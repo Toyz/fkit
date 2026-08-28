@@ -24,6 +24,7 @@ import {
   syncUrl,
   relativeTime,
   type BlobResponse,
+  type TreeResponse,
   type Commit,
   type CommitDetail,
   type Entry,
@@ -61,6 +62,28 @@ type View =
   | { kind: "merge"; number: number }
   | { kind: "settings"; section: string }
   | { kind: "unknown" };
+
+
+/**
+ * The `<ref>/<path>` suffix the content endpoints share.
+ *
+ * One function because three queries build the same string, and three copies
+ * is three chances for one to encode a segment differently from the others —
+ * which would quietly give that query a cache key of its own.
+ */
+function refAndPath(el: PageRepo): string {
+  const v = el.loc!.view;
+  const path = "path" in v ? v.path : "";
+  return (
+    encodeURIComponent(el.refName()) +
+    (path ? "/" + path.split("/").map(encodeURIComponent).join("/") : "")
+  );
+}
+
+/** True once there is a repository, and the view is a directory listing. */
+function onTree(el: PageRepo): boolean {
+  return Boolean(el.loc && el.repoQuery.data && el.loc.view.kind === "tree");
+}
 
 /** Parse `/owner/repo/<kind>/<ref>/<path…>` out of the current location. */
 function parse(): { owner: string; name: string; view: View } | null {
@@ -789,13 +812,51 @@ export class PageRepo extends LoomElement {
   @reactive accessor error = "";
   @reactive accessor notFound = false;
 
-  @reactive accessor entries: Entry[] | null = null;
+  @query<TreeResponse>({
+    url: (el: PageRepo) => `/api/repos/${el.loc!.owner}/${el.loc!.name}/tree/${refAndPath(el)}`,
+    enabled: onTree,
+    init: { credentials: "same-origin" },
+  })
+  accessor treeQuery!: ApiState<TreeResponse>;
+
+  private get entries(): Entry[] | null {
+    return this.treeQuery.data?.entries ?? null;
+  }
   @reactive accessor blob: BlobResponse | null = null;
   @reactive accessor commits: Commit[] | null = null;
   @reactive accessor detail: CommitDetail | null = null;
-  @reactive accessor readme: { name: string; content: string } | null = null;
+  /**
+   * Its own query, so a repository without a README is an empty result rather
+   * than a failed page — the endpoint answers null, and null is data.
+   */
+  @query<{ name: string; content: string }>({
+    url: (el: PageRepo) => `/api/repos/${el.loc!.owner}/${el.loc!.name}/readme/${refAndPath(el)}`,
+    enabled: onTree,
+    init: { credentials: "same-origin" },
+  })
+  accessor readmeQuery!: ApiState<{ name: string; content: string }>;
+
+  private get readme(): { name: string; content: string } | null {
+    return this.readmeQuery.data ?? null;
+  }
   /** Filled in after the tree renders, so the listing is never blocked on it. */
-  @reactive accessor lastCommits: Record<string, LastCommit> | null = null;
+  /**
+   * The commit column. Walking history is the slow part, so this deliberately
+   * arrives after the file names — the difference now is that a response for a
+   * directory you have already navigated away from cannot land in it, because
+   * it is keyed by the path it was asked for.
+   */
+  @query<Record<string, LastCommit>>({
+    url: (el: PageRepo) =>
+      `/api/repos/${el.loc!.owner}/${el.loc!.name}/lastcommits/${refAndPath(el)}`,
+    enabled: onTree,
+    init: { credentials: "same-origin" },
+  })
+  accessor lastCommitsQuery!: ApiState<Record<string, LastCommit>>;
+
+  private get lastCommits(): Record<string, LastCommit> | null {
+    return this.lastCommitsQuery.data ?? null;
+  }
   @reactive accessor copied = false;
   /// Which setup block was most recently copied.
   @reactive accessor copiedKey = "";
@@ -876,7 +937,8 @@ export class PageRepo extends LoomElement {
     return (this.refs ?? []).filter((r) => r.kind === "tag");
   }
 
-  private ref(): string {
+  /** Public for the query URL builders, which are module-level. */
+  refName(): string {
     const v = this.loc?.view;
     const explicit = v && "ref" in v ? v.ref : "";
     return explicit || this.repo?.default_branch || "main";
@@ -888,12 +950,9 @@ export class PageRepo extends LoomElement {
     const { owner, name } = at;
     const v = at.view;
 
-    this.entries = null;
     this.blob = null;
     this.commits = null;
     this.detail = null;
-    this.readme = null;
-    this.lastCommits = null;
     this.copied = false;
     this.copiedKey = "";
     this.patch = null;
@@ -910,28 +969,14 @@ export class PageRepo extends LoomElement {
 
     try {
       if (v.kind === "tree") {
-        const t = await api.tree(owner, name, this.ref(), v.path);
-        this.entries = t.entries;
-
-        // Deliberately not awaited together with the listing: walking history
-        // for the commit column is the slow part, and the file names should be
-        // on screen immediately with the column filling in behind them.
-        void api
-          .lastCommits(owner, name, this.ref(), v.path)
-          .then((m) => {
-            if (this.loc?.view.kind === "tree" && this.loc.view.path === v.path) {
-              this.lastCommits = m;
-            }
-          })
-          .catch(() => {});
-
-        this.readme = await api.readme(owner, name, this.ref(), v.path);
+        // The listing, the readme and the commit column are queries now, each
+        // keyed by the path it was asked for. Nothing to sequence here.
         this.docPath = "";
         this.doc = null;
       } else if (v.kind === "blob") {
-        this.blob = await api.blob(owner, name, this.ref(), v.path);
+        this.blob = await api.blob(owner, name, this.refName(), v.path);
       } else if (v.kind === "commits") {
-        this.commits = await api.commits(owner, name, this.ref(), 100);
+        this.commits = await api.commits(owner, name, this.refName(), 100);
       } else if (v.kind === "compare") {
         const base = v.base || this.repo.default_branch;
         const head = v.head || this.repo.default_branch;
@@ -974,7 +1019,7 @@ export class PageRepo extends LoomElement {
 
   private renderCrumbs(path: string) {
     const at = this.loc!;
-    const r = this.ref();
+    const r = this.refName();
     const parts = path.split("/").filter(Boolean);
     const rootHref = `/${at.owner}/${at.name}/tree/${r}`;
     return (
@@ -1120,7 +1165,7 @@ export class PageRepo extends LoomElement {
    */
   private renderLatest() {
     const at = this.loc!;
-    const ref = this.ref();
+    const ref = this.refName();
     const head = (this.refs ?? []).find((r) => r.name === ref)?.head;
     if (!head) return null;
 
@@ -1182,7 +1227,7 @@ export class PageRepo extends LoomElement {
 
   private renderTree(path: string) {
     const at = this.loc!;
-    const r = this.ref();
+    const r = this.refName();
     const rows: unknown[] = [];
 
     if (path) {
@@ -1252,7 +1297,7 @@ export class PageRepo extends LoomElement {
   private renderBlob() {
     const b = this.blob!;
     const at = this.loc!;
-    const rawHref = api.rawUrl(at.owner, at.name, this.ref(), b.path);
+    const rawHref = api.rawUrl(at.owner, at.name, this.refName(), b.path);
     const head = (
       <div class="panel-head">
         <span class="val">
@@ -1479,7 +1524,7 @@ export class PageRepo extends LoomElement {
     const at = this.loc!;
     const isOpen = !this.collapsed[f.path];
     const lang = languageFor(f.path);
-    const ref = atRef ?? this.detail?.hash ?? this.ref();
+    const ref = atRef ?? this.detail?.hash ?? this.refName();
     const href = `/${at.owner}/${at.name}/blob/${ref}/${f.path}`;
 
     return (
@@ -1663,7 +1708,7 @@ export class PageRepo extends LoomElement {
    */
   private mdContext(docDir: string): MarkdownContext {
     const at = this.loc!;
-    const ref = this.ref();
+    const ref = this.refName();
 
     const resolve = (rel: string): string => {
       // Strip a query or fragment before joining, and put it back after.
@@ -1693,7 +1738,7 @@ export class PageRepo extends LoomElement {
     const at = this.loc!;
     this.doc = null;
     void api
-      .blob(at.owner, at.name, this.ref(), path)
+      .blob(at.owner, at.name, this.refName(), path)
       .then((b) => {
         // Guard against a slow response for a tab the reader has left.
         if (this.docPath === path) this.doc = b.content ?? "(not a text file)";
@@ -1931,9 +1976,9 @@ fkit push</pre>
           {canOpen ? (
             <a
               class="btn primary"
-              href={`/${at.owner}/${at.name}/compare/${this.repo!.default_branch}...${this.ref()}`}
+              href={`/${at.owner}/${at.name}/compare/${this.repo!.default_branch}...${this.refName()}`}
               onClick={linkHandler(
-                `/${at.owner}/${at.name}/compare/${this.repo!.default_branch}...${this.ref()}`,
+                `/${at.owner}/${at.name}/compare/${this.repo!.default_branch}...${this.refName()}`,
               )}
             >
               <loom-icon name="plus" size={12}></loom-icon> new merge request
@@ -2629,7 +2674,7 @@ fkit push</pre>
     }
 
     const v = at.view;
-    const ref = this.ref();
+    const ref = this.refName();
     // Tags hang off the files view rather than owning a tab, so "files" stays
     // lit while you are on /tags — the same place GitHub leaves you.
     const tab =
