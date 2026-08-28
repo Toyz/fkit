@@ -12,6 +12,8 @@
  *     flash the whole page.
  */
 import { LoomElement, component, css, styles, reactive, mount, on, inject } from "@toyz/loom";
+// Renamed: importing it as `fetch` would shadow the global in this module.
+import { fetch as query, type ApiState } from "@toyz/loom/query";
 import { route } from "@toyz/loom/router";
 import { base } from "../ui";
 import { settingsLayout } from "../ui-settings";
@@ -742,7 +744,23 @@ export class PageRepo extends LoomElement {
    * A result that has not arrived is not a result.
    */
   @reactive accessor refs: Ref[] | null = null;
-  @reactive accessor stats: RepoStats | null = null;
+  /**
+   * Decoration: counts and sizes for the sidebar. A failure here must not take
+   * the page with it, which `@fetch` gives for free — the error lands in
+   * `.error` and nothing reads it.
+   *
+   * `enabled` keeps it from firing before there is a repository to ask about.
+   */
+  @query<RepoStats>({
+    url: (el: PageRepo) => `/api/repos/${el.loc!.owner}/${el.loc!.name}/stats`,
+    enabled: (el: PageRepo) => Boolean(el.loc),
+    init: { credentials: "same-origin" },
+  })
+  accessor statsQuery!: ApiState<RepoStats>;
+
+  private get stats(): RepoStats | null {
+    return this.statsQuery.data ?? null;
+  }
   /** A non-README document selected from the tab strip, and its content. */
   @reactive accessor docPath = "";
   @reactive accessor doc: string | null = null;
@@ -772,7 +790,12 @@ export class PageRepo extends LoomElement {
   /** Paths the reader has collapsed. */
   @reactive accessor collapsed: Record<string, boolean> = {};
 
-  private loc = parse();
+  /**
+   * Reactive, because query URLs are built from it. `@fetch` derives its cache
+   * key from the resolved URL, so navigating changes the key and the request
+   * re-runs — which is the manual `reload()` sequencing, done by the decorator.
+   */
+  @reactive accessor loc = parse();
 
   @mount
   init() {
@@ -804,12 +827,6 @@ export class PageRepo extends LoomElement {
         this.repo = null;
         this.repo = await api.repo(at.owner, at.name);
         this.refs = await api.refs(at.owner, at.name);
-        // Decoration: a failure here must not take the page with it.
-        this.stats = null;
-        void api
-          .repoStats(at.owner, at.name)
-          .then((s) => (this.stats = s))
-          .catch(() => undefined);
       }
     } catch (e) {
       this.notFound = e instanceof ApiError && e.status === 404;
