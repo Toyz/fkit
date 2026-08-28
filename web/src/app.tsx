@@ -1,12 +1,14 @@
 /**
  * App shell — the persistent header and the route outlet.
  */
-import { LoomElement, component, css, styles, reactive, mount, inject } from "@toyz/loom";
+import { LoomElement, component, css, styles, reactive, mount, inject, on } from "@toyz/loom";
+import { debounce } from "@toyz/loom/element";
 import { base } from "./ui";
 import "./components/user-menu";
 import { Session } from "./session";
 import { linkHandler, go } from "./nav";
 import type { Meta, User } from "./api";
+import { prefetchRoute } from "./api";
 
 const shell = css`
   :host { min-height: 100vh; display: flex; flex-direction: column; background: var(--bg); }
@@ -46,6 +48,38 @@ export class FkitApp extends LoomElement {
   @inject("session") accessor session!: Session;
   @reactive accessor user: User | null | undefined = undefined;
   @reactive accessor meta: Meta | null = null;
+
+  /** The link the pointer is currently over, waiting to see if it stays. */
+  private hovering = "";
+
+  /**
+   * Start a page's first request while the pointer is still travelling.
+   *
+   * One delegated listener rather than a handler per link: `composedPath`
+   * crosses shadow roots, so this reaches anchors inside any component,
+   * including ones that do not exist yet.
+   */
+  @on(document, "pointerover")
+  onLinkHover(e: Event) {
+    const a = e.composedPath().find((n) => n instanceof HTMLAnchorElement) as
+      | HTMLAnchorElement
+      | undefined;
+    const href = a?.getAttribute("href") ?? "";
+    // Same-origin routes only. An absolute URL is somebody else's server.
+    if (!href.startsWith("/") || href.startsWith("//")) return;
+    this.hovering = href;
+    this.warmHovered();
+  }
+
+  /**
+   * Debounced, because a pointer crossing a file listing passes over every row
+   * on the way to the one it wants, and prefetching all of them would cost
+   * more than the wait it saves.
+   */
+  @debounce(90)
+  warmHovered() {
+    if (this.hovering) prefetchRoute(this.hovering);
+  }
 
   @mount
   init() {

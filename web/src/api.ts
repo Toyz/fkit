@@ -180,7 +180,76 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * Requests started on hover, waiting for the navigation that wants them.
+ *
+ * Consume-once, not a cache: the entry is removed the moment a real request
+ * takes it, and expires on its own if nobody does. A cache would have to know
+ * when a mutation makes it wrong, which is a much larger promise than "this
+ * click was predictable".
+ */
+const warmed = new Map<string, { at: number; p: Promise<unknown> }>();
+
+/** Long enough to cover hover-then-click, short enough that nothing goes stale. */
+const WARM_MS = 15_000;
+
+/**
+ * Start a GET now because someone is probably about to need it.
+ *
+ * Errors are deliberately not handled here — the promise is stored as-is, so
+ * the real caller still sees the failure. The empty catch only stops the
+ * browser reporting an unhandled rejection while nothing is awaiting it yet.
+ */
+export function prefetch(path: string): void {
+  if (warmed.has(path)) return;
+  const p = request<unknown>(path);
+  p.catch(() => {});
+  warmed.set(path, { at: Date.now(), p });
+}
+
+/**
+ * Map a route the user is hovering to the requests that page will make.
+ *
+ * Only the first request of each page: enough to remove the visible wait,
+ * without spending bandwidth on everything a page might eventually ask for.
+ */
+export function prefetchRoute(href: string): void {
+  const segs = href.split(/[?#]/)[0].split("/").filter(Boolean).map(decodeURIComponent);
+  if (segs.length === 0) return;
+
+  const [owner, name, kind, ...rest] = segs;
+  // Reserved top-level routes are pages, not people.
+  if (["login", "register", "settings", "admin", "new", "repos"].includes(owner)) return;
+
+  if (!name) {
+    prefetch(`/users/${encodeURIComponent(owner)}`);
+    return;
+  }
+
+  // Every repository view needs the repository itself before anything else.
+  prefetch(`/repos/${owner}/${name}`);
+
+  const ref = rest[0] ?? "";
+  if (!kind || kind === "tree") {
+    const path = rest.slice(1).join("/");
+    prefetch(
+      `/repos/${owner}/${name}/tree/${encodeURIComponent(ref || "main")}${path ? "/" + path : ""}`,
+    );
+  } else if (kind === "commits") {
+    prefetch(`/repos/${owner}/${name}/commits/${encodeURIComponent(ref || "main")}?limit=50&skip=0`);
+  }
+}
+
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  // A hover may already have started this exact GET.
+  if (!init.method || init.method === "GET") {
+    const hit = warmed.get(path);
+    if (hit) {
+      warmed.delete(path);
+      if (Date.now() - hit.at < WARM_MS) return hit.p as Promise<T>;
+    }
+  }
+
   const res = await fetch(`/api${path}`, {
     ...init,
     // Session cookies are HttpOnly; the browser attaches them, JS never sees them.
