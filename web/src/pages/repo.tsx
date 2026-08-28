@@ -851,7 +851,18 @@ export class PageRepo extends LoomElement {
   private get commits(): Commit[] | null {
     return this.commitsQuery.data ?? null;
   }
-  @reactive accessor detail: CommitDetail | null = null;
+  @query<CommitDetail>({
+    url: (el: PageRepo) =>
+      `/api/repos/${el.loc!.owner}/${el.loc!.name}/commit/${el.loc!.view.kind === "commit" ? el.loc!.view.hash : ""}`,
+    enabled: (el: PageRepo) =>
+      Boolean(el.loc && el.repoQuery.data && el.loc.view.kind === "commit"),
+    init: { credentials: "same-origin" },
+  })
+  accessor detailQuery!: ApiState<CommitDetail>;
+
+  private get detail(): CommitDetail | null {
+    return this.detailQuery.data ?? null;
+  }
   /**
    * Its own query, so a repository without a README is an empty result rather
    * than a failed page — the endpoint answers null, and null is data.
@@ -887,13 +898,86 @@ export class PageRepo extends LoomElement {
   @reactive accessor copied = false;
   /// Which setup block was most recently copied.
   @reactive accessor copiedKey = "";
-  @reactive accessor patch: Patch | null = null;
-  @reactive accessor comparison: Comparison | null = null;
-  @reactive accessor merges: MergeRequest[] | null = null;
+  /**
+   * The line diff, which can be real work on a large commit. It is its own
+   * query so the summary is not waiting behind it — and being keyed by the
+   * hash, a slow one cannot land under a commit you have since navigated to.
+   */
+  @query<Patch>({
+    url: (el: PageRepo) =>
+      `/api/repos/${el.loc!.owner}/${el.loc!.name}/patch/${el.loc!.view.kind === "commit" ? el.loc!.view.hash : ""}`,
+    enabled: (el: PageRepo) =>
+      Boolean(el.loc && el.repoQuery.data && el.loc.view.kind === "commit"),
+    init: { credentials: "same-origin" },
+  })
+  accessor patchQuery!: ApiState<Patch>;
+
+  private get patch(): Patch | null {
+    return this.patchQuery.data ?? null;
+  }
+  @query<Comparison>({
+    url: (el: PageRepo) => {
+      const v = el.loc!.view;
+      const d = el.repoQuery.data?.default_branch ?? "main";
+      const base = v.kind === "compare" ? v.base || d : d;
+      const head = v.kind === "compare" ? v.head || d : d;
+      return `/api/repos/${el.loc!.owner}/${el.loc!.name}/compare/${encodeURIComponent(base)}/${encodeURIComponent(head)}`;
+    },
+    enabled: (el: PageRepo) =>
+      Boolean(el.loc && el.repoQuery.data && el.loc.view.kind === "compare"),
+    init: { credentials: "same-origin" },
+  })
+  accessor comparisonQuery!: ApiState<Comparison>;
+
+  private get comparison(): Comparison | null {
+    return this.comparisonQuery.data ?? null;
+  }
+  /**
+   * `params` carries the state filter, so switching between open and closed
+   * changes the key and refetches — the filter and the cache cannot disagree.
+   */
+  @query<MergeRequest[]>({
+    url: (el: PageRepo) => `/api/repos/${el.loc!.owner}/${el.loc!.name}/merges`,
+    params: (el: PageRepo) => ({ state: el.mergeState }),
+    enabled: (el: PageRepo) =>
+      Boolean(el.loc && el.repoQuery.data && el.loc.view.kind === "merges"),
+    init: { credentials: "same-origin" },
+  })
+  accessor mergesQuery!: ApiState<MergeRequest[]>;
+
+  private get merges(): MergeRequest[] | null {
+    return this.mergesQuery.data ?? null;
+  }
   @reactive accessor mergeState: "open" | "merged" | "closed" | "all" = "open";
-  @reactive accessor mr: MergeRequestDetail | null = null;
+  @query<MergeRequestDetail>({
+    url: (el: PageRepo) =>
+      `/api/repos/${el.loc!.owner}/${el.loc!.name}/merges/${el.loc!.view.kind === "merge" ? el.loc!.view.number : 0}`,
+    enabled: (el: PageRepo) =>
+      Boolean(el.loc && el.repoQuery.data && el.loc.view.kind === "merge"),
+    init: { credentials: "same-origin" },
+  })
+  accessor mrQuery!: ApiState<MergeRequestDetail>;
+
+  private get mr(): MergeRequestDetail | null {
+    return this.mrQuery.data ?? null;
+  }
   @reactive accessor busy = false;
-  @reactive accessor collaborators: Collaborator[] | null = null;
+  /**
+   * Only an admin may read this. A 403 is a permissions answer rather than a
+   * fault, so the render treats "no data" as "none to show" and nothing reads
+   * the error.
+   */
+  @query<Collaborator[]>({
+    url: (el: PageRepo) => `/api/repos/${el.loc!.owner}/${el.loc!.name}/collaborators`,
+    enabled: (el: PageRepo) =>
+      Boolean(el.loc && el.repoQuery.data && el.loc.view.kind === "settings"),
+    init: { credentials: "same-origin" },
+  })
+  accessor collaboratorsQuery!: ApiState<Collaborator[]>;
+
+  private get collaborators(): Collaborator[] | null {
+    return this.collaboratorsQuery.data ?? null;
+  }
   @reactive accessor newRole = "write";
   /// Transient "saved" confirmation on settings forms.
   @reactive accessor notice = "";
@@ -974,17 +1058,10 @@ export class PageRepo extends LoomElement {
   private async loadView() {
     const at = this.loc;
     if (!at || !this.repo) return;
-    const { owner, name } = at;
     const v = at.view;
 
-    this.detail = null;
     this.copied = false;
     this.copiedKey = "";
-    this.patch = null;
-    this.comparison = null;
-    this.merges = null;
-    this.mr = null;
-    this.collaborators = null;
     this.notice = "";
     this.busy = false;
     this.collapsed = {};
@@ -992,39 +1069,11 @@ export class PageRepo extends LoomElement {
     // A repository with no commits has no refs to browse.
     if (this.branches().length === 0 && v.kind !== "settings") return;
 
-    try {
-      if (v.kind === "tree") {
-        // The listing, the readme and the commit column are queries now, each
-        // keyed by the path it was asked for. Nothing to sequence here.
-        this.docPath = "";
-        this.doc = null;
-      } else if (v.kind === "compare") {
-        const base = v.base || this.repo.default_branch;
-        const head = v.head || this.repo.default_branch;
-        this.comparison = await api.compare(owner, name, base, head);
-      } else if (v.kind === "settings") {
-        // Only an admin can read the collaborator list; a failure here is a
-        // permissions answer, not an error worth showing.
-        this.collaborators = await api.collaborators(owner, name).catch(() => []);
-      } else if (v.kind === "merges") {
-        this.merges = await api.merges(owner, name, this.mergeState);
-      } else if (v.kind === "merge") {
-        this.mr = await api.mergeRequest(owner, name, v.number);
-      } else if (v.kind === "commit") {
-        this.detail = await api.commit(owner, name, v.hash);
-        // The summary renders immediately; the line diff can take real work on
-        // a large commit, so it arrives separately.
-        void api
-          .patch(owner, name, v.hash)
-          .then((pp) => {
-            if (this.loc?.view.kind === "commit" && this.loc.view.hash === v.hash) {
-              this.patch = pp;
-            }
-          })
-          .catch(() => {});
-      }
-    } catch (e) {
-      this.error = (e as Error).message;
+    // The document tab is a selection, not a response — everything this method
+    // used to fetch is a query now, keyed by what it was asked for.
+    if (v.kind === "tree") {
+      this.docPath = "";
+      this.doc = null;
     }
   }
 
@@ -1985,9 +2034,9 @@ fkit push</pre>
             <button
               class={this.mergeState === k ? "" : "bare"}
               onClick={async () => {
+                // The query takes its state through `params`, so this
+                // assignment changes the key and the refetch is the decorator's.
                 this.mergeState = k;
-                this.merges = null;
-                this.merges = await api.merges(at.owner, at.name, k);
               }}
             >
               {k}
@@ -2058,7 +2107,7 @@ fkit push</pre>
       if (ok) this.notice = ok;
       const at = this.loc!;
       if (at.view.kind === "merge") {
-        this.mr = await api.mergeRequest(at.owner, at.name, at.view.number);
+        await this.mrQuery.refetch();
         // A merge moves a branch, so the refs the page is holding are stale.
         await this.refsQuery.refetch();
       }
@@ -2549,7 +2598,7 @@ fkit push</pre>
                 ) as HTMLInputElement;
                 void this.act(async () => {
                   await api.addCollaborator(at.owner, at.name, user.value.trim(), this.newRole);
-                  this.collaborators = await api.collaborators(at.owner, at.name);
+                  await this.collaboratorsQuery.refetch();
                   user.value = "";
                 });
               }}
@@ -2596,7 +2645,7 @@ fkit push</pre>
                     if (!ok) return;
                     await this.act(async () => {
                       await api.removeCollaborator(at.owner, at.name, c.username);
-                      this.collaborators = await api.collaborators(at.owner, at.name);
+                      await this.collaboratorsQuery.refetch();
                     });
                   }}
                 >
