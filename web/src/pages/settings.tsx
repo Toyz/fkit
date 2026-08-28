@@ -128,6 +128,10 @@ export class PageSettings extends SettingsBase {
   }
 
   private async load() {
+    // Waited on, not read. Before the session resolves `isAuthed` is false for
+    // a signed-in visitor too, and redirecting on that made every one of these
+    // pages impossible to refresh or link to.
+    await this.session.ready();
     if (!this.session.isAuthed) {
       // Nothing here is meaningful signed out.
       go("/login");

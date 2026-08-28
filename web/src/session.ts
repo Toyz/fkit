@@ -22,16 +22,55 @@ export class Session {
     return this.user.value;
   }
 
+  /**
+   * Whether there is a signed-in user *right now*.
+   *
+   * False while the answer is still unknown, so this is not a question to
+   * redirect on — see [`ready`]. It is fine for deciding what to render,
+   * because a render happens again when the answer arrives.
+   */
   get isAuthed(): boolean {
     return !!this.user.value;
   }
 
+  /** True once `/auth/me` has answered, whichever way it answered. */
+  get resolved(): boolean {
+    return this.user.value !== undefined;
+  }
+
+  private pending: Promise<void> | null = null;
+
+  /**
+   * Resolves once the session is known.
+   *
+   * Anything that *acts* on whether someone is signed in — a redirect above
+   * all — has to wait for this. `isAuthed` is false before the answer arrives,
+   * so a guard that reads it directly bounces a signed-in visitor to the login
+   * page on any direct navigation or refresh. That was the behaviour of every
+   * /settings page.
+   *
+   * The in-flight promise is shared rather than started again, so several
+   * pages asking at once produce one request.
+   */
+  ready(): Promise<void> {
+    if (this.resolved) return Promise.resolve();
+    return this.pending ?? this.load();
+  }
+
   /** Resolve the current session once at boot. A 401 is expected, not an error. */
   async load(): Promise<void> {
-    // Both are independent; a failure of one must not blank the other.
-    const [me, meta] = await Promise.allSettled([api.me(), api.meta()]);
-    this.user.set(me.status === "fulfilled" ? me.value : null);
-    if (meta.status === "fulfilled") this.meta.set(meta.value);
+    if (this.pending) return this.pending;
+    this.pending = (async () => {
+      // Both are independent; a failure of one must not blank the other.
+      const [me, meta] = await Promise.allSettled([api.me(), api.meta()]);
+      this.user.set(me.status === "fulfilled" ? me.value : null);
+      if (meta.status === "fulfilled") this.meta.set(meta.value);
+    })();
+    try {
+      await this.pending;
+    } finally {
+      this.pending = null;
+    }
   }
 
   async login(username: string, password: string): Promise<void> {

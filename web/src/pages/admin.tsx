@@ -195,9 +195,7 @@ export class PageAdmin extends LoomElement {
   }
 
   private async load() {
-    if (this.session.current === undefined) {
-      await this.session.load();
-    }
+    await this.session.ready();
     if (!this.session.current?.is_admin) {
       // Not an administrator: nothing on this page would load anyway.
       go("/");
