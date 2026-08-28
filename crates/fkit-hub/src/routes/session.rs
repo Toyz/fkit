@@ -4,12 +4,14 @@ use crate::auth::{self, Viewer};
 use crate::error::{AppError, AppResult};
 use crate::models::*;
 use crate::state::AppState;
-use axum::extract::{Path, State};
+use crate::ratelimit::{client_ip, Quota};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use chrono::{Duration, Utc};
+use std::net::SocketAddr;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -28,6 +30,58 @@ pub fn routes() -> Router<AppState> {
         .route("/auth/sessions/{id}", delete(revoke_session))
         .route("/tokens", get(list_tokens).post(create_token))
         .route("/tokens/{id}", delete(revoke_token))
+}
+
+
+// ---- rate limiting --------------------------------------------------------
+//
+// These are the endpoints that are cheap to ask for and expensive to answer:
+// a password guess costs an Argon2 verification, a forgotten-password request
+// costs an email. Argon2 makes each attempt slow for the server, not for the
+// attacker, so the ceiling has to be explicit.
+//
+// Quotas are per window per key and deliberately generous — they exist to stop
+// a script, not to inconvenience someone who mistypes a password twice.
+
+/// Ten a minute stops guessing without troubling a real person.
+const LOGIN_PER_IP: Quota = Quota::per_minute(10);
+/// Failures against one account, from anywhere. Higher than the per-IP limit
+/// because it is the one an attacker can reach from many addresses, and it is
+/// cleared on success so it cannot be used to lock somebody out.
+const LOGIN_PER_USER: Quota = Quota::per_hour(30);
+/// Attempts, including the ones that fail validation. Generous, because a
+/// person who fumbles the form three times is not an attacker and must not be
+/// locked out for an hour — this only exists so the endpoint cannot be
+/// hammered into doing unbounded Argon2 work.
+const REGISTER_TRIES_PER_IP: Quota = Quota::per_hour(20);
+/// Accounts actually created. Counted only on success, so it caps farming
+/// without a fumbled form ever touching it.
+const REGISTER_MADE_PER_IP: Quota = Quota::per_hour(5);
+/// Sending mail costs money and reputation, so this is the tightest one.
+const FORGOT_PER_IP: Quota = Quota::per_hour(5);
+/// Also per address, so one mailbox cannot be flooded from many machines.
+const FORGOT_PER_EMAIL: Quota = Quota::per_hour(3);
+const RESET_PER_IP: Quota = Quota::per_hour(10);
+/// An invite token is 256 bits, so this is not about guessing it — it stops
+/// the endpoint being a free oracle to hammer.
+const INVITE_PEEK_PER_IP: Quota = Quota::per_hour(30);
+const TOKEN_CREATE_PER_USER: Quota = Quota::per_hour(20);
+
+/// Count one request and turn a refusal into a 429 carrying `Retry-After`.
+async fn limit(state: &AppState, scope: &str, id: &str, quota: Quota) -> AppResult<()> {
+    let key = format!("{scope}:{id}");
+    let d = state.limiter.check(&key, quota).await;
+    if d.allowed {
+        Ok(())
+    } else {
+        Err(AppError::TooManyRequests(d.retry_after))
+    }
+}
+
+/// The address to charge a request to. See [`crate::ratelimit::client_ip`] for
+/// why this is not simply the peer.
+fn who(state: &AppState, headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
+    client_ip(headers, peer, state.trust_proxy)
 }
 
 /// Instance policy, readable without authentication.
@@ -59,9 +113,13 @@ async fn meta(State(state): State<AppState>) -> Json<serde_json::Value> {
 
 async fn register(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<RegisterReq>,
 ) -> AppResult<impl IntoResponse> {
+    let ip = who(&state, &headers, Some(peer));
+    limit(&state, "register-try", &ip, REGISTER_TRIES_PER_IP).await?;
+
     let username = auth::normalize_username(&body.username)?;
     auth::validate_password(&body.password)?;
 
@@ -120,6 +178,10 @@ async fn register(
         return Err(AppError::conflict("that username or email is already taken"));
     }
     inserted?;
+
+    // Counted here rather than at the top: the account exists, so this is the
+    // quota that caps farming. A form fumbled five times never reaches it.
+    limit(&state, "register-made", &ip, REGISTER_MADE_PER_IP).await?;
 
     // The account exists, so the invite is now spent. The UPDATE re-checks
     // `used_at IS NULL`, so two people racing the same link cannot both win it;
@@ -201,8 +263,12 @@ async fn claim_invite(state: &AppState, token: &str, email: &str) -> AppResult<C
 /// pre-filled and locked.
 async fn peek_invite(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     axum::extract::Query(q): axum::extract::Query<InviteQuery>,
 ) -> AppResult<Json<serde_json::Value>> {
+    limit(&state, "invite-peek", &who(&state, &headers, Some(peer)), INVITE_PEEK_PER_IP).await?;
+
     let row: Option<(Option<String>,)> = sqlx::query_as(
         "SELECT email FROM invites
           WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now()",
@@ -224,10 +290,14 @@ struct InviteQuery {
 
 async fn login(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<LoginReq>,
 ) -> AppResult<impl IntoResponse> {
     let username = body.username.trim().to_ascii_lowercase();
+
+    limit(&state, "login-ip", &who(&state, &headers, Some(peer)), LOGIN_PER_IP).await?;
+    limit(&state, "login-user", &username, LOGIN_PER_USER).await?;
 
     let user: Option<UserRow> = sqlx::query_as("SELECT * FROM users WHERE username = $1")
         .bind(&username)
@@ -250,6 +320,10 @@ async fn login(
         return Err(AppError::Unauthorized);
     }
     let user = user.expect("verified above");
+
+    // Proving you own the account clears its failure count, so an attacker
+    // guessing at someone else's username cannot lock them out of their own.
+    state.limiter.reset(&format!("login-user:{username}")).await;
 
     let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
     let session = auth::create_session(&state.db, user.id, ua).await?;
@@ -294,8 +368,17 @@ struct ForgotReq {
 /// the truth from their inbox; nobody else learns anything.
 async fn forgot_password(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(body): Json<ForgotReq>,
 ) -> AppResult<Json<serde_json::Value>> {
+    limit(&state, "forgot-ip", &who(&state, &headers, Some(peer)), FORGOT_PER_IP).await?;
+    // Keyed by a digest, not the address itself: these keys may end up in an
+    // external store, and that store should not become a list of who has an
+    // account here.
+    let email_key = auth::token_digest(&body.email.trim().to_ascii_lowercase());
+    limit(&state, "forgot-email", &email_key, FORGOT_PER_EMAIL).await?;
+
     let quiet_ok = || {
         Ok(Json(serde_json::json!({
             "ok": true,
@@ -381,9 +464,12 @@ struct ResetReq {
 
 async fn reset_password(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<ResetReq>,
 ) -> AppResult<impl IntoResponse> {
+    limit(&state, "reset", &who(&state, &headers, Some(peer)), RESET_PER_IP).await?;
+
     auth::validate_password(&body.password)?;
 
     // One indexed lookup on the digest; the token itself is never stored.
@@ -677,6 +763,8 @@ async fn create_token(
     Json(body): Json<CreateTokenReq>,
 ) -> AppResult<impl IntoResponse> {
     let u = viewer.require()?;
+    limit(&state, "token-create", &u.id.to_string(), TOKEN_CREATE_PER_USER).await?;
+
     let name = body.name.trim();
     if name.is_empty() || name.len() > 64 {
         return Err(AppError::bad("token name must be 1-64 characters"));

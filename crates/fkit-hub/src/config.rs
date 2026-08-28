@@ -39,6 +39,8 @@ struct ServerSection {
     web_dir: Option<PathBuf>,
     /// Mark session cookies `Secure`. Set this when behind a TLS proxy.
     secure_cookies: Option<bool>,
+    /// Take the client address from `X-Forwarded-For`. Only behind a proxy.
+    trust_proxy: Option<bool>,
     /// Allow anyone to register. Turn off for a private instance.
     open_registration: Option<bool>,
     /// Require a signed-in user for *everything*, including repositories marked
@@ -116,6 +118,10 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub web_dir: PathBuf,
     pub secure_cookies: bool,
+    /// Whether `X-Forwarded-For` may be believed when identifying a client for
+    /// rate limiting. Off by default: on a directly-exposed server, believing
+    /// it lets anyone forge a new identity per request.
+    pub trust_proxy: bool,
     pub open_registration: bool,
     pub require_auth: bool,
     pub default_repo_visibility: String,
@@ -142,6 +148,7 @@ impl Default for Config {
             data_dir: PathBuf::from("./fkit-hub-data"),
             web_dir: PathBuf::from("web/dist"),
             secure_cookies: false,
+            trust_proxy: false,
             open_registration: true,
             require_auth: false,
             default_repo_visibility: "private".into(),
@@ -214,6 +221,7 @@ impl Config {
         if let Some(v) = f.server.listen { self.listen = v }
         if let Some(v) = f.server.web_dir { self.web_dir = v }
         if let Some(v) = f.server.secure_cookies { self.secure_cookies = v }
+        if let Some(v) = f.server.trust_proxy { self.trust_proxy = v }
         if let Some(v) = f.server.open_registration { self.open_registration = v }
         if let Some(v) = f.server.require_auth { self.require_auth = v }
         if let Some(v) = f.server.default_repo_visibility {
@@ -248,6 +256,7 @@ impl Config {
         // http the browser then discards the session cookie and login appears
         // to silently fail. All three read the same way now.
         if let Some(v) = flag_env("FKIT_SECURE_COOKIES") { self.secure_cookies = v }
+        if let Some(v) = flag_env("FKIT_TRUST_PROXY") { self.trust_proxy = v }
         if let Some(v) = flag_env("FKIT_OPEN_REGISTRATION") { self.open_registration = v }
         if let Some(v) = flag_env("FKIT_REQUIRE_AUTH") { self.require_auth = v }
         // RESEND_API_KEY is what Resend's own documentation and every hosting
@@ -279,6 +288,7 @@ impl Config {
                 "--web" => { self.web_dir = PathBuf::from(need(i)?); i += 2 }
                 "--database-url" => { self.database_url = need(i)?; i += 2 }
                 "--secure-cookies" => { self.secure_cookies = true; i += 1 }
+                "--trust-proxy" => { self.trust_proxy = true; i += 1 }
                 "--closed-registration" => { self.open_registration = false; i += 1 }
                 "--require-auth" => { self.require_auth = true; i += 1 }
                 other => bail!("unknown option '{other}' (try --help)"),
@@ -338,6 +348,7 @@ fn print_help() {
          \x20       --web DIR              built frontend directory\n\
          \x20       --database-url URL     postgres connection string\n\
          \x20       --secure-cookies       mark session cookies Secure (use behind TLS)\n\
+         \x20       --trust-proxy          take the client IP from X-Forwarded-For\n\
          \x20       --closed-registration  disable public sign-up\n\
          \x20       --require-auth         require a login for everything, even public repos\n\
          \x20       --print-config-template  write a commented fkit-hub.toml to stdout\n\n\
@@ -345,7 +356,8 @@ fn print_help() {
          \x20   defaults < fkit-hub.toml < environment < flags\n\n\
          ENVIRONMENT:\n\
          \x20   DATABASE_URL (required), FKIT_LISTEN, FKIT_DATA, FKIT_WEB_DIR,\n\
-         \x20   FKIT_SECURE_COOKIES, FKIT_OPEN_REGISTRATION, RUST_LOG\n\
+         \x20   FKIT_SECURE_COOKIES, FKIT_TRUST_PROXY,\n\
+         \x20   FKIT_OPEN_REGISTRATION, RUST_LOG\n\
          \x20   RESEND_API_KEY, FKIT_EMAIL_FROM, FKIT_PUBLIC_URL\n\n\
          MAIL:\n\
          \x20   RESEND_API_KEY overrides the key stored in the database, so a\n\
@@ -369,6 +381,13 @@ web_dir = "web/dist"
 # OFF for plain-HTTP local use — a Secure cookie over http:// is discarded by
 # the browser, which looks exactly like a login that silently fails.
 secure_cookies = false
+
+# Believe `X-Forwarded-For` when identifying a client for rate limiting. Turn
+# this ON behind a reverse proxy, where every request otherwise appears to come
+# from the proxy's address and one client's limit would be everyone's. Leave it
+# OFF on a directly-exposed server: the header is client-supplied, so believing
+# it there lets anyone mint a new identity per request and skip the limit.
+trust_proxy = false
 
 # Set false to run a private instance where only an admin can create accounts.
 # The very first account is always allowed, so a fresh server is never locked

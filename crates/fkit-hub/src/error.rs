@@ -30,6 +30,10 @@ pub enum AppError {
     #[error("{0}")]
     Conflict(String),
 
+    /// Too many requests. The duration becomes `Retry-After`.
+    #[error("too many requests — try again in {} seconds", .0.as_secs().max(1))]
+    TooManyRequests(std::time::Duration),
+
     /// Anything unexpected. The detail is logged, never sent to the client.
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
@@ -64,6 +68,17 @@ impl IntoResponse for AppError {
             AppError::Forbidden(m) => (StatusCode::FORBIDDEN, m.clone()),
             AppError::NotFound(m) => (StatusCode::NOT_FOUND, m.clone()),
             AppError::Conflict(m) => (StatusCode::CONFLICT, m.clone()),
+            AppError::TooManyRequests(after) => {
+                // Answered here rather than falling through, because a 429 is
+                // the one error that carries a header the client should obey.
+                let secs = after.as_secs().max(1);
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [(axum::http::header::RETRY_AFTER, secs.to_string())],
+                    Json(json!({ "error": self.to_string() })),
+                )
+                    .into_response();
+            }
             AppError::Internal(e) => {
                 // Logged in full; the client is told nothing useful to an attacker.
                 tracing::error!("internal error: {e:#}");

@@ -16,6 +16,7 @@ mod email;
 mod error;
 mod models;
 mod perms;
+mod ratelimit;
 mod routes;
 mod settings;
 mod state;
@@ -88,6 +89,8 @@ async fn main() -> Result<()> {
         web_dir: cfg.web_dir.clone(),
         settings,
         max_archive_bytes: cfg.max_archive_bytes,
+        limiter: std::sync::Arc::new(ratelimit::MemoryLimiter::default()),
+        trust_proxy: cfg.trust_proxy,
     };
 
     let api = Router::new()
@@ -145,6 +148,10 @@ async fn main() -> Result<()> {
     );
     tracing::info!("  (both editable at /admin by an administrator)");
     tracing::info!("  cookies  {}", if cfg.secure_cookies { "Secure" } else { "not Secure (dev)" });
+    tracing::info!(
+        "  clients  {}",
+        if cfg.trust_proxy { "X-Forwarded-For (proxy trusted)" } else { "peer address" }
+    );
     // Mail is silent when it is missing — the sign-in page simply omits the
     // reset link — so the one place it can be noticed is here.
     match (policy.email_configured(), cfg.env_email.is_empty()) {
@@ -159,9 +166,15 @@ async fn main() -> Result<()> {
         );
     }
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown())
-        .await?;
+    // With ConnectInfo, so rate limiting can tell one client from another. On
+    // a directly-exposed server this peer address is the only trustworthy
+    // identity a request has.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown())
+    .await?;
     Ok(())
 }
 

@@ -3,7 +3,10 @@
 use anyhow::Result;
 use fkit_core::store::Store;
 use std::path::PathBuf;
+use std::sync::Arc;
 use uuid::Uuid;
+
+use crate::ratelimit::RateLimiter;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -19,6 +22,12 @@ pub struct AppState {
     /// Largest archive this server will build, in bytes of content. 0 = no
     /// limit. Checked against the tree before any file is read.
     pub max_archive_bytes: u64,
+    /// Ceiling on the cheap-to-ask, expensive-to-answer endpoints. Behind a
+    /// trait so the counters can move out of this process without any route
+    /// changing — see [`crate::ratelimit`].
+    pub limiter: Arc<dyn RateLimiter>,
+    /// Whether `X-Forwarded-For` may be believed when identifying a client.
+    pub trust_proxy: bool,
 }
 
 impl AppState {
