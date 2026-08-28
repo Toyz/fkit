@@ -9,9 +9,8 @@ on:
 
 env:
   # The same builder the image is compiled with, so a check passing here means
-  # the toolchain that ships the release agreed. It carries clippy and rustfmt
-  # already, and its host triple is the musl target, so the tests run against
-  # the libc the binaries are actually shipped with.
+  # the toolchain that ships the release agreed. Its host triple is the musl
+  # target, so the tests run against the libc the binaries actually ship with.
   BUILDER: rust:1-alpine
   # A path on the runner's host — see the note in image.yml. The target
   # directory is deliberately not the one image.yml uses: these are different
@@ -35,6 +34,12 @@ jobs:
             -e CARGO_TARGET_DIR=/target \
             "$BUILDER" \
             sh -euc '
+              # The image installs the minimal profile. `cargo-clippy` is on
+              # PATH regardless -- rustup shims every command it knows about,
+              # installed or not -- so the missing component only announces
+              # itself when clippy is run. Add it up front instead.
+              rustup component add clippy
+
               cargo test --workspace
               cargo clippy --workspace --all-targets -- -D warnings
             '

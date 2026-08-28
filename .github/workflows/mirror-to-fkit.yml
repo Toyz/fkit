@@ -49,8 +49,25 @@ jobs:
           set -euo pipefail
           echo "${{ secrets.GITHUB_TOKEN }}" \
             | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-          image=ghcr.io/${{ github.repository_owner }}/fkit-hub:latest
-          docker pull -q "$image"
+
+          # The owner is spelled however the account is spelled, and a registry
+          # reference has to be lowercase. `docker/metadata-action` does this
+          # for the publishing side; here it is ours to do.
+          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          repo=ghcr.io/$owner/fkit-hub
+
+          # `:latest` moves on a release, so it is the tag worth mirroring
+          # against -- but it does not exist until the first tag is pushed, and
+          # `:main` is then the only image published. Prefer the release, take
+          # what is there.
+          if docker pull -q "$repo:latest"; then
+            image=$repo:latest
+          else
+            echo "no :latest published yet -- falling back to :main"
+            image=$repo:main
+            docker pull -q "$image"
+          fi
+
           cid=$(docker create "$image")
           docker cp "$cid:/usr/local/bin/fkit" ./fkit-bin
           docker rm "$cid" >/dev/null
