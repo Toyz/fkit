@@ -1,13 +1,31 @@
+# Paths fkit does not track when this repository is hosted in fkit itself.
+#
+# Patterns match a single path *component*, not a path: `node_modules/` ignores
+# that directory wherever it appears, and `web/node_modules/` would match
+# nothing at all. See `Ignore` in fkit-core/src/ingest.rs for the whole grammar
+# — exact names, `*.suffix`, and `name/` for directories only.
+
 # Build output — regenerable, and huge.
 target/
+node_modules/
+dist/
+
+# Local data: object stores and anything `make dev` writes.
+fkit-data/
+fkit-hub-data/
+.dev/
+
+# Generated secrets — never committed.
+.env
+.env.prod
+
+# Local overrides.
+fkit-hub.toml
+docker-compose.override.yml
+
+# Local Playwright harness, not part of the source.
+e2e/
 
 # Editor and OS noise
 .DS_Store
 *.swp
-
-# Generated secrets — never committed.
-.env
-
-# Frontend
-node_modules/
-dist/

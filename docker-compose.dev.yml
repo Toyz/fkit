@@ -1,0 +1,16 @@
+# Local development overlay — Postgres only, reachable from the host.
+#
+#   make dev        the hub on the host with live reload, this file included
+#   make dev-db     just the database, if you would rather run the hub yourself
+#
+# The base compose deliberately does not publish Postgres: there, only the hub
+# container talks to it. `make dev` runs the hub as a normal process on the
+# host instead, so the port has to be reachable. It is published on 55432 and
+# not 5432 so it cannot collide with a Postgres already installed on the
+# machine.
+name: fkit
+
+services:
+  postgres:
+    ports:
+      - "${DEV_DB_PORT:-55432}:5432"

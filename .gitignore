@@ -6,6 +6,8 @@ web/dist/
 # Local data: repositories, object stores, Postgres volumes
 fkit-data/
 fkit-hub-data/
+# `make dev` keeps its object store here, outside the Docker volumes
+.dev/
 
 # fkit's own working directory, once this repo is hosted in fkit as well
 .fkit/
@@ -19,5 +21,8 @@ fkit-hub-data/
 # Local overrides
 fkit-hub.toml
 docker-compose.override.yml
+
+# Local Playwright harness — a scratch pad for driving the UI, not a test suite
+e2e/
 
 .DS_Store

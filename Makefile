@@ -1,12 +1,13 @@
 # fkit — common tasks.
 #
-#   make up      start everything (generates .env on first run)
+#   make up      start everything in Docker (generates .env on first run)
+#   make dev     run the hub on this machine with live reload
 #   make logs    follow the hub's logs
 #   make down    stop, keeping data
 #   make test    run the Rust and frontend checks
 
 .DEFAULT_GOAL := help
-.PHONY: help setup up down restart logs ps test build web clean nuke image push
+.PHONY: help setup up dev dev-db dev-down down restart logs ps test build web clean nuke image push
 
 help: ## Show this help
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -20,6 +21,19 @@ up: setup ## Build and start the hub + Postgres
 	@echo
 	@echo "  fkit hub  ->  http://localhost:$${HUB_PORT:-7500}"
 	@echo "  The first account you register becomes the administrator."
+
+# ---- local development ----------------------------------------------------
+# `make up` runs the hub in Docker, which is what you want to check a release.
+# `make dev` runs it as a process on this machine so a change to a .rs file is
+# a rebuild and not an image build.
+dev: setup ## Run the hub here with live reload (Postgres stays in Docker)
+	@scripts/dev.sh
+
+dev-db: setup ## Start only Postgres, published on 55432 for a hub run by hand
+	docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --wait postgres
+
+dev-down: ## Stop the development Postgres
+	docker compose -f docker-compose.yml -f docker-compose.dev.yml down
 
 down: ## Stop everything (data volumes are kept)
 	docker compose down
@@ -41,7 +55,7 @@ build: ## Build release binaries and the web UI
 	cargo build --release --workspace
 	cd web && npm run build
 
-web: ## Run the frontend dev server against a local hub
+web: ## Run the frontend dev server with hot reload (pairs with 'make dev')
 	cd web && npm run dev
 
 # ---- publishing -----------------------------------------------------------
