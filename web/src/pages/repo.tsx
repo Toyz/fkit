@@ -947,14 +947,15 @@ export class PageRepo extends LoomElement {
   /**
    * The right-hand column: what this repository *is*, next to what is in it.
    *
-   * Only shown at the root. Inside a directory the question is "what is in
-   * here", and a panel about the repository as a whole is just noise beside it.
+   * Shown for every directory, not only the root. It was root-only on the
+   * argument that a panel about the whole repository is noise beside one
+   * folder — but the cost is the page snapping between one column and two as
+   * you walk the tree, which is worse than the noise. Reading a *file* still
+   * takes the full width, because code wants the room.
    */
   private renderAside() {
     const at = this.loc!;
     const r = this.repo!;
-    const v = at.view as Extract<View, { kind: "tree" }>;
-    if (v.path) return null;
 
     const tags = this.tags().slice().sort(
       (a, b) => (b.head?.timestamp ?? 0) - (a.head?.timestamp ?? 0),
