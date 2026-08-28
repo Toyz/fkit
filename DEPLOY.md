@@ -61,14 +61,48 @@ docker compose --env-file .env.prod -f docker-compose.prod.yml \
 docker compose -f docker-compose.prod.yml logs -f hub
 ```
 
-The hub listens on `BIND_ADDR:HUB_PORT` (`127.0.0.1:7500` by default) — point
-your proxy at that. It must pass WebSocket upgrades through: the sync protocol
-is WebSocket end to end, so a proxy that mangles `Upgrade` breaks push and
-clone while leaving the web UI looking perfectly healthy.
+The hub listens on `BIND_ADDR:HUB_PORT` (`127.0.0.1:7500` by default), which is
+local-only until you deliberately expose it. Migrations run on boot.
 
-Migrations run on boot. The first account you register becomes the administrator — do that
-immediately, then close registration in **admin → instance** and bring anyone
-else in from **admin → invites**.
+### Claim the administrator account before you expose it
+
+An empty server lets the *first* registration through even with
+`open_registration = false` — otherwise an instance shipped with registration
+closed could never be set up. That account becomes the administrator.
+
+Which means the order matters, and it is the reverse of what feels natural:
+
+```sh
+# 1. still on 127.0.0.1, from the server itself
+ssh -L 7500:127.0.0.1:7500 server      # or curl it locally
+#    register your account at http://127.0.0.1:7500
+# 2. only then point the proxy at it
+```
+
+Expose it first and there is a window between the proxy going live and you
+signing up in which whoever finds the host becomes its administrator. The
+default `BIND_ADDR` protects you right up until the moment you put a proxy in
+front, and that is exactly the step this guide is about.
+
+Then close registration in **admin → instance** and bring people in from
+**admin → invites**.
+
+### The proxy
+
+It must pass WebSocket upgrades through: the sync protocol is WebSocket end to
+end, so a proxy that mangles `Upgrade` breaks push and clone while leaving the
+web UI looking perfectly healthy.
+
+It must also set `X-Forwarded-For`, and `hub.toml` must say `trust_proxy = true`
+to believe it. Rate limits are counted per client address; behind a proxy every
+request appears to come from the proxy, so with `trust_proxy` off the whole
+instance shares a single bucket — ten sign-ins a minute between everyone, and
+the symptom is your users being told to try again later because somebody else
+just logged in.
+
+Leave `trust_proxy` **off** if the hub is reachable directly. The header is
+client-supplied there, so believing it lets anyone present a new address per
+request and skip the limits entirely.
 
 Then:
 

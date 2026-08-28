@@ -3,6 +3,7 @@
 
 [server]
 secure_cookies = true            # false if you reach the hub over plain http
+trust_proxy = true               # on behind a proxy, off if reachable directly
 open_registration = false        # first account on an empty server still gets in
 require_auth = false             # public repos stay readable without an account
 default_repo_visibility = "private"

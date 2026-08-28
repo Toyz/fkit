@@ -164,6 +164,17 @@ async fn main() -> Result<()> {
         "  clients  {}",
         if cfg.trust_proxy { "X-Forwarded-For (proxy trusted)" } else { "peer address" }
     );
+    // Secure cookies say a proxy is in front; counting the peer address says
+    // there isn't. Together they put the whole instance in one rate-limit
+    // bucket, and the symptom never points at the cause.
+    if cfg.secure_cookies && !cfg.trust_proxy {
+        tracing::warn!(
+            "secure_cookies is on but trust_proxy is off: every request will be \
+             counted against the proxy's address, so the rate limits apply to the \
+             whole instance at once. Set trust_proxy = true in hub.toml if a proxy \
+             is in front of this."
+        );
+    }
     // Mail is silent when it is missing — the sign-in page simply omits the
     // reset link — so the one place it can be noticed is here.
     match (policy.email_configured(), cfg.env_email.is_empty()) {
