@@ -35,7 +35,14 @@ const shell = css`
   .who .name { color: var(--muted); }
 
   /* "flex: 1 0 auto" rather than "flex: 1" — with the latter a short page
-     leaves the footer floating mid-viewport instead of at the bottom. */
+     leaves the footer floating mid-viewport instead of at the bottom.
+   *
+   * The min-height keeps the footer *below* the fold while a page is still
+   * loading. Without it the footer sits right at the viewport edge, and every
+   * block that arrives late — a README most of all — shoves it down through
+   * the visible area. That single movement was most of the page's layout
+   * shift. Content growing below the fold is not something anyone perceives;
+   * the footer sliding past their eyes is. */
   main { flex: 1 0 auto; padding: 16px 0 48px; }
 
   footer { border-top: 1px solid var(--border); padding: 10px 0; color: var(--faint); font-size: 11px; }

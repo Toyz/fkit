@@ -123,3 +123,44 @@ html, body {
 *::-webkit-scrollbar { width: 9px; height: 9px; }
 *::-webkit-scrollbar-thumb { background: var(--border-hi); border: 2px solid var(--bg); border-radius: 5px; }
 *::-webkit-scrollbar-track { background: transparent; }
+
+/* ---------------------------------------------------------------------------
+ * Boot shell.
+ *
+ * The markup inside <fkit-app> in index.html, shown only until the element
+ * upgrades. It lives here rather than in app.tsx because that stylesheet is
+ * adopted into a shadow root and cannot reach light-DOM children.
+ *
+ * These rules mirror `header` in app.tsx. They are duplicated on purpose: the
+ * whole point is to paint before the module that defines the real one has
+ * parsed. Keep them in step — a boot bar of a different height would trade the
+ * blank flash for a jump.
+ * ------------------------------------------------------------------------ */
+.boot-bar {
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+.boot-wrap {
+  max-width: 1440px;
+  margin: 0 auto;
+  padding: 0 18px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  height: 38px;
+}
+.boot-brand {
+  display: flex;
+  align-items: baseline;
+  gap: 1px;
+  color: var(--text);
+  font-weight: 600;
+}
+.boot-brand .k { color: var(--accent); }
+.boot-tail {
+  color: var(--faint);
+  font-weight: 400;
+  margin-left: 7px;
+  font-size: 11px;
+}
+.boot-nav { color: var(--muted); font-size: 12px; }

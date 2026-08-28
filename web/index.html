@@ -9,7 +9,26 @@
     <link rel="stylesheet" href="/src/styles.css" />
   </head>
   <body>
-    <fkit-app></fkit-app>
+    <fkit-app>
+      <!--
+        The first frame. Until the module parses and upgrades <fkit-app> there
+        is nothing here to draw, and the whole page used to arrive at once
+        about 75ms in — the blank-then-everything flash.
+
+        These are light-DOM children, so they stop being rendered the instant a
+        shadow root attaches: the real header replaces this rather than having
+        to be cleaned up. It is deliberately only the parts that never change,
+        because anything conditional would be a guess that has to be corrected.
+      -->
+      <div class="boot" aria-hidden="true">
+        <div class="boot-bar">
+          <div class="boot-wrap">
+            <span class="boot-brand"><span class="k">f</span>kit<span class="boot-tail">hub</span></span>
+            <span class="boot-nav">Repositories</span>
+          </div>
+        </div>
+      </div>
+    </fkit-app>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
