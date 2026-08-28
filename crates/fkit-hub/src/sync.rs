@@ -127,9 +127,17 @@ impl RepoHost for PgHost {
                 if old == tip {
                     return Ok(RefUpdate::AlreadyCurrent);
                 }
-                // Reachability is a pure question about the object store, so it
-                // is safe to answer while holding the row lock.
-                if !force && !is_ancestor(&self.store, old, tip)? {
+                // A tag has no history to fast-forward along. Moving one makes
+                // every checkout of that name silently mean something else, so
+                // it takes an explicit force rather than passing the ancestry
+                // test a later commit would happen to satisfy.
+                if fkit_core::session::is_tag(branch) {
+                    if !force {
+                        return Ok(RefUpdate::NotFastForward);
+                    }
+                } else if !force && !is_ancestor(&self.store, old, tip)? {
+                    // Reachability is a pure question about the object store,
+                    // so it is safe to answer while holding the row lock.
                     return Ok(RefUpdate::NotFastForward);
                 }
             }

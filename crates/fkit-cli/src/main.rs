@@ -41,6 +41,10 @@ BRANCHES
     branch                   list branches
     branch <name>            create a branch at HEAD
     branch -d <name>         delete a branch
+    tag                      list tags
+    tag <name> [<commit>]    tag a commit (HEAD by default); tags do not move
+    tag -f <name> [<commit>] move a tag anyway
+    tag -d <name>            delete a tag
     switch <name>            move HEAD to a branch and update the working tree
     merge <branch>           merge another branch into the current one
         -m <message>         message for the merge commit
@@ -51,7 +55,8 @@ REMOTES
     remote [<url>]           show or set the remote (ws://host:7420/repo)
     clone <url> [<dir>]      copy a remote repository
         --no-checkout        fetch objects and refs, write no files
-    push [<branch>] [--force]   send commits to the remote
+    push [<branch>] [--force] [--no-tags]
+                             send commits and tags to the remote
     pull [<branch>]          fetch commits from the remote and update
 
 INSPECTION
@@ -111,6 +116,7 @@ fn run() -> Result<()> {
         "log" => cmd_log(rest),
         "diff" => cmd_diff(rest),
         "branch" => cmd_branch(rest),
+        "tag" => cmd_tag(rest),
         "switch" => cmd_switch(rest),
         "merge" => cmd_merge(rest),
         "checkout" => cmd_checkout(rest),
@@ -145,6 +151,11 @@ fn resolve(repo: &Repo, spec: &str) -> Result<Hash> {
             .context("HEAD does not point at a commit yet (no commits in this repo)");
     }
     if let Some(h) = repo.read_ref(spec)? {
+        return Ok(h);
+    }
+    // Tags resolve after branches: a branch and a tag may share a name, and
+    // the branch is the one you are more likely to be working on.
+    if let Some(h) = repo.read_tag(spec.strip_prefix(Repo::TAG_PREFIX).unwrap_or(spec))? {
         return Ok(h);
     }
     repo.store.resolve_prefix(spec)
@@ -528,6 +539,73 @@ fn read_side(
     Ok(buf)
 }
 
+/// `fkit tag` — mark a commit with a name.
+///
+/// Tags are refs, stored beside branches and pushed with them. The difference
+/// that matters is that a tag does not move: it is a claim about what a name
+/// meant at a moment, and repointing it makes every earlier checkout of that
+/// name silently wrong.
+fn cmd_tag(args: &[String]) -> Result<()> {
+    let repo = here()?;
+    let mut force = false;
+    let mut delete = false;
+    let mut positional: Vec<&String> = Vec::new();
+    for a in args {
+        match a.as_str() {
+            "--force" | "-f" => force = true,
+            "--delete" | "-d" => delete = true,
+            other if other.starts_with('-') => bail!("unknown option '{other}'"),
+            _ => positional.push(a),
+        }
+    }
+
+    if delete {
+        let name = positional.first().context("usage: fkit tag -d <name>")?;
+        repo.delete_tag(name)?;
+        println!("deleted tag {name}");
+        return Ok(());
+    }
+
+    let Some(name) = positional.first() else {
+        let tags = repo.list_tags()?;
+        if tags.is_empty() {
+            println!("no tags — create one with: fkit tag v1.0");
+            return Ok(());
+        }
+        for (name, hash) in &tags {
+            let summary = match repo.store.get(*hash) {
+                Ok(Object::Commit(c)) => c.message.lines().next().unwrap_or_default().to_string(),
+                _ => String::new(),
+            };
+            println!("  {:<20} {}  {summary}", name, hash.short());
+        }
+        return Ok(());
+    };
+
+    if !fkit_core::session::valid_tag(name) {
+        bail!(
+            "'{name}' is not a valid tag name — letters, digits, dot, underscore \
+             and hyphen, starting with a letter or digit"
+        );
+    }
+
+    // Default to whatever HEAD is on, which is what you almost always mean
+    // right after committing a release.
+    let target = match positional.get(1) {
+        Some(spec) => resolve(&repo, spec)?,
+        None => repo.head_commit()?.context("no commits yet — nothing to tag")?,
+    };
+    // Naming a tree or a chunk as a release would be meaningless.
+    match repo.store.get(target)? {
+        Object::Commit(_) => {}
+        other => bail!("{} is a {}, not a commit", target.short(), other.kind().name()),
+    }
+
+    repo.write_tag(name, target, force)?;
+    println!("tag {name} -> {}", target.short());
+    Ok(())
+}
+
 fn cmd_branch(args: &[String]) -> Result<()> {
     let repo = here()?;
     match args {
@@ -556,6 +634,12 @@ fn cmd_branch(args: &[String]) -> Result<()> {
             Ok(())
         }
         [name] => {
+            if !fkit_core::session::valid_new_branch(name) {
+                bail!(
+                    "'{name}' is not a usable branch name — 'tags/' is reserved for tags, \
+                     and a name must start with a letter or digit"
+                );
+            }
             if repo.read_ref(name)?.is_some() {
                 bail!("branch '{name}' already exists");
             }
@@ -988,9 +1072,16 @@ fn cmd_remote(args: &[String]) -> Result<()> {
 fn cmd_push(args: &[String]) -> Result<()> {
     let repo = here()?;
     let mut force = false;
+    let mut with_tags = true;
     let mut branch = None;
     for a in args {
-        if a == "--force" || a == "-f" { force = true } else { branch = Some(a.clone()) }
+        match a.as_str() {
+            "--force" | "-f" => force = true,
+            // Tags ride along by default: a release tag left behind on the
+            // machine that made it is a tag nobody else can act on.
+            "--no-tags" => with_tags = false,
+            other => branch = Some(other.to_string()),
+        }
     }
     let branch = match branch {
         Some(b) => b,
@@ -1022,7 +1113,59 @@ fn cmd_push(args: &[String]) -> Result<()> {
         }
         other => bail!("unexpected reply: {other:?}"),
     }
+
+    if with_tags {
+        push_tags(&repo, &mut ws)?;
+    }
     ws.close();
+    Ok(())
+}
+
+/// The first line of an error chain, for a one-line report.
+fn first_line(e: &anyhow::Error) -> String {
+    let s = e.to_string();
+    s.lines().next().unwrap_or(&s).trim_start_matches("remote error: ").to_string()
+}
+
+/// Send every local tag the remote does not already have at the same commit.
+///
+/// Done after the branch, on the same connection, so the commits a tag names
+/// are already there. A tag whose commit is not reachable from any branch is
+/// still sent — the server asks for what it lacks either way.
+fn push_tags(repo: &Repo, ws: &mut WebSocket) -> Result<()> {
+    let tags = repo.list_tags()?;
+    if tags.is_empty() {
+        return Ok(());
+    }
+
+    let mut sent = 0usize;
+    let mut objects = 0usize;
+    let mut skipped = Vec::new();
+    for (name, tip) in &tags {
+        let remote_name = format!("{}{name}", Repo::TAG_PREFIX);
+        send(ws, &Msg::PushRef { branch: remote_name, tip: *tip, force: false })?;
+
+        // A rejection arrives as an Error, which `recv` raises rather than
+        // returns — so a conflicting tag would otherwise abort the whole push
+        // and take the tags after it with it. The server stays in its command
+        // loop after refusing, so the connection is fine to keep using.
+        match serve_wants(&repo.store, ws).and_then(|stats| {
+            objects += stats.objects as usize;
+            recv(ws)
+        }) {
+            Ok(Msg::Ok { .. }) => sent += 1,
+            Ok(other) => bail!("unexpected reply pushing tag {name}: {other:?}"),
+            Err(e) => skipped.push(format!("{name}: {}", first_line(&e))),
+        }
+    }
+
+    match objects {
+        0 => println!("  {sent} tag(s) already current"),
+        n => println!("  {sent} tag(s), {n} new object(s)"),
+    }
+    for s in &skipped {
+        println!("  tag not pushed — {s}");
+    }
     Ok(())
 }
 
@@ -1079,16 +1222,32 @@ fn pull_branch(
     let stats = fetch_closure(&repo.store, ws, &[tip])?;
     verify_closure(&repo.store, tip)?;
 
-    if let Some(old) = repo.read_ref(branch)?
-        && old != tip && !is_ancestor(&repo.store, old, tip)? {
-            bail!(
-                "refusing to pull: your local '{branch}' ({}) is not an ancestor of the \
-                 remote's ({}) — histories have diverged",
+    if let Some(tag) = branch.strip_prefix(Repo::TAG_PREFIX) {
+        // A tag has no history to fast-forward. If the remote's differs from
+        // ours, one of them is a lie about what the name meant; say so rather
+        // than picking a winner.
+        match repo.read_tag(tag)? {
+            Some(old) if old != tip => bail!(
+                "refusing to pull: tag '{tag}' is {} here and {} on the remote — \
+                 delete the local tag if the remote's is the one you want",
                 old.short(),
                 tip.short()
-            );
+            ),
+            Some(_) => {}
+            None => repo.write_tag(tag, tip, false)?,
         }
-    repo.write_ref(branch, tip)?;
+    } else {
+        if let Some(old) = repo.read_ref(branch)?
+            && old != tip && !is_ancestor(&repo.store, old, tip)? {
+                bail!(
+                    "refusing to pull: your local '{branch}' ({}) is not an ancestor of the \
+                     remote's ({}) — histories have diverged",
+                    old.short(),
+                    tip.short()
+                );
+            }
+        repo.write_ref(branch, tip)?;
+    }
 
     // Drain the server's trailing Ok.
     let _ = recv(ws);
@@ -1129,20 +1288,29 @@ fn cmd_clone(args: &[String]) -> Result<()> {
 
     println!("cloning {url} into {}", dir.display());
     let mut total = fkit_core::proto::TransferStats::default();
-    for (branch, _) in &refs {
-        let s = pull_branch(&repo, &mut ws, branch)?;
-        println!("  branch {branch}: {} object(s)", s.objects);
+    for (name, _) in &refs {
+        let s = pull_branch(&repo, &mut ws, name)?;
+        match name.strip_prefix(Repo::TAG_PREFIX) {
+            Some(tag) => println!("  tag {tag}: {} object(s)", s.objects),
+            None => println!("  branch {name}: {} object(s)", s.objects),
+        }
         total.objects += s.objects;
         total.bytes += s.bytes;
         total.round_trips += s.round_trips;
     }
     ws.close();
 
-    // Prefer 'main', else whatever came first.
-    let primary = if refs.iter().any(|(n, _)| n == "main") {
+    // Prefer 'main', else the first branch. A tag is not a place to stand:
+    // checking one out would leave HEAD detached on a fresh clone.
+    let branches: Vec<&String> =
+        refs.iter().map(|(n, _)| n).filter(|n| !n.starts_with(Repo::TAG_PREFIX)).collect();
+    let primary = if branches.iter().any(|n| *n == "main") {
         "main".to_string()
     } else {
-        refs[0].0.clone()
+        branches
+            .first()
+            .map(|n| (*n).clone())
+            .context("remote has tags but no branches — nothing to check out")?
     };
     repo.set_head(&Head::Branch(primary.clone()))?;
     let tip = repo.read_ref(&primary)?.context("missing tip after clone")?;
@@ -1299,7 +1467,10 @@ fn cmd_gc(args: &[String]) -> Result<()> {
     // Roots: every branch, plus HEAD and any merge in progress. Missing
     // MERGE_HEAD here would collect the other side of a conflict the user is
     // still resolving.
-    let mut roots: Vec<Hash> = repo.list_refs()?.into_values().collect();
+    // all_refs, not list_refs: a tag is a root. A release tagged on a branch
+    // that was since deleted is exactly the history someone still needs, and
+    // collecting it would destroy the only thing pointing at it.
+    let mut roots: Vec<Hash> = repo.all_refs()?.into_values().collect();
     if let Some(h) = repo.head_commit()? {
         roots.push(h);
     }
@@ -1637,7 +1808,7 @@ fn cmd_stats() -> Result<()> {
 
     // Logical size = what a naive checkout of every commit would occupy.
     let mut logical = 0u64;
-    for (_, commit) in repo.list_refs()? {
+    for (_, commit) in repo.all_refs()? {
         for (id, _) in repo.history(commit, usize::MAX)? {
             if let Ok(Object::Commit(c)) = repo.store.get(id) {
                 let files = repo.walk_tree(c.tree)?;

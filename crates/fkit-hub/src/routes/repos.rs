@@ -287,11 +287,18 @@ async fn delete_repo(
 
 #[derive(Serialize)]
 pub struct RefView {
+    /// The bare name: the `tags/` prefix is a namespace marker on the wire,
+    /// not part of what the tag is called.
     pub name: String,
     pub target: String,
     pub short: String,
     pub updated_at: chrono::DateTime<chrono::Utc>,
     pub is_default: bool,
+    /// "branch" or "tag".
+    pub kind: &'static str,
+    /// The commit this ref points at, so a listing can say what was released
+    /// without a request per row.
+    pub head: Option<crate::models::HeadView>,
 }
 
 async fn list_refs(
@@ -311,19 +318,44 @@ pub async fn refs_of(state: &AppState, repo: &RepoRow) -> AppResult<Vec<RefView>
     .fetch_all(&state.db)
     .await?;
 
+    let store = state.store_for(repo.id).ok();
+
     Ok(rows
         .into_iter()
         .filter_map(|(n, t, u)| {
             let h = Hash(t.try_into().ok()?);
+            let (kind, name) = match n.strip_prefix(fkit_core::session::TAG_PREFIX) {
+                Some(bare) => ("tag", bare.to_string()),
+                None => ("branch", n),
+            };
             Some(RefView {
-                is_default: n == repo.default_branch,
-                name: n,
+                is_default: kind == "branch" && name == repo.default_branch,
                 target: h.to_hex(),
                 short: h.short(),
                 updated_at: u,
+                kind,
+                head: store.as_ref().and_then(|s| head_view(s, h)),
+                name,
             })
         })
         .collect())
+}
+
+/// Summarise the commit a ref points at. `None` if the object is missing or is
+/// not a commit, which a listing should render as a ref with no detail rather
+/// than as an error.
+pub fn head_view(store: &fkit_core::Store, hash: Hash) -> Option<crate::models::HeadView> {
+    let fkit_core::Object::Commit(c) = store.get(hash).ok()? else {
+        return None;
+    };
+    let hex = hash.to_hex();
+    Some(crate::models::HeadView {
+        short: hex[..10].to_string(),
+        commit: hex,
+        summary: c.message.lines().next().unwrap_or_default().to_string(),
+        author: c.author,
+        timestamp: c.timestamp,
+    })
 }
 
 async fn list_collaborators(

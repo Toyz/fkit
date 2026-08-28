@@ -60,7 +60,9 @@ pub fn fsck(repo: &Repo) -> Result<FsckReport> {
 
     // Reachability: everything findable from any branch or from HEAD.
     let mut reachable = HashSet::new();
-    let mut stack: Vec<Hash> = repo.list_refs()?.values().copied().collect();
+    // Tags are roots too, or a commit kept alive only by a tag is reported as
+    // unreachable — and the advice fsck gives for that is to garbage collect.
+    let mut stack: Vec<Hash> = repo.all_refs()?.values().copied().collect();
     if let Some(h) = repo.head_commit()? {
         stack.push(h);
     }

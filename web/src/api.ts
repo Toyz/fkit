@@ -40,11 +40,15 @@ export interface Repo {
 }
 
 export interface Ref {
+  /** The bare name — a tag's `tags/` prefix is stripped by the server. */
   name: string;
   target: string;
   short: string;
   updated_at: string;
   is_default: boolean;
+  kind: "branch" | "tag";
+  /** The commit it points at. */
+  head: Head | null;
 }
 
 export interface Entry {

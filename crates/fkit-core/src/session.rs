@@ -47,9 +47,15 @@ pub trait RepoHost {
     fn on_pull(&self, _branch: &str, _stats: &TransferStats) {}
 }
 
-/// Branch names become path components in some backends and column values in
+/// Ref names become path components in some backends and column values in
 /// others, so they are validated once, centrally.
+///
+/// Branch names may contain `/`, so the tag namespace cannot simply claim the
+/// character. `tags/` is reserved instead: it is stripped here so a tag ref
+/// validates as its bare name, and [`valid_new_branch`] refuses to create a
+/// branch that would land inside it.
 pub fn valid_branch(name: &str) -> bool {
+    let name = name.strip_prefix(TAG_PREFIX).unwrap_or(name);
     !name.is_empty()
         && name.len() <= 127
         && name.starts_with(|c: char| c.is_ascii_alphanumeric())
@@ -57,6 +63,29 @@ pub fn valid_branch(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+}
+
+/// Duplicated from `Repo` so the protocol layer does not depend on a working
+/// tree — a server has refs but no checkout.
+pub const TAG_PREFIX: &str = "tags/";
+
+/// Is this ref a tag rather than a branch?
+pub fn is_tag(name: &str) -> bool {
+    name.starts_with(TAG_PREFIX)
+}
+
+/// May a *branch* be created with this name?
+///
+/// Same rules, minus the tag namespace. Without this a branch called `tags/v1`
+/// would arrive at the server indistinguishable from the tag `v1`.
+pub fn valid_new_branch(name: &str) -> bool {
+    valid_branch(name) && !is_tag(name)
+}
+
+/// A tag name: like a branch, but flat. Tags are stored one per file in a
+/// single directory, and a `/` would nest them where nothing looks.
+pub fn valid_tag(name: &str) -> bool {
+    valid_branch(name) && !name.contains('/')
 }
 
 /// Read the opening `Hello`, returning `(repo, token)`.
@@ -137,13 +166,20 @@ pub fn serve_session<T: Transport + ?Sized, H: RepoHost + ?Sized>(
                         })?;
                     }
                     RefUpdate::NotFastForward => {
-                        send_error(
-                            t,
-                            format!(
+                        // A tag has no ancestry to be behind, so the branch
+                        // advice — "pull first" — would send someone looking
+                        // for a merge that does not exist.
+                        let message = match branch.strip_prefix(TAG_PREFIX) {
+                            Some(tag) => format!(
+                                "rejected: tag {tag} already exists on the server at a \
+                                 different commit (delete it there, or push with --force)"
+                            ),
+                            None => format!(
                                 "rejected: {branch} on the server is not an ancestor of your \
                                  commit (pull first, or push with --force)"
                             ),
-                        )?;
+                        };
+                        send_error(t, message)?;
                     }
                 }
             }
@@ -183,5 +219,21 @@ mod tests {
         for bad in ["", "-leading", "/leading", "has space", "a..b", "with\\slash", &"x".repeat(128)] {
             assert!(!valid_branch(bad), "should reject {bad:?}");
         }
+    }
+
+    #[test]
+    fn the_tag_namespace_is_reserved_against_branches() {
+        // A tag ref validates as its bare name...
+        assert!(valid_branch("tags/v1.0"));
+        assert!(is_tag("tags/v1.0"));
+        // ...but nothing may create a branch that lands in the namespace,
+        // which would otherwise be indistinguishable on the wire.
+        assert!(!valid_new_branch("tags/v1.0"));
+        assert!(valid_new_branch("feature/x"), "slashes are still fine in a branch");
+
+        // Tag names are flat: they are one file in one directory.
+        assert!(valid_tag("v1.0"));
+        assert!(!valid_tag("release/v1.0"));
+        assert!(!valid_tag(""));
     }
 }

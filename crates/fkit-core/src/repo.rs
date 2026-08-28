@@ -200,14 +200,51 @@ impl Repo {
         self.meta().join("refs").join("heads").join(branch)
     }
 
-    pub fn read_ref(&self, branch: &str) -> Result<Option<Hash>> {
-        match fs::read_to_string(self.ref_path(branch)) {
-            Ok(s) => Hash::from_hex(s.trim())
-                .map(Some)
-                .context("branch file does not contain a valid hash"),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
+    /// Tags travel in the same ref namespace as branches, distinguished by
+    /// this prefix. One namespace keeps the wire protocol and the hub's refs
+    /// table unchanged — a tag is a ref like any other — while a branch called
+    /// `tags/x` is impossible because the prefix is stripped before a branch
+    /// name is ever validated.
+    pub const TAG_PREFIX: &'static str = "tags/";
+
+    fn tag_path(&self, name: &str) -> PathBuf {
+        self.meta().join("refs").join("tags").join(name)
+    }
+
+    pub fn read_tag(&self, name: &str) -> Result<Option<Hash>> {
+        read_hash_file(&self.tag_path(name))
+    }
+
+    /// Point a tag at a commit.
+    ///
+    /// Refuses to move an existing tag unless `force`. A tag is a claim about
+    /// what a name meant at a moment; silently repointing it makes every
+    /// checkout of that name a different tree, and nothing downstream can tell.
+    pub fn write_tag(&self, name: &str, commit: Hash, force: bool) -> Result<()> {
+        if !force && let Some(old) = self.read_tag(name)? {
+            if old == commit {
+                return Ok(());
+            }
+            bail!("tag '{name}' already points at {} — pass --force to move it", old.short());
         }
+        let p = self.tag_path(name);
+        fs::create_dir_all(p.parent().unwrap())?;
+        fs::write(p, format!("{commit}\n"))?;
+        Ok(())
+    }
+
+    pub fn delete_tag(&self, name: &str) -> Result<()> {
+        fs::remove_file(self.tag_path(name))
+            .with_context(|| format!("no such tag: {name}"))?;
+        Ok(())
+    }
+
+    pub fn list_tags(&self) -> Result<BTreeMap<String, Hash>> {
+        read_ref_dir(&self.meta().join("refs").join("tags"))
+    }
+
+    pub fn read_ref(&self, branch: &str) -> Result<Option<Hash>> {
+        read_hash_file(&self.ref_path(branch))
     }
 
     pub fn write_ref(&self, branch: &str, commit: Hash) -> Result<()> {
@@ -224,17 +261,15 @@ impl Repo {
     }
 
     pub fn list_refs(&self) -> Result<BTreeMap<String, Hash>> {
-        let mut out = BTreeMap::new();
-        let dir = self.meta().join("refs").join("heads");
-        if !dir.exists() {
-            return Ok(out);
-        }
-        for e in fs::read_dir(dir)? {
-            let e = e?;
-            let name = e.file_name().to_string_lossy().to_string();
-            if let Some(h) = self.read_ref(&name)? {
-                out.insert(name, h);
-            }
+        read_ref_dir(&self.meta().join("refs").join("heads"))
+    }
+
+    /// Every ref, in the one namespace the protocol and the hub speak: branches
+    /// under their own names, tags under `tags/`.
+    pub fn all_refs(&self) -> Result<BTreeMap<String, Hash>> {
+        let mut out = self.list_refs()?;
+        for (name, hash) in self.list_tags()? {
+            out.insert(format!("{}{name}", Self::TAG_PREFIX), hash);
         }
         Ok(out)
     }
@@ -558,4 +593,40 @@ pub fn diff_trees(view: &View, old: Option<Hash>, new: Option<Hash>) -> Result<V
     }
     changes.sort_by(|x, y| x.path().cmp(y.path()));
     Ok(changes)
+}
+
+fn read_hash_file(path: &Path) -> Result<Option<Hash>> {
+    match fs::read_to_string(path) {
+        Ok(s) => Hash::from_hex(s.trim())
+            .map(Some)
+            .context("ref file does not contain a valid hash"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        // An empty ref name resolves to the refs directory itself, and a
+        // nested branch leaves a directory where a sibling ref looks for a
+        // file. Neither is a ref; both used to surface as a raw
+        // "Is a directory (os error 21)".
+        Err(e) if e.kind() == std::io::ErrorKind::IsADirectory => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Every ref in one flat directory. Not recursive: a ref name may contain `/`
+/// on the wire, but on disk branches and tags live in separate directories and
+/// a nested name would be a name with a slash in it, which is rejected.
+fn read_ref_dir(dir: &Path) -> Result<BTreeMap<String, Hash>> {
+    let mut out = BTreeMap::new();
+    if !dir.exists() {
+        return Ok(out);
+    }
+    for e in fs::read_dir(dir)? {
+        let e = e?;
+        if !e.file_type()?.is_file() {
+            continue;
+        }
+        let name = e.file_name().to_string_lossy().to_string();
+        if let Some(h) = read_hash_file(&e.path())? {
+            out.insert(name, h);
+        }
+    }
+    Ok(out)
 }

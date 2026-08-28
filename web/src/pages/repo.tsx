@@ -53,6 +53,7 @@ type View =
   | { kind: "commits"; ref: string }
   | { kind: "commit"; hash: string }
   | { kind: "compare"; base: string; head: string }
+  | { kind: "tags" }
   | { kind: "merges" }
   | { kind: "merge"; number: number }
   | { kind: "settings"; section: string }
@@ -68,6 +69,7 @@ function parse(): { owner: string; name: string; view: View } | null {
   if (kind === "settings") {
     return { owner, name, view: { kind: "settings", section: rest[0] ?? "general" } };
   }
+  if (kind === "tags") return { owner, name, view: { kind: "tags" } };
   if (kind === "merges") {
     const n = rest[0] ? Number(rest[0]) : NaN;
     return {
@@ -231,6 +233,27 @@ const sheet = css`
     color: var(--muted); font-size: 11.5px; font-family: var(--sans);
     margin-top: 4px; line-height: 1.45;
   }
+  /* Tags: one line each, same rhythm as a file row. */
+  .tagrow {
+    display: grid; grid-template-columns: 16px minmax(0, 1fr) auto auto;
+    align-items: center; gap: 10px;
+    height: var(--row); padding: 0 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  .tagrow:last-child { border-bottom: 0; }
+  .tagrow:hover { background: var(--raised); }
+  .tagrow .ic { color: var(--faint); display: flex; }
+  .tagrow .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tagrow .nm a { color: var(--accent); }
+  .tagrow .msg {
+    font-family: var(--sans); color: var(--muted); font-size: 12px; margin-left: 10px;
+  }
+  .tagrow .sha {
+    font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums;
+  }
+  .tagrow .sha:hover { color: var(--accent); }
+  .tagrow .when { color: var(--faint); font-size: 11px; white-space: nowrap; }
+
   .collab-note {
     color: var(--muted); font-size: 11.5px; font-family: var(--sans);
     margin-top: 9px; line-height: 1.5;
@@ -523,6 +546,17 @@ export class PageRepo extends LoomElement {
     await this.loadView();
   }
 
+  /** Branches only. `refs` carries tags too, and neither the branch picker
+   *  nor the default-branch setting may offer one: a tag is not somewhere you
+   *  can commit. */
+  private branches(): Ref[] {
+    return this.refs.filter((r) => r.kind !== "tag");
+  }
+
+  private tags(): Ref[] {
+    return this.refs.filter((r) => r.kind === "tag");
+  }
+
   private ref(): string {
     const v = this.loc?.view;
     const explicit = v && "ref" in v ? v.ref : "";
@@ -553,7 +587,7 @@ export class PageRepo extends LoomElement {
     this.collapsed = {};
 
     // A repository with no commits has no refs to browse.
-    if (this.refs.length === 0 && v.kind !== "settings") return;
+    if (this.branches().length === 0 && v.kind !== "settings") return;
 
     try {
       if (v.kind === "tree") {
@@ -1008,9 +1042,9 @@ export class PageRepo extends LoomElement {
       <div>
         <div class="cmp-bar">
           <span class="muted">merge</span>
-          <branch-picker refs={this.refs} current={v.head} onPick={pick("head")}></branch-picker>
+          <branch-picker refs={this.branches()} current={v.head} onPick={pick("head")}></branch-picker>
           <span class="muted">into</span>
-          <branch-picker refs={this.refs} current={v.base} onPick={pick("base")}></branch-picker>
+          <branch-picker refs={this.branches()} current={v.base} onPick={pick("base")}></branch-picker>
           <button class="bare" onClick={swap} title="swap sides">swap</button>
         </div>
 
@@ -1115,6 +1149,66 @@ export class PageRepo extends LoomElement {
 
   private stateTag(state: string) {
     return <span class={`mstate ${state}`}>{state}</span>;
+  }
+
+  /**
+   * Tags — the releases view.
+   *
+   * A tag is a ref that does not move, so the row says what it names rather
+   * than only that it exists: the commit's summary, who made it, and when.
+   * Sorted newest-first by the commit's own timestamp, not the ref's
+   * updated_at, because pushing an old tag later should not put it on top.
+   */
+  private renderTags() {
+    const at = this.loc!;
+    const tags = this.tags().slice().sort((a, b) => {
+      const ta = a.head?.timestamp ?? 0;
+      const tb = b.head?.timestamp ?? 0;
+      return tb - ta || a.name.localeCompare(b.name);
+    });
+
+    if (tags.length === 0) {
+      return (
+        <div class="panel">
+          <div class="panel-head"><span>tags</span></div>
+          <div class="empty">
+            <h2>no tags yet</h2>
+            <p class="prose">
+              A tag marks a commit with a name that does not move — a release, a
+              revision someone else has to be able to find again.
+            </p>
+            <pre class="cmd">fkit tag v1.0
+fkit push</pre>
+          </div>
+        </div>
+      );
+    }
+
+    return (
+      <div class="panel">
+        <div class="panel-head">
+          <span>tags</span>
+          <span class="val">{tags.length}</span>
+        </div>
+        {tags.map((t) => {
+          const tree = `/${at.owner}/${at.name}/tree/${t.name}`;
+          const commit = `/${at.owner}/${at.name}/commit/${t.target}`;
+          return (
+            <div class="tagrow">
+              <span class="ic"><loom-icon name="tag" size={13}></loom-icon></span>
+              <span class="nm">
+                <a href={tree} onClick={linkHandler(tree)}>{t.name}</a>
+                {t.head ? <span class="msg">{t.head.summary}</span> : null}
+              </span>
+              <a class="sha" href={commit} onClick={linkHandler(commit)}>{t.short}</a>
+              <span class="when">
+                {t.head ? relativeTime(t.head.timestamp) : relativeTime(t.updated_at)}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    );
   }
 
   private renderMergeList() {
@@ -1596,7 +1690,7 @@ export class PageRepo extends LoomElement {
             <div class="row">
               <fkit-select
                 value={r.default_branch}
-                options={this.refs.map((b) => ({ value: b.name, label: b.name, hint: b.short }))}
+                options={this.branches().map((b) => ({ value: b.name, label: b.name, hint: b.short }))}
                 onPick={(e: Event) => {
                   const v = (e as CustomEvent<string>).detail;
                   void this.act(async () => {
@@ -1605,7 +1699,7 @@ export class PageRepo extends LoomElement {
                 }}
               ></fkit-select>
               <span class="fd" style="margin:0">
-                Opened when a URL names no branch. {this.refs.length} branch(es) available.
+                Opened when a URL names no branch. {this.branches().length} branch(es) available.
               </span>
             </div>
           </div>
@@ -1811,10 +1905,12 @@ export class PageRepo extends LoomElement {
     const ref = this.ref();
     const tab =
       v.kind === "commit" ? "commits" : v.kind === "merge" ? "merges" : v.kind;
-    const other = this.refs.find((b) => b.name !== r.default_branch)?.name ?? r.default_branch;
+    const other =
+      this.branches().find((b) => b.name !== r.default_branch)?.name ?? r.default_branch;
     const tabs: [string, string, string, string][] = [
       ["tree", "files", "file", `/${at.owner}/${at.name}/tree/${ref}`],
       ["commits", "history", "history", `/${at.owner}/${at.name}/commits/${ref}`],
+      ["tags", "tags", "tag", `/${at.owner}/${at.name}/tags`],
       ["merges", "merges", "merge", `/${at.owner}/${at.name}/merges`],
       [
         "compare",
@@ -1859,7 +1955,7 @@ export class PageRepo extends LoomElement {
 
         {this.error ? <div class="error">{this.error}</div> : null}
 
-        {this.refs.length === 0 && v.kind !== "settings" ? (
+        {this.branches().length === 0 && v.kind !== "settings" ? (
           <div class="panel">
             <div class="panel-head"><span>this repository is empty</span></div>
             <div class="panel-body">{this.renderSetup(r)}</div>
@@ -1868,6 +1964,8 @@ export class PageRepo extends LoomElement {
           this.renderSettings()
         ) : v.kind === "compare" ? (
           this.renderCompare()
+        ) : v.kind === "tags" ? (
+          this.renderTags()
         ) : v.kind === "merges" ? (
           this.renderMergeList()
         ) : v.kind === "merge" ? (
@@ -1901,7 +1999,7 @@ export class PageRepo extends LoomElement {
               {v.kind !== "commits" ? this.renderCrumbs(v.kind === "tree" || v.kind === "blob" ? v.path : "") : null}
               <div style="flex:1"></div>
               <branch-picker
-                refs={this.refs}
+                refs={this.branches()}
                 current={ref}
                 onPick={(e: Event) => this.switchRef((e as CustomEvent<string>).detail)}
               ></branch-picker>

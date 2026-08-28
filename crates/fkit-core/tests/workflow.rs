@@ -262,3 +262,34 @@ fn executable_bit_and_symlinks_survive_a_round_trip() {
     }
     let _ = tree_of(&repo, first.commit);
 }
+
+/// A commit kept alive only by a tag must survive garbage collection.
+///
+/// Roots came from branches alone, so tagging a release and then deleting the
+/// branch left the tag pointing at objects the very next `gc` would delete.
+#[test]
+fn gc_keeps_a_commit_that_only_a_tag_points_at() {
+    let tmp = Tmp::new("gc-tag");
+    let repo = Repo::init(&tmp.0).unwrap();
+    repo.config_set("author.name", "tester").unwrap();
+    repo.config_set("author.email", "t@e").unwrap();
+
+    write(&tmp.0, "a.txt", "release one\n");
+    repo.commit("first").unwrap();
+    let released = repo.head_commit().unwrap().unwrap();
+    repo.write_tag("v1.0", released, false).unwrap();
+
+    // Move the branch on, so nothing but the tag reaches the first commit.
+    write(&tmp.0, "a.txt", "release two\n");
+    repo.commit("second").unwrap();
+
+    let roots: Vec<_> = repo.all_refs().unwrap().into_values().collect();
+    let live = fkit_core::gc::reachable(&repo.store, &roots).unwrap();
+    assert!(
+        live.contains(&released),
+        "the tagged commit must be reachable, or gc would delete the release"
+    );
+
+    // And the tag still resolves to it afterwards.
+    assert_eq!(repo.read_tag("v1.0").unwrap(), Some(released));
+}
