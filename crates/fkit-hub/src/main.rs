@@ -87,6 +87,7 @@ async fn main() -> Result<()> {
         secure_cookies: cfg.secure_cookies,
         web_dir: cfg.web_dir.clone(),
         settings,
+        max_archive_bytes: cfg.max_archive_bytes,
     };
 
     let api = Router::new()

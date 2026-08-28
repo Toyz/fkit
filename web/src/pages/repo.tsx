@@ -2698,6 +2698,7 @@ fkit push</pre>
               <clone-button
                 url={syncUrl(r.owner, r.name)}
                 visibility={r.visibility}
+                archive={`/api/repos/${r.owner}/${r.name}/archive/${encodeURIComponent(ref)}`}
               ></clone-button>
             </div>
 

@@ -6,6 +6,7 @@
 
 use crate::auth::Viewer;
 use crate::content;
+use fkit_core::archive::EPOCH;
 use crate::error::{AppError, AppResult};
 use crate::models::RepoRow;
 use crate::state::AppState;
@@ -23,6 +24,7 @@ pub fn routes() -> Router<AppState> {
         .route("/repos/{owner}/{name}/blob/{ref}/{*path}", get(blob))
         .route("/repos/{owner}/{name}/commits/{ref}", get(commits))
         .route("/repos/{owner}/{name}/commit/{hash}", get(commit_detail))
+        .route("/repos/{owner}/{name}/archive/{spec}", get(archive))
         .route("/repos/{owner}/{name}/readme/{ref}", get(readme))
         .route("/repos/{owner}/{name}/readme/{ref}/{*path}", get(readme_at))
         .route("/repos/{owner}/{name}/lastcommits/{ref}", get(last_commits_root))
@@ -338,4 +340,206 @@ async fn readme_at(
     Ok(Json(
         content::find_readme(&store, dir).map(|(n, c)| ReadmeResponse { name: n, content: c }),
     ))
+}
+
+
+// ---- archives -----------------------------------------------------------
+
+/// Stream a `.tar`, `.tar.gz` or `.zip` of a tree.
+///
+/// The URL carries the format as an extension — `archive/main.zip` — so the
+/// browser gets a sensible filename without a header having to argue for one.
+///
+/// Nothing is buffered. The writer runs on a blocking thread and pushes into a
+/// bounded channel that the response body drains, so a slow client applies
+/// backpressure instead of filling memory, and a client that disappears kills
+/// the walk on its next write rather than reading a repository into a closed
+/// socket.
+async fn archive(
+    State(state): State<AppState>,
+    viewer: Viewer,
+    headers: axum::http::HeaderMap,
+    Path((owner, name, spec)): Path<(String, String, String)>,
+) -> AppResult<axum::response::Response> {
+    use axum::http::header;
+    use axum::response::IntoResponse;
+
+    // Longest extension first: "main.tar.gz" is a tarball, not a tar named
+    // "main.tar" with a stray suffix.
+    let (r, format) = if let Some(base) = spec.strip_suffix(".tar.gz") {
+        (base, Format::TarGz)
+    } else if let Some(base) = spec.strip_suffix(".tgz") {
+        (base, Format::TarGz)
+    } else if let Some(base) = spec.strip_suffix(".tar") {
+        (base, Format::Tar)
+    } else if let Some(base) = spec.strip_suffix(".zip") {
+        (base, Format::Zip)
+    } else {
+        return Err(AppError::bad(
+            "name the format in the extension: .zip, .tar or .tar.gz",
+        ));
+    };
+    if r.is_empty() {
+        return Err(AppError::bad("no branch, tag or commit named"));
+    }
+
+    let (repo, _, _) = super::load_repo(&state, &viewer, &owner, &name).await?;
+    let commit_id = resolve_ref(&state, &repo, r).await?;
+    let store = state.store_for(repo.id).map_err(AppError::Internal)?;
+    let tree = content::commit_of(&store, commit_id)?.tree;
+
+    // The archive of a tree is a pure function of the tree and the format, and
+    // the writers are deterministic — so this tag is not a heuristic, it is
+    // exact, and it can never need revalidating. A repeat visit costs a 304.
+    let etag = format!("\"{}-{}\"", tree.to_hex(), format.ext());
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(',').any(|t| t.trim() == etag))
+    {
+        return Ok((axum::http::StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
+    }
+
+    // Directory objects only: the size is known before a byte of content is
+    // read, so an oversized request is refused now rather than half way
+    // through a download.
+    let plan = fkit_core::archive::plan(&store, tree, "").map_err(AppError::Internal)?;
+    let limit = state.max_archive_bytes;
+    if limit > 0 && plan.bytes > limit {
+        return Err(AppError::bad(format!(
+            "that archive would hold {} of content, and this server's limit is {}",
+            human(plan.bytes),
+            human(limit)
+        )));
+    }
+
+    // `<repo>-<ref>`, with anything path-shaped flattened: a ref may contain a
+    // slash, and a Content-Disposition filename may not.
+    let stem = format!("{}-{}", repo.name, r.replace(['/', '\\'], "-"));
+    let filename = format!("{stem}.{}", format.ext());
+    let root = stem.clone();
+
+    // Bounded, so a slow reader stops the writer instead of queueing the whole
+    // repository in memory. Eight buffers is enough to keep the socket fed.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(8);
+    let tar_len = plan.tar_size();
+
+    tokio::task::spawn_blocking(move || {
+        let mut sink = ChannelWriter { tx: tx.clone(), buf: Vec::with_capacity(64 * 1024) };
+        let result = match format {
+            Format::Tar => fkit_core::archive::write_tar(&store, &plan, &root, EPOCH, &mut sink)
+                .and_then(|()| sink.finish().map_err(Into::into)),
+            Format::TarGz => {
+                let mut gz = flate2::write::GzEncoder::new(sink, flate2::Compression::fast());
+                fkit_core::archive::write_tar(&store, &plan, &root, EPOCH, &mut gz)
+                    .and_then(|()| gz.finish()?.finish().map_err(Into::into))
+            }
+            Format::Zip => fkit_core::archive::write_zip(&store, &plan, &root, &mut sink)
+                .and_then(|()| sink.finish().map_err(Into::into)),
+        };
+        // A failure part way through cannot un-send what has already gone, so
+        // the body is truncated and the error is logged. The client sees a
+        // short archive, which every extractor reports as corrupt — the honest
+        // outcome, and the reason the size checks above happen up front.
+        if let Err(e) = result {
+            tracing::warn!("archive of {owner}/{name} failed part way: {e:#}");
+            let _ = tx.blocking_send(Err(std::io::Error::other(e.to_string())));
+        }
+    });
+
+    let body = axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
+
+    let mut res = axum::response::Response::builder()
+        .header(header::CONTENT_TYPE, format.mime())
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        )
+        .header(header::ETAG, etag)
+        // Immutable: the tree hash is in the tag, so this body can never change.
+        .header(header::CACHE_CONTROL, "private, max-age=31536000, immutable");
+
+    // Only tar has a predictable length. Compressing or deflating would make
+    // any number here a guess, and a wrong Content-Length is worse than none.
+    if let Format::Tar = format {
+        res = res.header(header::CONTENT_LENGTH, tar_len);
+    }
+
+    res.body(body).map_err(|e| AppError::Internal(anyhow::anyhow!(e)))
+}
+
+#[derive(Clone, Copy)]
+enum Format {
+    Tar,
+    TarGz,
+    Zip,
+}
+
+impl Format {
+    fn ext(self) -> &'static str {
+        match self {
+            Format::Tar => "tar",
+            Format::TarGz => "tar.gz",
+            Format::Zip => "zip",
+        }
+    }
+    fn mime(self) -> &'static str {
+        match self {
+            Format::Tar => "application/x-tar",
+            Format::TarGz => "application/gzip",
+            Format::Zip => "application/zip",
+        }
+    }
+}
+
+/// A `Write` that forwards into the response channel.
+///
+/// Batched: the archive writers make many small writes — a 512-byte tar header,
+/// then a chunk — and one channel message each would be all overhead. A send
+/// that fails means the client is gone, which is reported as a broken pipe so
+/// the walk stops immediately.
+struct ChannelWriter {
+    tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    buf: Vec<u8>,
+}
+
+impl ChannelWriter {
+    fn push(&mut self) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let chunk = bytes::Bytes::from(std::mem::take(&mut self.buf));
+        self.buf = Vec::with_capacity(64 * 1024);
+        self.tx
+            .blocking_send(Ok(chunk))
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "client went away"))
+    }
+
+    fn finish(mut self) -> std::io::Result<()> {
+        self.push()
+    }
+}
+
+impl std::io::Write for ChannelWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        if self.buf.len() >= 64 * 1024 {
+            self.push()?;
+        }
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.push()
+    }
+}
+
+fn human(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = bytes as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 { format!("{bytes} B") } else { format!("{v:.1} {}", UNITS[u]) }
 }

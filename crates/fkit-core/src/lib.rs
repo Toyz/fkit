@@ -7,6 +7,7 @@
 //! 3. [`chunker`] — how file bytes are split so that edits stay cheap
 //! 4. [`store`]   — how objects live on disk
 
+pub mod archive;
 pub mod checkout;
 pub mod chunker;
 pub mod config;

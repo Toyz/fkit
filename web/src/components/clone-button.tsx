@@ -46,6 +46,21 @@ const sheet = css`
     padding: 6px 8px; font-size: 11.5px; color: var(--text);
     overflow-x: auto; white-space: nowrap;
   }
+  .dl { padding: 9px 10px; border-top: 1px solid var(--border); }
+  .dl .lbl {
+    display: block; font-size: 10.5px; color: var(--faint);
+    text-transform: uppercase; letter-spacing: .07em; margin-bottom: 7px;
+  }
+  .dl .fmts { display: flex; gap: 6px; }
+  .fmt {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 11.5px; padding: 3px 9px;
+    border: 1px solid var(--border-hi); border-radius: var(--radius);
+    color: var(--muted); text-decoration: none;
+  }
+  .fmt:hover { color: var(--accent); border-color: var(--accent); text-decoration: none; }
+  .fmt loom-icon { opacity: .8; }
+
   .note { color: var(--faint); font-size: 11px; font-family: var(--sans); line-height: 1.45; }
 `;
 
@@ -54,6 +69,8 @@ const sheet = css`
 export class CloneButton extends LoomElement {
   @prop accessor url = "";
   @prop accessor visibility = "public";
+  /** Base for the archive links, e.g. `/api/repos/helba/fkit/archive/main`. */
+  @prop accessor archive = "";
 
   @reactive accessor open = false;
   @reactive accessor copied = "";
@@ -119,6 +136,23 @@ export class CloneButton extends LoomElement {
           <div class="pop">
             {this.row("cmd", "clone", `fkit clone ${this.url}`)}
             {this.row("url", "url", this.url)}
+            {this.archive ? (
+              <div class="dl">
+                <span class="lbl">download this ref</span>
+                <div class="fmts">
+                  {/* Real links, so middle-click and "save as" behave and the
+                      browser owns the download. The server streams, so a
+                      large repository starts arriving immediately rather
+                      than after it has been built somewhere. */}
+                  {["zip", "tar.gz", "tar"].map((f) => (
+                    <a class="fmt" href={`${this.archive}.${f}`} download>
+                      <loom-icon name="archive" size={12}></loom-icon>
+                      {f}
+                    </a>
+                  ))}
+                </div>
+              </div>
+            ) : null}
             <div class="note">
               {this.visibility === "public"
                 ? "Public — cloning needs no account. Pushing needs a token."

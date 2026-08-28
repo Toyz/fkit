@@ -30,4 +30,7 @@ sqlx = { version = "0.9", default-features = false, features = ["chrono", "deriv
 getrandom = "0.4"
 blake3.workspace = true
 toml = "1.1.4"
+flate2 = "1"
+tokio-stream = "0.1"
+bytes = "1"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "http2", "rustls"] }

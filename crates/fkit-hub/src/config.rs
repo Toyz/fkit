@@ -81,6 +81,8 @@ struct LimitsSection {
     max_inline_blob: Option<u64>,
     /// Reject a push larger than this, in bytes. 0 disables the limit.
     max_push_bytes: Option<u64>,
+    /// Refuse an archive whose contents exceed this, in bytes. 0 disables it.
+    max_archive_bytes: Option<u64>,
 }
 
 /// Mail settings supplied by the environment.
@@ -119,6 +121,7 @@ pub struct Config {
     pub max_connections: u32,
     pub max_inline_blob: u64,
     pub max_push_bytes: u64,
+    pub max_archive_bytes: u64,
     /// Seeds `email_from` on a fresh database; the admin UI wins thereafter.
     pub email_from: Option<String>,
     /// Seeds `public_url` on a fresh database; the admin UI wins thereafter.
@@ -144,6 +147,7 @@ impl Default for Config {
             max_connections: 16,
             max_inline_blob: 2 * 1024 * 1024,
             max_push_bytes: 0,
+            max_archive_bytes: 0,
             email_from: None,
             public_url: None,
             env_email: EnvEmail::default(),
@@ -216,6 +220,7 @@ impl Config {
         if let Some(v) = f.storage.data_dir { self.data_dir = v }
         if let Some(v) = f.limits.max_inline_blob { self.max_inline_blob = v }
         if let Some(v) = f.limits.max_push_bytes { self.max_push_bytes = v }
+        if let Some(v) = f.limits.max_archive_bytes { self.max_archive_bytes = v }
         if let Some(v) = f.email.from { self.email_from = Some(v) }
         if let Some(v) = f.email.public_url { self.public_url = Some(v) }
         Ok(())
@@ -398,6 +403,12 @@ max_inline_blob = 2097152
 
 # Reject pushes larger than this (bytes). 0 disables the limit.
 max_push_bytes = 0
+
+# Refuse to build an archive of more than this many bytes of content (bytes).
+# The size is known from the tree before any file is read, so an oversized
+# request is refused immediately rather than part-way through a download.
+# 0 disables the limit.
+max_archive_bytes = 0
 "#;
 
 #[cfg(test)]

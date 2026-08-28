@@ -16,6 +16,9 @@ pub struct AppState {
     pub web_dir: PathBuf,
     /// Live instance policy, changeable by an administrator at runtime.
     pub settings: crate::settings::Settings,
+    /// Largest archive this server will build, in bytes of content. 0 = no
+    /// limit. Checked against the tree before any file is read.
+    pub max_archive_bytes: u64,
 }
 
 impl AppState {
