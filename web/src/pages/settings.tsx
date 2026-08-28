@@ -5,7 +5,8 @@
  * share a rail, a layout and a loading model, and splitting them would mean
  * four copies of that.
  */
-import { LoomElement, component, css, styles, reactive, mount, inject } from "@toyz/loom";
+import { LoomElement, component, css, styles, reactive, mount, on, inject } from "@toyz/loom";
+import { debounce } from "@toyz/loom/element";
 import { route } from "@toyz/loom/router";
 import { base } from "../ui";
 import { settingsLayout } from "../ui-settings";
@@ -104,16 +105,26 @@ export class PageSettings extends SettingsBase {
   @reactive accessor canWrite = true;
   @reactive accessor copied = false;
 
+  /// Cancelled automatically if the component goes away, so the flash can
+  /// never fire into a detached element. Repeated copies restart the timer
+  /// rather than stacking one per click.
+  @debounce(1400)
+  clearCopied() {
+    this.copied = false;
+  }
+
   @mount
   init() {
-    const sync = () => {
-      const seg = location.pathname.split("/").filter(Boolean)[1] ?? "profile";
-      this.section = (SECTIONS.find(([s]) => s === seg)?.[0] ?? "profile") as Section;
-      void this.load();
-    };
-    sync();
-    window.addEventListener("popstate", sync);
-    return () => window.removeEventListener("popstate", sync);
+    this.sync();
+  }
+
+  /// Bound on connect and released on disconnect by the decorator, so there is
+  /// no cleanup to forget.
+  @on(window, "popstate")
+  private sync() {
+    const seg = location.pathname.split("/").filter(Boolean)[1] ?? "profile";
+    this.section = (SECTIONS.find(([s]) => s === seg)?.[0] ?? "profile") as Section;
+    void this.load();
   }
 
   private async load() {
@@ -274,7 +285,7 @@ export class PageSettings extends SettingsBase {
                   onClick={async () => {
                     await navigator.clipboard.writeText(this.fresh!.secret).catch(() => {});
                     this.copied = true;
-                    setTimeout(() => (this.copied = false), 1400);
+                    this.clearCopied();
                   }}
                 >
                   <loom-icon name={this.copied ? "check" : "copy"} size={12}></loom-icon>
@@ -333,7 +344,7 @@ export class PageSettings extends SettingsBase {
             <div class="row-item"><span class="muted">no tokens yet</span></div>
           ) : (
             this.tokens.map((t) => (
-              <div class="row-item">
+              <div class="row-item" loom-key={t.id}>
                 <span>
                   <span class="rt">{t.name}</span>
                   <span class="rs">

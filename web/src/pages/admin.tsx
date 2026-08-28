@@ -5,7 +5,7 @@
  * particular needs to be closable the moment it is being abused, which is not a
  * moment anyone wants to be editing TOML over SSH.
  */
-import { LoomElement, component, css, styles, reactive, mount, inject } from "@toyz/loom";
+import { LoomElement, component, css, styles, reactive, mount, on, inject } from "@toyz/loom";
 import { route } from "@toyz/loom/router";
 import { base } from "../ui";
 import { settingsLayout } from "../ui-settings";
@@ -184,14 +184,14 @@ export class PageAdmin extends LoomElement {
 
   @mount
   init() {
-    const sync = () => {
-      const seg = location.pathname.split("/").filter(Boolean)[1] ?? "overview";
-      this.section = (SECTIONS.find(([s]) => s === seg)?.[0] ?? "overview") as Section;
-      void this.load();
-    };
-    sync();
-    window.addEventListener("popstate", sync);
-    return () => window.removeEventListener("popstate", sync);
+    this.sync();
+  }
+
+  @on(window, "popstate")
+  private sync() {
+    const seg = location.pathname.split("/").filter(Boolean)[1] ?? "overview";
+    this.section = (SECTIONS.find(([s]) => s === seg)?.[0] ?? "overview") as Section;
+    void this.load();
   }
 
   private async load() {
@@ -715,7 +715,7 @@ export class PageAdmin extends LoomElement {
     const expired = !spent && new Date(i.expires_at).getTime() < Date.now();
     const state = spent ? "used" : expired ? "expired" : "live";
     return (
-      <div class={`irow ${state}`}>
+      <div class={`irow ${state}`} loom-key={i.id}>
         <span class="dot"></span>
         <span class="who">
           {i.email ?? <span class="anon">open link</span>}
@@ -814,7 +814,7 @@ export class PageAdmin extends LoomElement {
 
   private userRow(u: AdminUser, self: boolean) {
     return (
-      <div class={`urow ${u.is_active ? "" : "off"}`}>
+      <div class={`urow ${u.is_active ? "" : "off"}`} loom-key={u.id}>
         <span class="un">
           {u.username}
           {self ? <span class="tag on">you</span> : null}

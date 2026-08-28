@@ -6,6 +6,7 @@
  * from the empty state and the settings page.
  */
 import { LoomElement, component, css, styles, reactive, prop, mount, query } from "@toyz/loom";
+import { debounce } from "@toyz/loom/element";
 
 /** Bytes, for a label. Local so the component stays self-contained. */
 function size(bytes: number): string {
@@ -91,6 +92,13 @@ export class CloneButton extends LoomElement {
   @reactive accessor open = false;
   @reactive accessor copied = "";
 
+  /// Copying a second thing restarts this rather than leaving the first
+  /// timer to fire against the wrong key, and disconnecting cancels it.
+  @debounce(1400)
+  clearCopied() {
+    this.copied = "";
+  }
+
   @query(".pop") accessor pop!: HTMLElement | null;
 
   @mount
@@ -116,9 +124,7 @@ export class CloneButton extends LoomElement {
     try {
       await navigator.clipboard.writeText(text);
       this.copied = key;
-      setTimeout(() => {
-        if (this.copied === key) this.copied = "";
-      }, 1400);
+      this.clearCopied();
     } catch {
       /* clipboard blocked; the text is selectable either way */
     }

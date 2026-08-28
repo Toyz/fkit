@@ -45,12 +45,24 @@ fi
 DB_PORT="${DEV_DB_PORT:-55432}"
 PORT="${HUB_PORT:-7500}"
 
-# --- the database ----------------------------------------------------------
-# A hub container from `make up` would already hold this port, and the bind
-# failure that follows is a confusing way to find that out.
+# --- the port --------------------------------------------------------------
+# Whatever already holds the port, the bind failure a minute from now is a
+# confusing way to find out about it. A container we can stop; another process
+# is someone else's, so say whose it is rather than killing it.
 if [ -n "$($COMPOSE ps -q hub 2>/dev/null)" ]; then
   echo "Stopping the containerised hub — this script runs one on the host instead."
   $COMPOSE stop hub >/dev/null
+fi
+
+holder=$(ss -ltnp 2>/dev/null | grep ":${HUB_PORT:-7500} " || true)
+if [ -n "$holder" ]; then
+  echo "Something is already listening on port ${HUB_PORT:-7500}:" >&2
+  echo "  $holder" >&2
+  echo >&2
+  echo "Another 'make dev' in a different terminal is the usual answer. Stop it," >&2
+  echo "or set HUB_PORT to something else for this one:" >&2
+  echo "  HUB_PORT=7600 make dev" >&2
+  exit 1
 fi
 
 echo "Starting Postgres on 127.0.0.1:$DB_PORT ..."

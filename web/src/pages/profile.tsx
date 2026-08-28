@@ -13,7 +13,7 @@
  * otherwise swallow `/settings` and `/admin`. Those names are reserved
  * usernames as well, so the two defences agree.
  */
-import { LoomElement, component, css, styles, reactive, mount, inject } from "@toyz/loom";
+import { LoomElement, component, css, styles, reactive, mount, on, inject } from "@toyz/loom";
 import { route } from "@toyz/loom/router";
 import { base } from "../ui";
 import { api, relativeTime, type Profile } from "../api";
@@ -85,19 +85,19 @@ export class PageProfile extends LoomElement {
 
   @mount
   init() {
-    const load = () => {
-      const who = location.pathname.split("/").filter(Boolean)[0] ?? "";
-      this.profile = null;
-      this.error = "";
-      this.filter = "";
-      api
-        .profile(who)
-        .then((p) => (this.profile = p))
-        .catch((e) => (this.error = (e as Error).message));
-    };
-    load();
-    window.addEventListener("popstate", load);
-    return () => window.removeEventListener("popstate", load);
+    this.load();
+  }
+
+  @on(window, "popstate")
+  private load() {
+    const who = location.pathname.split("/").filter(Boolean)[0] ?? "";
+    this.profile = null;
+    this.error = "";
+    this.filter = "";
+    api
+      .profile(who)
+      .then((p) => (this.profile = p))
+      .catch((e) => (this.error = (e as Error).message));
   }
 
   update() {

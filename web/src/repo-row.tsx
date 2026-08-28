@@ -88,7 +88,7 @@ export function repoRow(r: Repo, opts: RepoRowOptions = {}) {
   ].filter(Boolean).join(" · ");
 
   return (
-    <a class="rr" href={href} onClick={linkHandler(href)}>
+    <a class="rr" loom-key={`${r.owner}/${r.name}`} href={href} onClick={linkHandler(href)}>
       <span class="ic" title={r.visibility}>
         <loom-icon name={priv ? "lock" : "repo"} size={13}></loom-icon>
       </span>

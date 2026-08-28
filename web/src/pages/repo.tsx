@@ -11,7 +11,7 @@
  *     between files, so sub-navigation does not refetch repository metadata or
  *     flash the whole page.
  */
-import { LoomElement, component, css, styles, reactive, mount, inject } from "@toyz/loom";
+import { LoomElement, component, css, styles, reactive, mount, on, inject } from "@toyz/loom";
 import { route } from "@toyz/loom/router";
 import { base } from "../ui";
 import { settingsLayout } from "../ui-settings";
@@ -364,7 +364,10 @@ const sheet = css`
   }
   /* Two columns: the tree, and what the repository is. Collapses rather than
      squeezing — a 200px sidebar is worse than no sidebar. */
-  .split { display: grid; grid-template-columns: minmax(0, 1fr) 250px; gap: 20px; }
+  /* A floor on the height, so a short listing does not pull the footer up
+     into view while a long one pushes it back down. The count is not knowable
+     before the fetch, so the only stable answer is to stop depending on it. */
+  .split { display: grid; grid-template-columns: minmax(0, 1fr) 250px; gap: 20px; min-height: 62vh; }
   @media (max-width: 900px) {
     .split { grid-template-columns: minmax(0, 1fr); }
     .aside { order: -1; }
@@ -768,15 +771,17 @@ export class PageRepo extends LoomElement {
   @mount
   init() {
     void this.reload();
-    const onNav = () => {
-      const next = parse();
-      const changedRepo =
-        !this.loc || !next || next.owner !== this.loc.owner || next.name !== this.loc.name;
-      this.loc = next;
-      void this.reload(changedRepo);
-    };
-    window.addEventListener("popstate", onNav);
-    return () => window.removeEventListener("popstate", onNav);
+  }
+
+  // Not private: it is invoked by the decorator, and TypeScript reports an
+  // unused private member for a method nothing in the class calls.
+  @on(window, "popstate")
+  onNav() {
+    const next = parse();
+    const changedRepo =
+      !this.loc || !next || next.owner !== this.loc.owner || next.name !== this.loc.name;
+    this.loc = next;
+    void this.reload(changedRepo);
   }
 
   /** Fetch repo metadata (only when the repo changed) plus the current view. */
@@ -1427,7 +1432,7 @@ export class PageRepo extends LoomElement {
     const href = `/${at.owner}/${at.name}/blob/${ref}/${f.path}`;
 
     return (
-      <div class="df">
+      <div class="df" loom-key={f.path}>
         <div class="df-head">
           <button
             class="bare df-toggle"
@@ -1509,7 +1514,7 @@ export class PageRepo extends LoomElement {
       return (
         <div class="panel">
           {d.changes.map((c) => (
-            <div class="ch">
+            <div class="ch" loom-key={c.path}>
               <span class={`st ${c.status}`}>
                 {c.status === "added" ? "+" : c.status === "removed" ? "−" : c.status === "modified" ? "~" : "t"}
               </span>
@@ -2452,7 +2457,7 @@ fkit push</pre>
             <div class="collab-empty">Only {r.owner} has access.</div>
           ) : (
             this.collaborators.map((c) => (
-              <div class="collab">
+              <div class="collab" loom-key={c.username}>
                 <span class="cu">{c.username}</span>
                 <span class="tag">{c.role}</span>
                 <span class="faint" style="font-size:11px">
@@ -2541,29 +2546,89 @@ fkit push</pre>
     const r = this.repo;
 
     if (!r) {
+      // Most of this page does not depend on the fetch at all: the owner and
+      // the repository name are in the URL, and so are the tabs. Rendering
+      // them as grey boxes and then replacing them with the same text a
+      // hundred milliseconds later is what made the page lurch — the whole
+      // shell was torn down and rebuilt at a different size.
+      //
+      // So the shell is real from the first frame and never moves. Only the
+      // parts that genuinely need the server — the description, the file list,
+      // the sidebar — are placeholders, and they fill in without resizing
+      // anything around them.
+      const skRef = this.ref();
+      const skKind = at.view.kind;
+      const skTab =
+        skKind === "commit" ? "commits"
+        : skKind === "merge" ? "merges"
+        : skKind === "tags" ? "tree"
+        : skKind;
+      const skTabs: [string, string, string, string][] = [
+        ["tree", "files", "file", `/${at.owner}/${at.name}/tree/${skRef}`],
+        ["commits", "history", "history", `/${at.owner}/${at.name}/commits/${skRef}`],
+        ["merges", "merges", "merge", `/${at.owner}/${at.name}/merges`],
+      ];
+
       return (
         <div class="wrap">
           <div class="head">
             <div class="title">
-              <span class="sk" style="width:14px;height:14px"></span>
-              <span class="sk tall" style="width:200px"></span>
+              <span class="ic"><loom-icon name="repo" size={14}></loom-icon></span>
+              <span class="p">
+                <a class="own" href="/" onClick={linkHandler("/")}>{at.owner}</a>
+                <span class="own">/</span>
+                <a
+                  href={`/${at.owner}/${at.name}`}
+                  onClick={linkHandler(`/${at.owner}/${at.name}`)}
+                  style="color:var(--text)"
+                >
+                  {at.name}
+                </a>
+              </span>
               <span class="sk" style="width:48px"></span>
             </div>
-            <div class="tabs" style="gap:14px;padding:5px 0 9px">
-              <span class="sk" style="width:36px"></span>
-              <span class="sk" style="width:48px"></span>
+            <div class="tabs">
+              {skTabs.map(([key, label, ic, href]) => (
+                <a class={skTab === key ? "on" : ""} href={href} onClick={linkHandler(href)}>
+                  <loom-icon name={ic} size={12}></loom-icon>
+                  {label}
+                </a>
+              ))}
             </div>
           </div>
-          <div class="panel files">
-            {[0, 1, 2, 3, 4].map(() => (
-              <div class="r sk-row">
-                <span class="sk" style="width:13px;height:13px"></span>
-                <span class="sk" style="width:min(70%,150px)"></span>
-                <span class="sk" style="width:min(60%,190px)"></span>
-                <span class="sk" style="width:58px"></span>
-                <span class="sk" style="width:44px"></span>
+
+          <div class="split">
+            <div class="main">
+              <div class="latest sk-row">
+                <span class="sk" style="width:64px"></span>
+                <span class="sk" style="width:min(46%,320px)"></span>
+                <span class="sk" style="width:70px"></span>
+                <span class="sk" style="width:84px"></span>
               </div>
-            ))}
+              <div class="panel files">
+                {[0, 1, 2, 3, 4, 5].map(() => (
+                  <div class="r sk-row">
+                    <span class="sk" style="width:13px;height:13px"></span>
+                    <span class="sk" style="width:min(70%,150px)"></span>
+                    <span class="sk" style="width:min(60%,190px)"></span>
+                    <span class="sk" style="width:58px"></span>
+                    <span class="sk" style="width:44px"></span>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <aside class="aside">
+              <section>
+                <h3>about</h3>
+                <span class="sk" style="width:100%"></span>
+                <div style="height:8px"></div>
+                <span class="sk" style="width:70%"></span>
+              </section>
+              <section>
+                <h3>tags</h3>
+                <span class="sk" style="width:50%"></span>
+              </section>
+            </aside>
           </div>
         </div>
       );
@@ -2706,16 +2771,44 @@ fkit push</pre>
 
             {v.kind === "tree" ? (
               this.entries === null ? (
-                <div class="panel files">
-                  {[0, 1, 2, 3, 4, 5].map(() => (
-                    <div class="r sk-row">
-                      <span class="sk" style="width:13px;height:13px"></span>
-                      <span class="sk" style="width:min(70%,150px)"></span>
-                      <span class="sk" style="width:min(60%,190px)"></span>
-                      <span class="sk" style="width:58px"></span>
-                      <span class="sk" style="width:44px"></span>
+                // The same `.split` as the loaded view, deliberately. A
+                // skeleton that is only the file list is full width, so the
+                // moment the data lands the sidebar appears and every row
+                // reflows *sideways* — which reads as the page lurching rather
+                // than filling in. Holding the grid, the commit bar and the
+                // sidebar means only the text inside them changes.
+                <div class="split">
+                  <div class="main">
+                    <div class="latest sk-row">
+                      <span class="sk" style="width:64px"></span>
+                      <span class="sk" style="width:min(46%,320px)"></span>
+                      <span class="sk" style="width:70px"></span>
+                      <span class="sk" style="width:84px"></span>
                     </div>
-                  ))}
+                    <div class="panel files">
+                      {[0, 1, 2, 3, 4, 5].map(() => (
+                        <div class="r sk-row">
+                          <span class="sk" style="width:13px;height:13px"></span>
+                          <span class="sk" style="width:min(70%,150px)"></span>
+                          <span class="sk" style="width:min(60%,190px)"></span>
+                          <span class="sk" style="width:58px"></span>
+                          <span class="sk" style="width:44px"></span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                  <aside class="aside">
+                    <section>
+                      <h3>about</h3>
+                      <span class="sk" style="width:100%"></span>
+                      <div style="height:8px"></div>
+                      <span class="sk" style="width:70%"></span>
+                    </section>
+                    <section>
+                      <h3>tags</h3>
+                      <span class="sk" style="width:50%"></span>
+                    </section>
+                  </aside>
                 </div>
               ) : (
                 <div class="split">
