@@ -233,6 +233,85 @@ const sheet = css`
     color: var(--muted); font-size: 11.5px; font-family: var(--sans);
     margin-top: 4px; line-height: 1.45;
   }
+  /* Two columns: the tree, and what the repository is. Collapses rather than
+     squeezing — a 200px sidebar is worse than no sidebar. */
+  .split { display: grid; grid-template-columns: minmax(0, 1fr) 250px; gap: 20px; }
+  @media (max-width: 900px) {
+    .split { grid-template-columns: minmax(0, 1fr); }
+    .aside { order: -1; }
+  }
+  .aside section { padding-bottom: 15px; margin-bottom: 15px; border-bottom: 1px solid var(--border); }
+  .aside section:last-child { border-bottom: 0; margin-bottom: 0; padding-bottom: 0; }
+  .aside h3 {
+    display: flex; align-items: center; gap: 7px;
+    font-size: 10.5px; font-weight: 600; margin: 0 0 8px;
+    text-transform: uppercase; letter-spacing: .07em; color: var(--faint);
+  }
+  .aside h3 a { color: inherit; }
+  .aside h3 a:hover { color: var(--accent); text-decoration: none; }
+  .aside h3 .n {
+    margin-left: auto; color: var(--muted);
+    font-variant-numeric: tabular-nums; letter-spacing: 0;
+  }
+  .aside .prose {
+    font-family: var(--sans); font-size: 12.5px; color: var(--muted);
+    margin: 0 0 10px; line-height: 1.5;
+  }
+  .aside .prose.faint { color: var(--faint); }
+
+  /* Label/value pairs, aligned — the same shape as the stats panels. */
+  .aside .facts {
+    display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; margin: 0;
+    font-size: 11.5px;
+  }
+  .aside .facts dt { color: var(--faint); }
+  .aside .facts dd { margin: 0; color: var(--muted); text-align: right; }
+  .aside .facts dd.mono { font-family: var(--mono); }
+
+  .aside .mini { list-style: none; margin: 0; padding: 0; }
+  .aside .mini li {
+    display: grid; grid-template-columns: 12px minmax(0, 1fr) auto;
+    align-items: center; gap: 7px; height: 22px; font-size: 12px;
+  }
+  .aside .mini loom-icon { color: var(--faint); }
+  .aside .mini a { color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .aside .mini .when { color: var(--faint); font-size: 10.5px; white-space: nowrap; }
+  .aside .more { display: inline-block; margin-top: 7px; font-size: 11.5px; color: var(--muted); }
+  .aside .more:hover { color: var(--accent); }
+
+  /* Images sit on a chequerboard, so transparency reads as transparency
+     rather than as whatever the page background happens to be. */
+  .imgview {
+    display: grid; place-items: center;
+    padding: 24px; min-height: 120px;
+    background-color: var(--bg);
+    background-image:
+      linear-gradient(45deg, var(--raised) 25%, transparent 25%),
+      linear-gradient(-45deg, var(--raised) 25%, transparent 25%),
+      linear-gradient(45deg, transparent 75%, var(--raised) 75%),
+      linear-gradient(-45deg, transparent 75%, var(--raised) 75%);
+    background-size: 16px 16px;
+    background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+  }
+  .imgview img {
+    max-width: 100%; max-height: 70vh;
+    /* Nearest-neighbour would be wrong for photos; this keeps small sprites
+       from turning to mush without wrecking anything else. */
+    image-rendering: auto;
+    border: 1px solid var(--border);
+    background: var(--surface);
+  }
+
+  /* "12 tags" beside the ref picker — a count that is also the way in, which
+     is how GitHub surfaces them. Not a button: it is a fact with a link on it. */
+  .refcount {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 12px; color: var(--muted); white-space: nowrap;
+  }
+  .refcount:hover { color: var(--text); text-decoration: none; }
+  .refcount b { color: var(--text); font-weight: 400; }
+  .refcount loom-icon { opacity: .75; }
+
   /* Tags: one line each, same rhythm as a file row. */
   .tagrow {
     display: grid; grid-template-columns: 16px minmax(0, 1fr) auto auto;
@@ -241,17 +320,20 @@ const sheet = css`
     border-bottom: 1px solid var(--border);
   }
   .tagrow:last-child { border-bottom: 0; }
-  .tagrow:hover { background: var(--raised); }
+  .tagrow:hover { background: var(--raised); text-decoration: none; }
   .tagrow .ic { color: var(--faint); display: flex; }
-  .tagrow .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .tagrow .nm a { color: var(--accent); }
+  .tagrow .nm {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    color: var(--accent);
+  }
   .tagrow .msg {
     font-family: var(--sans); color: var(--muted); font-size: 12px; margin-left: 10px;
   }
   .tagrow .sha {
     font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums;
+    cursor: pointer;
   }
-  .tagrow .sha:hover { color: var(--accent); }
+  .tagrow .sha:hover { color: var(--accent); text-decoration: underline; }
   .tagrow .when { color: var(--faint); font-size: 11px; white-space: nowrap; }
 
   .collab-note {
@@ -679,6 +761,94 @@ export class PageRepo extends LoomElement {
     );
   }
 
+  /**
+   * The right-hand column: what this repository *is*, next to what is in it.
+   *
+   * Only shown at the root. Inside a directory the question is "what is in
+   * here", and a panel about the repository as a whole is just noise beside it.
+   */
+  private renderAside() {
+    const at = this.loc!;
+    const r = this.repo!;
+    const v = at.view as Extract<View, { kind: "tree" }>;
+    if (v.path) return null;
+
+    const tags = this.tags().slice().sort(
+      (a, b) => (b.head?.timestamp ?? 0) - (a.head?.timestamp ?? 0),
+    );
+    const tagsHref = `/${at.owner}/${at.name}/tags`;
+
+    return (
+      <aside class="aside">
+        <section>
+          <h3>about</h3>
+          {r.description ? (
+            <p class="prose">{r.description}</p>
+          ) : (
+            <p class="prose faint">No description.</p>
+          )}
+          <dl class="facts">
+            <dt>visibility</dt>
+            <dd>{r.visibility}</dd>
+            <dt>default</dt>
+            <dd class="mono">{r.default_branch}</dd>
+            <dt>created</dt>
+            <dd>{relativeTime(r.created_at)}</dd>
+          </dl>
+        </section>
+
+        <section>
+          <h3>
+            <a href={tagsHref} onClick={linkHandler(tagsHref)}>tags</a>
+            <span class="n">{tags.length}</span>
+          </h3>
+          {tags.length === 0 ? (
+            <p class="prose faint">None yet.</p>
+          ) : (
+            <ul class="mini">
+              {tags.slice(0, 5).map((t) => {
+                const href = `/${at.owner}/${at.name}/tree/${t.name}`;
+                return (
+                  <li>
+                    <loom-icon name="tag" size={12}></loom-icon>
+                    <a href={href} onClick={linkHandler(href)}>{t.name}</a>
+                    <span class="when">
+                      {t.head ? relativeTime(t.head.timestamp) : ""}
+                    </span>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+          {tags.length > 5 ? (
+            <a class="more" href={tagsHref} onClick={linkHandler(tagsHref)}>
+              all {tags.length} tags
+            </a>
+          ) : null}
+        </section>
+
+        <section>
+          <h3>
+            branches
+            <span class="n">{this.branches().length}</span>
+          </h3>
+          <ul class="mini">
+            {this.branches().slice(0, 5).map((b) => {
+              const href = `/${at.owner}/${at.name}/tree/${b.name}`;
+              return (
+                <li>
+                  <loom-icon name="branch" size={12}></loom-icon>
+                  <a href={href} onClick={linkHandler(href)}>{b.name}</a>
+                  <span class="when">{relativeTime(b.updated_at)}</span>
+                </li>
+              );
+            })}
+          </ul>
+        </section>
+      </aside>
+    );
+  }
+
   private renderTree(path: string) {
     const at = this.loc!;
     const r = this.ref();
@@ -742,7 +912,11 @@ export class PageRepo extends LoomElement {
     const head = (
       <div class="panel-head">
         <span class="val">
-            {b.binary ? "binary" : `${b.lines} ${b.lines === 1 ? "line" : "lines"}`} ·{" "}
+            {b.image
+              ? b.image.replace("image/", "").toUpperCase()
+              : b.binary
+                ? "binary"
+                : `${b.lines} ${b.lines === 1 ? "line" : "lines"}`} ·{" "}
             {humanSize(b.size)}
           </span>
         <span class="row">
@@ -764,6 +938,19 @@ export class PageRepo extends LoomElement {
 
     if (b.truncated) {
       return <div class="panel">{head}<div class="empty">file is too large to display</div></div>;
+    }
+    // An image is served with its own content type by the raw endpoint — the
+    // only formats that get one, because they decode to pixels and cannot run
+    // anything. An SVG deliberately arrives as text and renders as source.
+    if (b.image) {
+      return (
+        <div class="panel">
+          {head}
+          <div class="imgview">
+            <img src={rawHref} alt={b.path} loading="lazy" />
+          </div>
+        </div>
+      );
     }
     if (b.binary) {
       return <div class="panel">{head}<div class="empty">binary file not shown</div></div>;
@@ -1168,6 +1355,9 @@ export class PageRepo extends LoomElement {
     });
 
     if (tags.length === 0) {
+      // The commands are only useful to someone who could run them. Showing
+      // them to a visitor reads as an instruction they cannot follow.
+      const canPush = this.repo?.access === "write" || this.repo?.access === "admin";
       return (
         <div class="panel">
           <div class="panel-head"><span>tags</span></div>
@@ -1177,8 +1367,10 @@ export class PageRepo extends LoomElement {
               A tag marks a commit with a name that does not move — a release, a
               revision someone else has to be able to find again.
             </p>
-            <pre class="cmd">fkit tag v1.0
+            {canPush ? (
+              <pre class="cmd">fkit tag v1.0
 fkit push</pre>
+            ) : null}
           </div>
         </div>
       );
@@ -1194,17 +1386,30 @@ fkit push</pre>
           const tree = `/${at.owner}/${at.name}/tree/${t.name}`;
           const commit = `/${at.owner}/${at.name}/commit/${t.target}`;
           return (
-            <div class="tagrow">
+            // The row is the link — the whole thing, the way a file row is.
+            // The commit hash is a link inside it to somewhere else, so it
+            // stops the click from bubbling out to the row's own navigation.
+            <a class="tagrow" href={tree} onClick={linkHandler(tree)}>
               <span class="ic"><loom-icon name="tag" size={13}></loom-icon></span>
               <span class="nm">
-                <a href={tree} onClick={linkHandler(tree)}>{t.name}</a>
+                {t.name}
                 {t.head ? <span class="msg">{t.head.summary}</span> : null}
               </span>
-              <a class="sha" href={commit} onClick={linkHandler(commit)}>{t.short}</a>
+              <span
+                class="sha"
+                onClick={(e: MouseEvent) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  go(commit);
+                }}
+                title="View this commit"
+              >
+                {t.short}
+              </span>
               <span class="when">
                 {t.head ? relativeTime(t.head.timestamp) : relativeTime(t.updated_at)}
               </span>
-            </div>
+            </a>
           );
         })}
       </div>
@@ -1903,14 +2108,21 @@ fkit push</pre>
 
     const v = at.view;
     const ref = this.ref();
+    // Tags hang off the files view rather than owning a tab, so "files" stays
+    // lit while you are on /tags — the same place GitHub leaves you.
     const tab =
-      v.kind === "commit" ? "commits" : v.kind === "merge" ? "merges" : v.kind;
+      v.kind === "commit"
+        ? "commits"
+        : v.kind === "merge"
+          ? "merges"
+          : v.kind === "tags"
+            ? "tree"
+            : v.kind;
     const other =
       this.branches().find((b) => b.name !== r.default_branch)?.name ?? r.default_branch;
     const tabs: [string, string, string, string][] = [
       ["tree", "files", "file", `/${at.owner}/${at.name}/tree/${ref}`],
       ["commits", "history", "history", `/${at.owner}/${at.name}/commits/${ref}`],
-      ["tags", "tags", "tag", `/${at.owner}/${at.name}/tags`],
       ["merges", "merges", "merge", `/${at.owner}/${at.name}/merges`],
       [
         "compare",
@@ -2000,9 +2212,19 @@ fkit push</pre>
               <div style="flex:1"></div>
               <branch-picker
                 refs={this.branches()}
+                tags={this.tags()}
                 current={ref}
                 onPick={(e: Event) => this.switchRef((e as CustomEvent<string>).detail)}
               ></branch-picker>
+              <a
+                class="refcount"
+                href={`/${at.owner}/${at.name}/tags`}
+                onClick={linkHandler(`/${at.owner}/${at.name}/tags`)}
+                title="Tags"
+              >
+                <loom-icon name="tag" size={12}></loom-icon>
+                <b>{this.tags().length}</b> {this.tags().length === 1 ? "tag" : "tags"}
+              </a>
               <a
                 class="btn"
                 href={`/${at.owner}/${at.name}/commits/${ref}`}
@@ -2030,9 +2252,12 @@ fkit push</pre>
                   ))}
                 </div>
               ) : (
-                <div>
-                  {this.renderTree(v.path)}
-                  {this.renderReadme()}
+                <div class="split">
+                  <div class="main">
+                    {this.renderTree(v.path)}
+                    {this.renderReadme()}
+                  </div>
+                  {this.renderAside()}
                 </div>
               )
             ) : v.kind === "blob" ? (

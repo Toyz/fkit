@@ -7,6 +7,10 @@
  * that looks borrowed. So this is a real listbox: filterable, keyboard-driven,
  * and styled like everything around it.
  *
+ * Tags live in here too, behind a Branches/Tags switch, which is where people
+ * already look for them: a tag is a thing you check out, so it belongs in the
+ * control for choosing what to look at rather than in a tab of its own.
+ *
  * Emits a `pick` CustomEvent carrying the chosen ref name.
  */
 import { LoomElement, component, css, styles, reactive, prop, mount, query } from "@toyz/loom";
@@ -65,6 +69,17 @@ const sheet = css`
      which would re-introduce the box this is trying to avoid. */
   .search:focus-within { color: var(--accent); }
 
+  /* Branches | Tags. Both visible, so the one you are not on is readable. */
+  .modes { display: flex; border-bottom: 1px solid var(--border); }
+  .modes button {
+    flex: 1; font: inherit; font-size: 11.5px; height: 28px;
+    background: transparent; border: 0; border-bottom: 2px solid transparent;
+    color: var(--muted); cursor: pointer;
+  }
+  .modes button:hover { color: var(--text); background: var(--raised); }
+  .modes button.on { color: var(--text); border-bottom-color: var(--accent); }
+  .modes .n { color: var(--faint); margin-left: 5px; font-variant-numeric: tabular-nums; }
+
   .list { max-height: 300px; overflow-y: auto; padding: 3px 0; }
   .opt {
     display: grid; grid-template-columns: 14px minmax(0, 1fr) auto;
@@ -83,11 +98,13 @@ const sheet = css`
 @styles(sheet)
 export class BranchPicker extends LoomElement {
   @prop accessor refs: Ref[] = [];
+  @prop accessor tags: Ref[] = [];
   @prop accessor current = "";
 
   @reactive accessor open = false;
   @reactive accessor filter = "";
   @reactive accessor active = 0;
+  @reactive accessor mode: "branches" | "tags" = "branches";
 
   @query(".pop input") accessor searchBox!: HTMLInputElement | null;
 
@@ -109,9 +126,21 @@ export class BranchPicker extends LoomElement {
     return () => document.removeEventListener("pointerdown", away, true);
   }
 
+  private source(): Ref[] {
+    return this.mode === "tags" ? this.tags : this.refs;
+  }
+
   private filtered(): Ref[] {
     const q = this.filter.trim().toLowerCase();
-    return q ? this.refs.filter((r) => r.name.toLowerCase().includes(q)) : this.refs;
+    const src = this.source();
+    return q ? src.filter((r) => r.name.toLowerCase().includes(q)) : src;
+  }
+
+  private setMode(mode: "branches" | "tags") {
+    this.mode = mode;
+    this.filter = "";
+    this.active = 0;
+    requestAnimationFrame(() => this.searchBox?.focus());
   }
 
   private choose(name: string) {
@@ -125,7 +154,10 @@ export class BranchPicker extends LoomElement {
   private toggle() {
     this.open = !this.open;
     this.active = 0;
+    // Open on whichever list the current ref came from, so the thing you are
+    // looking at is the thing you see checked.
     if (this.open) {
+      this.mode = this.tags.some((t) => t.name === this.current) ? "tags" : "branches";
       // Focus after the popover exists in the DOM.
       requestAnimationFrame(() => this.searchBox?.focus());
     }
@@ -159,17 +191,33 @@ export class BranchPicker extends LoomElement {
           onClick={() => this.toggle()}
           title="Switch branch"
         >
-          <loom-icon name="branch" size={13}></loom-icon>
+          <loom-icon
+            name={this.tags.some((t) => t.name === this.current) ? "tag" : "branch"}
+            size={13}
+          ></loom-icon>
           <span class="nm">{this.current || "—"}</span>
           <loom-icon class="chev" name="chevron" size={12}></loom-icon>
         </button>
 
         {this.open ? (
           <div class="pop">
+            {this.tags.length > 0 ? (
+              <div class="modes">
+                {(["branches", "tags"] as const).map((m) => (
+                  <button
+                    class={this.mode === m ? "on" : ""}
+                    onClick={() => this.setMode(m)}
+                  >
+                    {m}
+                    <span class="n">{m === "tags" ? this.tags.length : this.refs.length}</span>
+                  </button>
+                ))}
+              </div>
+            ) : null}
             <div class="search">
               <loom-icon name="search" size={12}></loom-icon>
               <input
-                placeholder="filter branches"
+                placeholder={`filter ${this.mode}`}
                 value={this.filter}
                 onInput={(e: Event) => {
                   this.filter = (e.target as HTMLInputElement).value;
@@ -180,7 +228,9 @@ export class BranchPicker extends LoomElement {
             </div>
             <div class="list">
               {list.length === 0 ? (
-                <div class="none">no branch matches</div>
+                <div class="none">
+                  {this.mode === "tags" ? "no tag matches" : "no branch matches"}
+                </div>
               ) : (
                 list.map((r, i) => (
                   <div

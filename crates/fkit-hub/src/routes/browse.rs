@@ -35,23 +35,38 @@ pub fn routes() -> Router<AppState> {
 ///
 /// Branch names are tried first: if someone names a branch after a valid hex
 /// string, the branch is what they meant.
+/// Resolve a URL ref — a branch, a tag, or a commit hash.
+///
+/// Tags are stored prefixed, so a URL saying `v1.0` has to be tried as
+/// `tags/v1.0` as well. Branch first: a branch and a tag may share a name, and
+/// the branch is the one someone browsing is more likely to mean. The prefixed
+/// spelling is also accepted, so a link that already carries it still works.
 async fn resolve_ref(state: &AppState, repo: &RepoRow, spec: &str) -> AppResult<Hash> {
-    let row: Option<(Vec<u8>,)> =
-        sqlx::query_as("SELECT target FROM refs WHERE repo_id = $1 AND name = $2")
-            .bind(repo.id)
-            .bind(spec)
-            .fetch_optional(&state.db)
-            .await?;
+    let tagged = format!("{}{spec}", fkit_core::session::TAG_PREFIX);
+    let candidates: [&str; 2] = if fkit_core::session::is_tag(spec) {
+        [spec, spec]
+    } else {
+        [spec, tagged.as_str()]
+    };
 
-    if let Some((bytes,)) = row {
-        let arr: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| AppError::Internal(anyhow::anyhow!("corrupt ref target")))?;
-        return Ok(Hash(arr));
+    for name in candidates {
+        let row: Option<(Vec<u8>,)> =
+            sqlx::query_as("SELECT target FROM refs WHERE repo_id = $1 AND name = $2")
+                .bind(repo.id)
+                .bind(name)
+                .fetch_optional(&state.db)
+                .await?;
+
+        if let Some((bytes,)) = row {
+            let arr: [u8; 32] = bytes
+                .try_into()
+                .map_err(|_| AppError::Internal(anyhow::anyhow!("corrupt ref target")))?;
+            return Ok(Hash(arr));
+        }
     }
 
     Hash::from_hex(spec)
-        .ok_or_else(|| AppError::not_found(format!("no such branch or commit: {spec}")))
+        .ok_or_else(|| AppError::not_found(format!("no such branch, tag or commit: {spec}")))
 }
 
 /// Open the store and resolve the ref — the common preamble of every handler.
@@ -112,6 +127,10 @@ struct BlobResponse {
     /// Absent for binary or oversized files.
     content: Option<String>,
     lines: usize,
+    /// Set when the bytes are an image the browser can display, so the client
+    /// can show the picture instead of "binary file". The raw endpoint serves
+    /// this same type, so the `<img>` actually loads under `nosniff`.
+    image: Option<&'static str>,
 }
 
 async fn blob(
@@ -136,6 +155,7 @@ async fn blob(
         truncated: b.truncated,
         lines: text.as_deref().map(|t| t.lines().count()).unwrap_or(0),
         content: text,
+        image: b.image,
     }))
 }
 
@@ -224,12 +244,16 @@ async fn raw(
     let (store, _, tree) = open(&state, &viewer, &owner, &name, &r).await?;
     let (bytes, _size) = content::raw_blob(&store, tree, &path)?;
 
+    // An image may be typed honestly: the formats below are decoded as pixels
+    // and cannot execute anything. Everything else keeps the blanket
+    // text/plain-or-octet-stream treatment described above — including SVG,
+    // which is a scriptable document wearing an image's file extension.
     let is_text = std::str::from_utf8(&bytes).is_ok()
         && !bytes.iter().take(8192).any(|b| *b == 0);
-    let ctype = if is_text {
-        "text/plain; charset=utf-8"
-    } else {
-        "application/octet-stream"
+    let ctype = match content::image_mime(&bytes) {
+        Some(mime) => mime,
+        None if is_text => "text/plain; charset=utf-8",
+        None => "application/octet-stream",
     };
 
     Ok((

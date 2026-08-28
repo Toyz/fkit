@@ -8,10 +8,11 @@ import { repoRow, repoRowSheet } from "../repo-row";
 import { Session } from "../session";
 
 const sheet = css`
-  .bar { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
-  .bar h1 { flex: 1; }
-  .bar input { max-width: 220px; font-size: 12px; }
-  .count { color: var(--faint); font-size: 11px; }
+  .bar { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; }
+  .bar h1 { margin-right: 2px; }
+  /* The count belongs to the title, not to the filter it was sitting beside. */
+  .count { flex: 1; color: var(--faint); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .bar input { width: 180px; font-size: 12px; height: 26px; padding: 0 9px; }
 
 `;
 

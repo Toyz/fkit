@@ -94,7 +94,45 @@ pub struct Blob {
     pub size: u64,
     pub truncated: bool,
     pub binary: bool,
+    /// The image type, when the bytes actually are one. `None` for everything
+    /// else — including SVG, which is a document, not a picture.
+    pub image: Option<&'static str>,
     pub hash: Hash,
+}
+
+/// Identify an image from its leading bytes.
+///
+/// Sniffed from content, never from the file name. The name is part of what
+/// somebody pushed, so trusting it would let a `.png` that is really HTML be
+/// served as an image — and with `nosniff` set, a Content-Type that disagrees
+/// with the bytes is exactly the mismatch that gets a real image blocked.
+///
+/// SVG is deliberately absent. It is an XML document that can carry script and
+/// external references, so it stays `text/plain`: you can read the source,
+/// which for an SVG is arguably the more useful view anyway.
+pub fn image_mime(bytes: &[u8]) -> Option<&'static str> {
+    const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    if bytes.starts_with(PNG) {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.starts_with(b"BM") {
+        return Some("image/bmp");
+    }
+    // RIFF containers name their form at offset 8: WEBP is one of several.
+    if bytes.len() > 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    // ISO-BMFF: an `ftyp` box whose brand says AVIF.
+    if bytes.len() > 12 && &bytes[4..8] == b"ftyp" && &bytes[8..12] == b"avif" {
+        return Some("image/avif");
+    }
+    None
 }
 
 pub fn read_blob(store: &Store, tree: Hash, path: &str) -> AppResult<Blob> {
@@ -118,8 +156,9 @@ pub fn read_blob(store: &Store, tree: Hash, path: &str) -> AppResult<Blob> {
     // The heuristic every diff tool uses: a NUL byte early in the file means
     // binary. Cheap, and wrong only for exotic text encodings.
     let binary = bytes.iter().take(8192).any(|b| *b == 0);
+    let image = image_mime(&bytes);
 
-    Ok(Blob { size: entry.size, hash: entry.hash, bytes, truncated, binary })
+    Ok(Blob { size: entry.size, hash: entry.hash, bytes, truncated, binary, image })
 }
 
 #[derive(Debug, Serialize)]
@@ -652,4 +691,35 @@ pub fn find_readme(store: &Store, tree: Hash) -> Option<(String, String)> {
     let mut buf = Vec::new();
     read_file(store, hit.hash, &mut buf).ok()?;
     Some((hit.name.clone(), String::from_utf8(buf).ok()?))
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::image_mime;
+
+    #[test]
+    fn images_are_identified_from_their_bytes() {
+        assert_eq!(image_mime(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0]), Some("image/png"));
+        assert_eq!(image_mime(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("image/jpeg"));
+        assert_eq!(image_mime(b"GIF89a....."), Some("image/gif"));
+        assert_eq!(image_mime(b"RIFF\0\0\0\0WEBPVP8 "), Some("image/webp"));
+        assert_eq!(image_mime(b"\0\0\0\x20ftypavif\0"), Some("image/avif"));
+    }
+
+    #[test]
+    fn an_svg_is_not_served_as_an_image() {
+        // It is XML that can carry script and fetch external resources. Served
+        // as image/svg+xml from this origin it would run with the viewer's
+        // session; as text/plain it is just readable source.
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg"><script>1</script></svg>"#;
+        assert_eq!(image_mime(svg), None);
+    }
+
+    #[test]
+    fn a_name_cannot_make_something_an_image() {
+        // Only the bytes decide. HTML pushed as "logo.png" stays inert.
+        assert_eq!(image_mime(b"<!doctype html><script>alert(1)</script>"), None);
+        assert_eq!(image_mime(b""), None);
+        assert_eq!(image_mime(b"RIFF\0\0\0\0WAVE"), None, "not every RIFF is a WEBP");
+    }
 }

@@ -73,6 +73,8 @@ export interface BlobResponse {
   truncated: boolean;
   content: string | null;
   lines: number;
+  /** Set when the bytes really are a displayable image. */
+  image: string | null;
 }
 
 export interface Commit {
