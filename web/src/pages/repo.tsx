@@ -295,6 +295,7 @@ const sheet = css`
     color: var(--faint); font-size: 11px; text-align: right;
     font-variant-numeric: tabular-nums; white-space: nowrap;
   }
+  .files .sz.sum { opacity: .62; }
   .files .when { text-align: right; }
   .files .msg {
     color: var(--muted); font-size: 12px;
@@ -1178,7 +1179,10 @@ export class PageRepo extends LoomElement {
           <span class="when">
             {lc ? relativeTime(lc.timestamp) : <span class="sk" style="width:52px"></span>}
           </span>
-          <span class="sz">{e.kind === "dir" ? "" : humanSize(e.size)}</span>
+          {/* A directory entry already carries the total bytes beneath it —
+              the tree records it at ingest, so this is a `du` that costs
+              nothing. Dimmed, because it is a sum rather than a file. */}
+          <span class={`sz ${e.kind === "dir" ? "sum" : ""}`}>{humanSize(e.size)}</span>
         </div>,
       );
     }
