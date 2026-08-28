@@ -230,13 +230,14 @@ impl Config {
         if let Ok(v) = std::env::var("FKIT_LISTEN") { self.listen = v }
         if let Ok(v) = std::env::var("FKIT_DATA") { self.data_dir = PathBuf::from(v) }
         if let Ok(v) = std::env::var("FKIT_WEB_DIR") { self.web_dir = PathBuf::from(v) }
-        if std::env::var("FKIT_SECURE_COOKIES").is_ok() { self.secure_cookies = true }
-        if let Ok(v) = std::env::var("FKIT_OPEN_REGISTRATION") {
-            self.open_registration = !matches!(v.as_str(), "0" | "false" | "no");
-        }
-        if let Ok(v) = std::env::var("FKIT_REQUIRE_AUTH") {
-            self.require_auth = !matches!(v.as_str(), "0" | "false" | "no");
-        }
+        // Presence alone used to be enough here, which made
+        // `FKIT_SECURE_COOKIES=0` — and, worse, the empty value a compose file
+        // passes for an unset variable — turn Secure cookies ON. Over plain
+        // http the browser then discards the session cookie and login appears
+        // to silently fail. All three read the same way now.
+        if let Some(v) = flag_env("FKIT_SECURE_COOKIES") { self.secure_cookies = v }
+        if let Some(v) = flag_env("FKIT_OPEN_REGISTRATION") { self.open_registration = v }
+        if let Some(v) = flag_env("FKIT_REQUIRE_AUTH") { self.require_auth = v }
         // RESEND_API_KEY is what Resend's own documentation and every hosting
         // platform's integration call it; the prefixed name is accepted so the
         // hub's variables can be grouped, and wins if somebody sets both.
@@ -295,6 +296,17 @@ impl Config {
 /// An environment variable set to the empty string is how a shell says
 /// "unset" in practice — `RESEND_API_KEY=` in a .env file, a secret that
 /// failed to inject — and must not read as a configured value.
+/// A boolean environment variable. `None` when unset or empty, so a compose
+/// file passing through a variable nobody set does not count as a decision.
+fn flag_env(name: &str) -> Option<bool> {
+    let v = std::env::var(name).ok()?;
+    let v = v.trim().to_ascii_lowercase();
+    if v.is_empty() {
+        return None;
+    }
+    Some(!matches!(v.as_str(), "0" | "false" | "no" | "off"))
+}
+
 fn non_empty_env(name: &str) -> Option<String> {
     std::env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
@@ -391,6 +403,28 @@ max_push_bytes = 0
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_blank_or_negative_flag_is_not_a_yes() {
+        // SAFETY: single-threaded test, and the variable is removed after.
+        unsafe {
+            for (set, want) in [
+                ("", None),
+                ("   ", None),
+                ("0", Some(false)),
+                ("false", Some(false)),
+                ("NO", Some(false)),
+                ("off", Some(false)),
+                ("1", Some(true)),
+                ("true", Some(true)),
+            ] {
+                std::env::set_var("FKIT_TEST_FLAG", set);
+                assert_eq!(flag_env("FKIT_TEST_FLAG"), want, "for {set:?}");
+            }
+            std::env::remove_var("FKIT_TEST_FLAG");
+        }
+        assert_eq!(flag_env("FKIT_TEST_FLAG"), None, "unset is not a decision");
+    }
 
     #[test]
     fn the_template_parses_and_round_trips_to_the_defaults_it_documents() {

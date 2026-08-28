@@ -326,6 +326,8 @@ export interface Meta {
   open_registration: boolean;
   require_auth: boolean;
   default_repo_visibility: "public" | "private";
+  /** No accounts exist yet: the first registration is allowed regardless. */
+  needs_setup?: boolean;
 }
 
 export const api = {

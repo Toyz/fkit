@@ -99,9 +99,17 @@ services:
       RESEND_API_KEY: ${RESEND_API_KEY:-}
       FKIT_EMAIL_FROM: ${FKIT_EMAIL_FROM:-}
 
-      # Set to 1 when Caddy (or any TLS proxy) is in front. Leave unset for a
-      # plain-http overlay deployment.
+      # Set to 1 when Caddy (or any TLS proxy) is in front; 0 for a plain-http
+      # deployment on a private network.
       FKIT_SECURE_COOKIES: ${FKIT_SECURE_COOKIES:-}
+
+      # Instance policy, seeded on FIRST BOOT ONLY into a settings row the
+      # admin UI owns afterwards — so a stale value here cannot silently undo
+      # something you changed from the web. Ship with 0 to open the server to
+      # nobody; the first account on an empty server is always allowed, so you
+      # can still claim it at /register.
+      FKIT_OPEN_REGISTRATION: ${FKIT_OPEN_REGISTRATION:-}
+      FKIT_REQUIRE_AUTH: ${FKIT_REQUIRE_AUTH:-}
     ports:
       - "${BIND_ADDR:-127.0.0.1}:${HUB_PORT:-7500}:7500"
     volumes:

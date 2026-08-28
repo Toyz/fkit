@@ -43,6 +43,17 @@ abstract class AuthPage extends LoomElement {
   protected signupOpen(): boolean {
     return this.meta?.open_registration !== false;
   }
+  /**
+   * A server with no accounts yet.
+   *
+   * The API lets the first registration through whatever the policy says, so
+   * that an instance deployed with registration already closed can still be
+   * claimed. Without this the sign-up page would hide the only form that
+   * works, and a correctly-configured private server would be unusable.
+   */
+  protected needsSetup(): boolean {
+    return this.meta?.needs_setup === true;
+  }
   @reactive accessor error = "";
   @reactive accessor busy = false;
 
@@ -108,7 +119,13 @@ export class PageLogin extends AuthPage {
               <a href="/forgot" onClick={linkHandler("/forgot")}>forgot your password?</a>
             </div>
           ) : null}
-          {this.signupOpen() ? (
+          {this.needsSetup() ? (
+            <div class="alt">
+              <a href="/register" onClick={linkHandler("/register")}>
+                claim this server — create the administrator account
+              </a>
+            </div>
+          ) : this.signupOpen() ? (
             <div class="alt">
               no account? <a href="/register" onClick={linkHandler("/register")}>register</a>
             </div>
@@ -171,7 +188,7 @@ export class PageRegister extends AuthPage {
       );
     }
 
-    if (!this.invite && !this.signupOpen()) {
+    if (!this.invite && !this.signupOpen() && !this.needsSetup()) {
       return (
         <div class="wrap">
           <div class="box">
@@ -200,7 +217,9 @@ export class PageRegister extends AuthPage {
             <div class="hint" style="margin:-8px 0 14px">
               {this.invite
                 ? "You were invited to this server. The link works once."
-                : "The first account on a new server becomes its administrator."}
+                : this.needsSetup()
+                  ? "This server has no accounts yet. This one becomes its administrator, and it is allowed even though registration is closed."
+                  : "The first account on a new server becomes its administrator."}
             </div>
             {this.error ? <div class="error">{this.error}</div> : null}
             <form

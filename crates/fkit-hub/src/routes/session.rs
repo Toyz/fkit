@@ -37,12 +37,23 @@ pub fn routes() -> Router<AppState> {
 /// login. It exposes no names, counts, or versions.
 async fn meta(State(state): State<AppState>) -> Json<serde_json::Value> {
     let p = state.policy();
+
+    // A server with no accounts always accepts one — `register` lets the first
+    // through whatever the policy says, so that an instance shipped with
+    // registration closed is not locked out of itself. The sign-in page needs
+    // to know, or it hides the only form that would work.
+    let empty: bool = sqlx::query_scalar("SELECT NOT EXISTS (SELECT 1 FROM users)")
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or(false);
+
     Json(serde_json::json!({
         "site_name": p.site_name,
         "email_enabled": p.email_configured(),
         "open_registration": p.open_registration,
         "require_auth": p.require_auth,
         "default_repo_visibility": p.default_repo_visibility,
+        "needs_setup": empty,
     }))
 }
 
