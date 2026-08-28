@@ -1,0 +1,15 @@
+# fkit.work — copy to /opt/fkit/hub.toml. Secrets live in .env.prod.
+# Environment variables override this file.
+
+[server]
+secure_cookies = true            # Caddy terminates TLS. false if no proxy.
+open_registration = false        # first account on an empty server still gets in
+require_auth = false             # public repos stay readable without an account
+default_repo_visibility = "private"
+
+[limits]
+max_push_bytes = 2147483648      # 2 GiB. 0 disables.
+
+[email]
+from = "hub@fkit.work"           # domain must be verified with Resend
+public_url = "https://fkit.work" # reset and invite links are built from this

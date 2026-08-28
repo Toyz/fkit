@@ -32,23 +32,26 @@ toolchain assumptions — at the cost of a cold build under QEMU.
 ## 2. Put the deployment files on the server
 
 ```sh
-scp docker-compose.prod.yml Caddyfile .env.prod.example server:/opt/fkit/
+scp docker-compose.prod.yml Caddyfile deploy/hub.toml .env.prod.example \
+    server:/opt/fkit/
 ssh server 'cd /opt/fkit && mv .env.prod.example .env.prod'
 ```
 
-Fill in `.env.prod`. The only real decision is the database:
+Settings live in **`hub.toml`**, mounted at `/etc/fkit/hub.toml`. Secrets live
+in **`.env.prod`** — a connection string and an API key have no business in a
+file that gets committed. Note the environment overrides the file, so the
+compose passes only those two through and nothing else.
+
+Fill in `.env.prod`:
 
 ```sh
-# (a) a database you already have — managed Postgres, or a box you run
-DATABASE_URL=postgres://user:pass@host:5432/fkit_hub
-
-# (b) or the bundled one
-POSTGRES_PASSWORD=$(openssl rand -base64 24)
+POSTGRES_PASSWORD=$(openssl rand -base64 24)   # with --profile bundled-db
+# or DATABASE_URL=postgres://...               # and drop that profile
+RESEND_API_KEY=                                # optional
 ```
 
-With (a) nothing local starts and `POSTGRES_PASSWORD` is unused. With (b) add
-`--profile bundled-db` below. Migrations run on boot either way — the hub needs
-a database it can create tables in, not a specific one.
+Migrations run on boot either way — the hub needs a database it can create
+tables in, not a specific one.
 
 Point `fkit.work` at the server's public address first. Caddy proves control of
 the name over port 80, so that record has to resolve before the first start.
