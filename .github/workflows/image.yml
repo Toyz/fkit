@@ -1,17 +1,11 @@
 # Build and publish the hub image.
 #
-# The binaries are compiled in the official Rust Alpine image and copied into
-# the build context, rather than inside the Docker build itself. Cargo's
-# incremental cache then actually applies: a source-only change recompiles the
-# workspace crates and nothing else. Building inside the image would start
-# every run with a target directory holding dependencies and no workspace
-# crates, and Docker's layer cache cannot help with a layer that changes
-# whenever the source does.
-#
-# The compiler comes from a container rather than from the runner so the build
-# does not depend on what the runner has installed. The self-hosted runners are
-# a long-lived Ubuntu 20.04 image, and pinning the toolchain to a container is
-# what keeps a runner rebuild from changing the binaries.
+# The binaries are compiled natively on the runner rather than inside the
+# Docker build, so cargo's incremental cache actually applies: a source-only
+# change recompiles the workspace crates and nothing else. Building inside the
+# image would start every run with a target directory holding dependencies and
+# no workspace crates, and Docker's layer cache cannot help with a layer that
+# changes whenever the source does.
 #
 # `Dockerfile.dist` then just copies the artifacts in. The self-contained
 # `Dockerfile` still exists for `make image` and for anyone building from
@@ -29,23 +23,10 @@ env:
   IMAGE: ${{ github.repository_owner }}/fkit-hub
   # Static, so the runtime image needs no libc beyond what Alpine ships.
   TARGET: x86_64-unknown-linux-musl
-  # Its host triple is already TARGET, so the binaries come out static with no
-  # cross toolchain to install and no musl C compiler to remember.
-  BUILDER: rust:1-alpine
-  # Cargo's caches live outside the workspace, which `actions/checkout` wipes at
-  # the start of every run. On a persistent runner a local directory is both
-  # simpler and faster than a round trip through the GitHub cache service.
-  #
-  # This is a path on the runner's *host*, not inside the runner container: the
-  # daemon resolving the mount is the host's. Docker creates it on first use,
-  # and every runner on that host shares it. Two builds at once then block on
-  # cargo's own lock, which is the right outcome — they would otherwise fight
-  # over the same target directory.
-  CACHE_DIR: /var/lib/fkit-ci
 
 jobs:
   build:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
@@ -64,49 +45,50 @@ jobs:
         working-directory: web
 
       # --- binaries ---------------------------------------------------
-      # The workspace is bind mounted into the builder. The runner is itself a
-      # container talking to the host's Docker daemon, so this only works
-      # because its workspace is mounted at the same path on both sides.
-      - name: Build the binaries
-        run: |
-          set -euo pipefail
-          docker run --rm \
-            -v "$PWD:/w" -w /w \
-            -v "$CACHE_DIR/cargo:/cargo" \
-            -v "$CACHE_DIR/target:/target" \
-            -e CARGO_HOME=/cargo \
-            -e CARGO_TARGET_DIR=/target \
-            -e TARGET="$TARGET" \
-            "$BUILDER" \
-            sh -euc '
-              cargo build --release --workspace --target "$TARGET"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
 
-              mkdir -p /w/ctx/bin
-              cp /target/"$TARGET"/release/fkit \
-                 /target/"$TARGET"/release/fkitd \
-                 /target/"$TARGET"/release/fkit-hub /w/ctx/bin/
-              strip /w/ctx/bin/*
+      # zstd is a C library built through cc, so the musl target needs a musl
+      # C compiler. Without it the link fails only at the very end of a long
+      # build, which is the worst place to find out.
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-              # A dynamically linked binary here would run in the builder and
-              # fail in the runtime image, so the assumption is checked rather
-              # than hoped for. The ELF headers are asked directly — is there
-              # an interpreter to load, is there a library to find — because
-              # file(1) words a static-pie binary differently from one version
-              # to the next, and the answer here has to be the same everywhere.
-              for b in /w/ctx/bin/*; do
-                readelf -lW "$b" | grep -q INTERP \
-                  && { echo "$b wants an ELF interpreter:"; readelf -lW "$b"; exit 1; }
-                readelf -dW "$b" 2>/dev/null | grep -q NEEDED \
-                  && { echo "$b needs a shared library:"; readelf -dW "$b"; exit 1; }
-              done
-              ls -lh /w/ctx/bin
-            '
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.TARGET }}
+          # Share the cache between tag builds and main builds: they compile
+          # the same crates, and a tag push should not start cold.
+          shared-key: image
+
+      - run: cargo build --release --workspace --target ${{ env.TARGET }}
 
       - name: Assemble the build context
         run: |
           set -euo pipefail
+          mkdir -p ctx/bin
+          cp target/${{ env.TARGET }}/release/fkit \
+             target/${{ env.TARGET }}/release/fkitd \
+             target/${{ env.TARGET }}/release/fkit-hub ctx/bin/
+          strip ctx/bin/*
           cp -r web/dist ctx/web
           cp Dockerfile.dist ctx/
+
+          # A dynamically linked binary here would run on the runner and fail in
+          # Alpine, so the assumption is checked rather than hoped for. The ELF
+          # headers are asked directly -- is there an interpreter to load, is
+          # there a library to find -- because file(1) words a static-pie binary
+          # differently from one version to the next, and this has to mean the
+          # same thing on whatever runner it lands on.
+          for b in ctx/bin/*; do
+            if readelf -lW "$b" | grep -q INTERP; then
+              echo "$b wants an ELF interpreter:"; readelf -lW "$b"; exit 1
+            fi
+            if readelf -dW "$b" 2>/dev/null | grep -q NEEDED; then
+              echo "$b needs a shared library:"; readelf -dW "$b"; exit 1
+            fi
+          done
+          ls -lh ctx/bin
 
       # --- publish ----------------------------------------------------
       - uses: docker/setup-buildx-action@v3

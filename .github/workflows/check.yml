@@ -7,45 +7,20 @@ on:
   pull_request:
   workflow_dispatch:
 
-env:
-  # The same builder the image is compiled with, so a check passing here means
-  # the toolchain that ships the release agreed. Its host triple is the musl
-  # target, so the tests run against the libc the binaries actually ship with.
-  BUILDER: rust:1-alpine
-  # A path on the runner's host — see the note in image.yml. The target
-  # directory is deliberately not the one image.yml uses: these are different
-  # profiles, and sharing it would only make the two jobs queue behind cargo's
-  # lock.
-  CACHE_DIR: /var/lib/fkit-ci
-
 jobs:
   rust:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Test and lint
-        run: |
-          set -euo pipefail
-          docker run --rm \
-            -v "$PWD:/w" -w /w \
-            -v "$CACHE_DIR/cargo:/cargo" \
-            -v "$CACHE_DIR/target-check:/target" \
-            -e CARGO_HOME=/cargo \
-            -e CARGO_TARGET_DIR=/target \
-            "$BUILDER" \
-            sh -euc '
-              # The image installs the minimal profile. `cargo-clippy` is on
-              # PATH regardless -- rustup shims every command it knows about,
-              # installed or not -- so the missing component only announces
-              # itself when clippy is run. Add it up front instead.
-              rustup component add clippy
-
-              cargo test --workspace
-              cargo clippy --workspace --all-targets -- -D warnings
-            '
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
   web:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
