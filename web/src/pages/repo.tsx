@@ -11,7 +11,7 @@
  *     between files, so sub-navigation does not refetch repository metadata or
  *     flash the whole page.
  */
-import { LoomElement, component, css, styles, reactive, mount, on, inject } from "@toyz/loom";
+import { LoomElement, component, css, styles, reactive, mount, on, inject, watch } from "@toyz/loom";
 // Renamed: importing it as `fetch` would shadow the global in this module.
 import { fetch as query, type ApiState } from "@toyz/loom/query";
 import { route } from "@toyz/loom/router";
@@ -23,7 +23,6 @@ import {
   humanSize,
   syncUrl,
   relativeTime,
-  ApiError,
   type BlobResponse,
   type Commit,
   type CommitDetail,
@@ -733,17 +732,40 @@ const sheet = css`
 @styles(base, settingsLayout, sheet, codeSheet, commitSheet)
 export class PageRepo extends LoomElement {
   @inject("session") accessor session!: Session;
-  @reactive accessor repo: Repo | null = null;
   /**
-   * `null` until the request comes back. An empty array means the repository
-   * genuinely has no branches.
-   *
-   * These were the same value, and "no branches" is what draws "this
-   * repository is empty" — so every page showed the empty state for as long as
-   * the refs request was in flight. Loading, then empty, then the listing.
-   * A result that has not arrived is not a result.
+   * These two used to be awaited one after the other inside `reload()`, so a
+   * page waited two round trips before it could draw anything. They do not
+   * depend on each other and are independent queries now, which also means the
+   * key does the invalidation: navigate to another repository and both refetch
+   * because the URL they are built from changed.
    */
-  @reactive accessor refs: Ref[] | null = null;
+  @query<Repo>({
+    url: (el: PageRepo) => `/api/repos/${el.loc!.owner}/${el.loc!.name}`,
+    enabled: (el: PageRepo) => Boolean(el.loc),
+    init: { credentials: "same-origin" },
+  })
+  accessor repoQuery!: ApiState<Repo>;
+
+  private get repo(): Repo | null {
+    return this.repoQuery.data ?? null;
+  }
+  /**
+   * "Not loaded" and "no branches" are different answers, and only one of them
+   * should draw "this repository is empty". As a nullable array that took a
+   * comment to explain and a `!== null` at the call site to honour; as a query
+   * it is `.loading` versus `.data.length`, and getting it wrong is not
+   * expressible.
+   */
+  @query<Ref[]>({
+    url: (el: PageRepo) => `/api/repos/${el.loc!.owner}/${el.loc!.name}/refs`,
+    enabled: (el: PageRepo) => Boolean(el.loc),
+    init: { credentials: "same-origin" },
+  })
+  accessor refsQuery!: ApiState<Ref[]>;
+
+  private get refs(): Ref[] | null {
+    return this.refsQuery.data ?? null;
+  }
   /**
    * Decoration: counts and sizes for the sidebar. A failure here must not take
    * the page with it, which `@fetch` gives for free — the error lands in
@@ -822,19 +844,25 @@ export class PageRepo extends LoomElement {
     }
     this.error = "";
 
-    try {
-      if (refetchRepo || !this.repo) {
-        this.repo = null;
-        this.repo = await api.repo(at.owner, at.name);
-        this.refs = await api.refs(at.owner, at.name);
-      }
-    } catch (e) {
-      this.notFound = e instanceof ApiError && e.status === 404;
-      this.error = this.notFound ? "" : (e as Error).message;
-      return;
-    }
-
     await this.loadView();
+  }
+
+  /**
+   * The view's own data waits on the refs, because which ref to ask about
+   * comes from them. Subscribing to the query rather than awaiting it is what
+   * lets the two above run in parallel.
+   */
+  @watch("refsQuery")
+  onRefs() {
+    if (this.refsQuery.ok) void this.loadView();
+  }
+
+  /** A repository that does not exist is a 404, not an error banner. */
+  @watch("repoQuery")
+  onRepo() {
+    const e = this.repoQuery.error as { status?: number } | undefined;
+    this.notFound = e?.status === 404;
+    this.error = !e || this.notFound ? "" : String((e as Error).message ?? e);
   }
 
   /** Branches only. `refs` carries tags too, and neither the branch picker
@@ -1965,7 +1993,8 @@ fkit push</pre>
       const at = this.loc!;
       if (at.view.kind === "merge") {
         this.mr = await api.mergeRequest(at.owner, at.name, at.view.number);
-        this.refs = await api.refs(at.owner, at.name);
+        // A merge moves a branch, so the refs the page is holding are stale.
+        await this.refsQuery.refetch();
       }
     } catch (e) {
       this.error = (e as Error).message;
@@ -2322,7 +2351,7 @@ fkit push</pre>
                 const at2 = (n: string) =>
                   (f.elements.namedItem(n) as HTMLInputElement).value;
                 void this.act(async () => {
-                  this.repo = await api.updateRepo(at.owner, at.name, {
+                  await api.updateRepo(at.owner, at.name, {
                     description: at2("description"),
                     homepage: at2("homepage"),
                     // Comma or space separated; the server normalises and
@@ -2390,7 +2419,8 @@ fkit push</pre>
                 onPick={(e: Event) => {
                   const v = (e as CustomEvent<string>).detail;
                   void this.act(async () => {
-                    this.repo = await api.updateRepo(at.owner, at.name, { default_branch: v });
+                    await api.updateRepo(at.owner, at.name, { default_branch: v });
+                    await this.repoQuery.refetch();
                   }, "saved");
                 }}
               ></fkit-select>
@@ -2431,7 +2461,8 @@ fkit push</pre>
             onPick={(e: Event) => {
               const v = (e as CustomEvent<string>).detail;
               void this.act(async () => {
-                this.repo = await api.updateRepo(at.owner, at.name, { visibility: v });
+                await api.updateRepo(at.owner, at.name, { visibility: v });
+                await this.repoQuery.refetch();
               });
             }}
           ></fkit-choice>
