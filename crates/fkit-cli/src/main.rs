@@ -76,6 +76,18 @@ INSPECTION
     stats                    storage and deduplication statistics
 ";
 
+// fkit spends most of its time allocating: the chunker cuts a stream into
+// millions of small buffers, hashes each, and drops nearly all of them again.
+// That is the workload general-purpose allocators handle worst and mimalloc
+// handles best, and it is thread-local, so the win grows with core count
+// rather than contending.
+//
+// Set here rather than in fkit-core: a library that installs a global
+// allocator makes the choice for every binary that ever links it, which is not
+// a library's decision to make.
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     // Rust ignores SIGPIPE by default, which turns `fkit log | head` into a
     // panic on a closed pipe rather than a clean exit. Restoring the default

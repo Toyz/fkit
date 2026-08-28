@@ -11,6 +11,7 @@ name = "fkit-hub"
 path = "src/main.rs"
 
 [dependencies]
+mimalloc = "0.1"
 fkit-core.workspace = true
 anyhow.workspace = true
 axum = { version = "0.8.9", features = ["ws", "macros"] }

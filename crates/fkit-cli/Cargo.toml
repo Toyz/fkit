@@ -12,5 +12,6 @@ name = "fkit"
 path = "src/main.rs"
 
 [dependencies]
+mimalloc = "0.1"
 fkit-core.workspace = true
 anyhow.workspace = true
