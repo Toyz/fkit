@@ -1,8 +1,10 @@
 /** Repository index. */
-import { LoomElement, component, css, styles, reactive, mount, inject } from "@toyz/loom";
+import { LoomElement, component, css, styles, reactive, inject } from "@toyz/loom";
+// Shadows the global `fetch` in this module, which is why it is renamed.
+import { fetch as query, type ApiState } from "@toyz/loom/query";
 import { route } from "@toyz/loom/router";
 import { base } from "../ui";
-import { api, type Repo } from "../api";
+import { type Repo } from "../api";
 import { linkHandler } from "../nav";
 import { repoRow, repoRowSheet } from "../repo-row";
 import { Session } from "../session";
@@ -21,22 +23,26 @@ const sheet = css`
 @styles(base, repoRowSheet, sheet)
 export class PageRepos extends LoomElement {
   @inject("session") accessor session!: Session;
-  @reactive accessor repos: Repo[] | null = null;
-  @reactive accessor error = "";
   @reactive accessor filter = "";
 
-  @mount
-  async load() {
-    try {
-      this.repos = await api.repos();
-    } catch (e) {
-      this.error = (e as Error).message;
-    }
-  }
+  /**
+   * The listing, as a request rather than as a nullable field.
+   *
+   * `ApiState` keeps "no data yet" and "no repositories" apart — as separate
+   * members, not as two readings of the same `null`. Conflating them is what
+   * put "this repository is empty" on screen mid-load elsewhere in this app,
+   * and here it is not expressible.
+   *
+   * The decorator also does the part that is easy to skip by hand: `fetch()`
+   * resolves for a 404 or a 500, so a hand-written `.then(r => r.json())` puts
+   * an error body in `data` and reports success. This throws instead.
+   */
+  @query<Repo[]>({ url: "/api/repos", init: { credentials: "same-origin" } })
+  accessor repos!: ApiState<Repo[]>;
 
   private visible(): Repo[] {
     const q = this.filter.trim().toLowerCase();
-    const all = this.repos ?? [];
+    const all = this.repos.data ?? [];
     return q ? all.filter((r) => r.full_name.toLowerCase().includes(q)) : all;
   }
 
@@ -47,7 +53,9 @@ export class PageRepos extends LoomElement {
         <div class="bar">
           <h1>repositories</h1>
           <span class="count">
-            {this.repos === null ? "" : `${list.length}${this.filter ? ` / ${this.repos.length}` : ""}`}
+            {this.repos.loading
+              ? ""
+              : `${list.length}${this.filter ? ` / ${this.repos.data?.length ?? 0}` : ""}`}
           </span>
           <input
             placeholder="filter"
@@ -56,9 +64,9 @@ export class PageRepos extends LoomElement {
           />
         </div>
 
-        {this.error ? <div class="error">{this.error}</div> : null}
+        {this.repos.error ? <div class="error">{this.repos.error.message}</div> : null}
 
-        {this.repos === null ? (
+        {this.repos.loading ? (
           <div class="panel">
             {[0, 1, 2, 3, 4].map(() => (
               <div class="rr sk-row">
