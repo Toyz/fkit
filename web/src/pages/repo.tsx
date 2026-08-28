@@ -822,8 +822,35 @@ export class PageRepo extends LoomElement {
   private get entries(): Entry[] | null {
     return this.treeQuery.data?.entries ?? null;
   }
-  @reactive accessor blob: BlobResponse | null = null;
-  @reactive accessor commits: Commit[] | null = null;
+  @query<BlobResponse>({
+    url: (el: PageRepo) => `/api/repos/${el.loc!.owner}/${el.loc!.name}/blob/${refAndPath(el)}`,
+    enabled: (el: PageRepo) =>
+      Boolean(el.loc && el.repoQuery.data && el.loc.view.kind === "blob"),
+    init: { credentials: "same-origin" },
+  })
+  accessor blobQuery!: ApiState<BlobResponse>;
+
+  private get blob(): BlobResponse | null {
+    return this.blobQuery.data ?? null;
+  }
+  /**
+   * `params` rather than a hand-built query string, so the key is derived from
+   * the same values the request carries — a limit that changed without the key
+   * changing would serve the old page back.
+   */
+  @query<Commit[]>({
+    url: (el: PageRepo) =>
+      `/api/repos/${el.loc!.owner}/${el.loc!.name}/commits/${encodeURIComponent(el.refName())}`,
+    params: { limit: 100, skip: 0 },
+    enabled: (el: PageRepo) =>
+      Boolean(el.loc && el.repoQuery.data && el.loc.view.kind === "commits"),
+    init: { credentials: "same-origin" },
+  })
+  accessor commitsQuery!: ApiState<Commit[]>;
+
+  private get commits(): Commit[] | null {
+    return this.commitsQuery.data ?? null;
+  }
   @reactive accessor detail: CommitDetail | null = null;
   /**
    * Its own query, so a repository without a README is an empty result rather
@@ -950,8 +977,6 @@ export class PageRepo extends LoomElement {
     const { owner, name } = at;
     const v = at.view;
 
-    this.blob = null;
-    this.commits = null;
     this.detail = null;
     this.copied = false;
     this.copiedKey = "";
@@ -973,10 +998,6 @@ export class PageRepo extends LoomElement {
         // keyed by the path it was asked for. Nothing to sequence here.
         this.docPath = "";
         this.doc = null;
-      } else if (v.kind === "blob") {
-        this.blob = await api.blob(owner, name, this.refName(), v.path);
-      } else if (v.kind === "commits") {
-        this.commits = await api.commits(owner, name, this.refName(), 100);
       } else if (v.kind === "compare") {
         const base = v.base || this.repo.default_branch;
         const head = v.head || this.repo.default_branch;
