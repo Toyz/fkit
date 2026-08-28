@@ -72,7 +72,7 @@ pub fn list_dir(store: &Store, tree: Hash, path: &str) -> AppResult<Vec<EntryVie
 }
 
 /// Walk down a path, one component at a time, following only directories.
-fn resolve_dir(store: &Store, root: Hash, path: &str) -> AppResult<Hash> {
+pub fn resolve_dir(store: &Store, root: Hash, path: &str) -> AppResult<Hash> {
     let mut current = root;
     for part in path.split('/').filter(|p| !p.is_empty() && *p != ".") {
         if part == ".." {

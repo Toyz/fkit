@@ -46,7 +46,7 @@ import "../components/clone-button";
 import "../components/fkit-select";
 import "../components/fkit-choice";
 import { adoptInto } from "../adopt";
-import { fileIcon } from "../file-icon";
+import { dirIcon, fileIcon } from "../file-icon";
 import { confirmAction } from "../components/fkit-dialog";
 
 type View =
@@ -263,21 +263,37 @@ const sheet = css`
     .latest .sha, .latest .when { display: none; }
   }
 
-  /* The name takes what it needs, the message takes the rest, and the two
-     right-hand columns are fixed so they line up down the list. The name used
-     to be pinned to a 8–22rem band, which parked every commit message in the
-     middle of the row with a gulf on both sides. */
+  /* The columns live on the panel and the rows adopt them with subgrid.
+     Each row used to be its own grid, so an auto-width name column sized to
+     that row's own filename and every message started somewhere different —
+     six distinct left edges in a twenty-file listing. A grid only aligns
+     columns within one container, so the container has to be the list.
+     (The previous 8–22rem band avoided this by making the column a fixed
+     width, at the cost of parking every message mid-row.) */
+  .panel.files {
+    display: grid;
+    /* The icon column is sized for the glyph, not the other way round: a
+       loom-icon has no intrinsic width, so left to itself it collapsed to a
+       3px sliver in the subgrid cell. */
+    grid-template-columns: 34px auto minmax(0, 1fr) 92px 72px;
+    column-gap: 12px;
+  }
   .files .r {
     display: grid;
-    grid-template-columns: 15px auto minmax(0, 1fr) 92px 62px;
-    align-items: center; gap: 12px;
+    grid-template-columns: subgrid;
+    grid-column: 1 / -1;
+    /* Stated again rather than inherited: a subgrid is supposed to take the
+       parent's gutters, and this one did not — the icon ended up flush
+       against the filename. */
+    column-gap: 12px;
+    align-items: center;
     height: var(--row); padding: 0 12px;
     border-bottom: 1px solid var(--border);
   }
   .files .fn { white-space: nowrap; }
   .files .sz {
     color: var(--faint); font-size: 11px; text-align: right;
-    font-variant-numeric: tabular-nums;
+    font-variant-numeric: tabular-nums; white-space: nowrap;
   }
   .files .when { text-align: right; }
   .files .msg {
@@ -293,8 +309,18 @@ const sheet = css`
   }
   .files .r:last-child { border-bottom: 0; }
   .files .r:hover { background: var(--raised); }
-  .files .ic { color: var(--faint); display: flex; }
+  /* The space after the glyph is inside this cell rather than a grid gap:
+     the subgrid did not take the parent's column gutters, so the icon sat
+     flush against the filename. Padding here does not depend on that. */
+  .files .ic {
+    color: var(--faint);
+    display: flex; align-items: center; justify-content: flex-start;
+    width: 34px; height: 18px;
+  }
+  .files .ic loom-icon { display: block; width: 14px; height: 14px; }
   .files .ic.d { color: var(--accent); }
+  /* Executable is worth noticing but is not a warning. */
+  .files .ic.x { color: var(--added); }
   .files a { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .files a:hover { color: var(--accent); }
   .files .sz { color: var(--faint); font-size: 11px; font-variant-numeric: tabular-nums; }
@@ -369,6 +395,48 @@ const sheet = css`
   .aside .facts dt { color: var(--faint); }
   .aside .facts dd { margin: 0; color: var(--muted); text-align: right; }
   .aside .facts dd.mono { font-family: var(--mono); }
+
+  /* README / LICENSE / CONTRIBUTING over the rendered document, which is
+     where a forge puts them — they are things to read, not facts about the
+     repository, so a sidebar list was the wrong shelf. */
+  .doctabs {
+    display: flex; align-items: center; gap: 2px;
+    padding: 0 8px;
+    background: var(--raised);
+    border-bottom: 1px solid var(--border);
+  }
+  .doctabs button {
+    display: inline-flex; align-items: center; gap: 6px;
+    font: inherit; font-size: 11.5px; height: 30px; padding: 0 9px;
+    background: transparent; border: 0; border-bottom: 2px solid transparent;
+    color: var(--muted); cursor: pointer;
+  }
+  .doctabs button:hover { color: var(--text); background: transparent; }
+  .doctabs button.on { color: var(--text); border-bottom-color: var(--accent); }
+  .doctabs button.on loom-icon { color: var(--accent); }
+  .doctabs .grow { flex: 1; }
+  .doctabs .val {
+    font-size: 11px; color: var(--faint); padding-right: 4px;
+  }
+
+  /* The homepage, as a link that shows where it goes rather than its scheme. */
+  .aside .home {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 12px; color: var(--accent); margin-bottom: 10px;
+    max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .aside .home loom-icon { flex: none; opacity: .8; }
+
+  /* Topics: labels, not buttons — nothing here is clickable yet, and a chip
+     that looks pressable and is not is worse than plain text. */
+  .aside .topics { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 11px; }
+  .aside .topic {
+    font-size: 11px; padding: 1px 7px; line-height: 17px;
+    border: 1px solid var(--border-hi); border-radius: 999px;
+    color: var(--muted); background: var(--raised);
+  }
+
+  .aside .docs li { grid-template-columns: 12px minmax(0, 1fr); }
 
   .aside .mini { list-style: none; margin: 0; padding: 0; }
   .aside .mini li {
@@ -665,6 +733,9 @@ export class PageRepo extends LoomElement {
   @reactive accessor repo: Repo | null = null;
   @reactive accessor refs: Ref[] = [];
   @reactive accessor stats: RepoStats | null = null;
+  /** A non-README document selected from the tab strip, and its content. */
+  @reactive accessor docPath = "";
+  @reactive accessor doc: string | null = null;
   @reactive accessor error = "";
   @reactive accessor notFound = false;
 
@@ -797,7 +868,9 @@ export class PageRepo extends LoomElement {
           })
           .catch(() => {});
 
-        if (!v.path) this.readme = await api.readme(owner, name, this.ref());
+        this.readme = await api.readme(owner, name, this.ref(), v.path);
+        this.docPath = "";
+        this.doc = null;
       } else if (v.kind === "blob") {
         this.blob = await api.blob(owner, name, this.ref(), v.path);
       } else if (v.kind === "commits") {
@@ -896,6 +969,28 @@ export class PageRepo extends LoomElement {
           ) : (
             <p class="prose faint">No description.</p>
           )}
+
+          {/* rel=noopener stops the target reaching back through window.opener;
+              nofollow because this is a link somebody else chose to put on our
+              page. The scheme is checked server-side before it is stored. */}
+          {r.homepage ? (
+            <a
+              class="home"
+              href={r.homepage}
+              target="_blank"
+              rel="noopener noreferrer nofollow"
+            >
+              <loom-icon name="link" size={12}></loom-icon>
+              {r.homepage.replace(/^https?:\/\//, "").replace(/\/$/, "")}
+            </a>
+          ) : null}
+
+          {r.topics?.length ? (
+            <div class="topics">
+              {r.topics.map((t) => <span class="topic">{t}</span>)}
+            </div>
+          ) : null}
+
           <dl class="facts">
             <dt>visibility</dt>
             <dd>{r.visibility}</dd>
@@ -997,6 +1092,36 @@ export class PageRepo extends LoomElement {
     );
   }
 
+  /**
+   * The well-known documents in the root, as tabs over the rendered pane.
+   *
+   * Detected from the root listing that has already been fetched, so nothing
+   * is claimed that is not actually in the tree, and it costs no request.
+   * Matched on the stem, so LICENSE, LICENSE.md and LICENCE.txt all count.
+   */
+  private docTabs(): { label: string; icon: string; path: string; name: string }[] {
+    const entries = this.entries;
+    if (!entries) return [];
+
+    const known: [RegExp, string, string][] = [
+      [/^readme$/, "readme", "book"],
+      [/^licen[cs]e$/, "license", "scale"],
+      [/^contributing$/, "contributing", "people"],
+      [/^code[_-]?of[_-]?conduct$/, "code of conduct", "heart"],
+      [/^security$/, "security", "shield"],
+      [/^changelog$/, "changelog", "history"],
+    ];
+
+    const found: { label: string; icon: string; path: string; name: string }[] = [];
+    for (const [re, label, icon] of known) {
+      const hit = entries.find(
+        (e) => e.kind !== "dir" && re.test((e.name.split(".")[0] ?? "").toLowerCase()),
+      );
+      if (hit) found.push({ label, icon, path: hit.path, name: hit.name });
+    }
+    return found;
+  }
+
   private renderTree(path: string) {
     const at = this.loc!;
     const r = this.ref();
@@ -1007,7 +1132,7 @@ export class PageRepo extends LoomElement {
       const href = `/${at.owner}/${at.name}/tree/${r}${up ? "/" + up : ""}`;
       rows.push(
         <div class="r">
-          <span class="ic d"><loom-icon name="up" size={13}></loom-icon></span>
+          <span class="ic d"><loom-icon name="up" size={14}></loom-icon></span>
           <a class="fn" href={href} onClick={linkHandler(href)}>..</a>
           <span></span>
           <span></span>
@@ -1023,21 +1148,25 @@ export class PageRepo extends LoomElement {
       const chref = lc ? `/${at.owner}/${at.name}/commit/${lc.hash}` : "";
       rows.push(
         <div class="r">
-          <span class={`ic ${e.kind === "dir" ? "d" : ""}`}>
+          <span
+            class={`ic ${e.kind === "dir" ? "d" : ""} ${e.kind === "exec" ? "x" : ""}`}
+            title={e.kind === "exec" ? "executable" : e.kind}
+          >
             <loom-icon
               name={
                 e.kind === "dir"
-                  ? "folder"
+                  ? dirIcon(e.name)
                   : e.kind === "symlink"
                     ? "link"
-                    : fileIcon(e.name)
+                    : e.kind === "exec"
+                      ? "terminal"
+                      : fileIcon(e.name)
               }
-              size={13}
+              size={14}
             ></loom-icon>
           </span>
           <a class="fn" href={href} onClick={linkHandler(href)}>
             {e.name}
-            {e.kind === "exec" ? <span class="tag" style="margin-left:7px">exec</span> : null}
           </a>
           {lc ? (
             <a class="msg" href={chref} onClick={linkHandler(chref)} title={lc.summary}>
@@ -1410,15 +1539,63 @@ export class PageRepo extends LoomElement {
   }
 
   private renderReadme() {
-    if (!this.readme) return null;
-    // The renderer escapes everything before generating markup, so `rawHTML`
-    // here is safe for untrusted README content.
+    const tabs = this.docTabs();
+    // Nothing to show, and nothing to offer.
+    if (!this.readme && tabs.length === 0) return null;
+
+    // The README is the default view; any other tab loads on demand.
+    const active = this.docPath;
+    const body = active ? this.doc : this.readme?.content;
+    const name = active
+      ? (tabs.find((t) => t.path === active)?.name ?? active)
+      : (this.readme?.name ?? "");
+
     return (
-      <div class="panel" style="margin-top:12px">
-        <div class="panel-head"><span>{this.readme.name}</span></div>
-        <div class="md" rawHTML={renderMarkdown(this.readme.content)}></div>
+      <div class="panel doc" style="margin-top:12px">
+        <div class="doctabs">
+          {tabs.map((t) => {
+            const isReadme = t.label === "readme";
+            const on = isReadme ? !active : active === t.path;
+            return (
+              <button
+                class={on ? "on" : ""}
+                type="button"
+                onClick={() => this.openDoc(isReadme ? "" : t.path)}
+              >
+                <loom-icon name={t.icon} size={12}></loom-icon>
+                {t.label}
+              </button>
+            );
+          })}
+          <span class="grow"></span>
+          <span class="val">{name}</span>
+        </div>
+        {body === null || body === undefined ? (
+          <div class="panel-body"><span class="sk" style="width:min(60%,320px)"></span></div>
+        ) : (
+          // The renderer escapes everything before generating markup, so
+          // rawHTML here is safe for untrusted repository content.
+          <div class="md" rawHTML={renderMarkdown(body)}></div>
+        )}
       </div>
     );
+  }
+
+  /** Switch the document pane. "" means the README, which is already loaded. */
+  private openDoc(path: string) {
+    this.docPath = path;
+    if (!path) return;
+    const at = this.loc!;
+    this.doc = null;
+    void api
+      .blob(at.owner, at.name, this.ref(), path)
+      .then((b) => {
+        // Guard against a slow response for a tab the reader has left.
+        if (this.docPath === path) this.doc = b.content ?? "(not a text file)";
+      })
+      .catch((e) => {
+        if (this.docPath === path) this.doc = `Could not load ${path}: ${(e as Error).message}`;
+      });
   }
 
   private renderCompare() {
@@ -2064,12 +2241,16 @@ fkit push</pre>
               class="stack"
               onSubmit={(e: Event) => {
                 e.preventDefault();
-                const input = (e.target as HTMLFormElement).elements.namedItem(
-                  "description",
-                ) as HTMLInputElement;
+                const f = e.target as HTMLFormElement;
+                const at2 = (n: string) =>
+                  (f.elements.namedItem(n) as HTMLInputElement).value;
                 void this.act(async () => {
                   this.repo = await api.updateRepo(at.owner, at.name, {
-                    description: input.value,
+                    description: at2("description"),
+                    homepage: at2("homepage"),
+                    // Comma or space separated; the server normalises and
+                    // de-duplicates, so this only has to split.
+                    topics: at2("topics").split(/[,\s]+/).filter(Boolean),
                   });
                 }, "saved");
               }}
@@ -2089,6 +2270,30 @@ fkit push</pre>
                   placeholder="one line about what this is"
                 />
                 <div class="fd">Shown beside the name in listings and at the top of the page.</div>
+              </div>
+              <div class="field">
+                <label>website</label>
+                <input
+                  name="homepage"
+                  value={r.homepage ?? ""}
+                  placeholder="https://fkit.work"
+                />
+                <div class="fd">
+                  Linked from the About panel. Must start with http:// or https:// —
+                  anything else would be a link that runs in a visitor's session rather
+                  than taking them somewhere.
+                </div>
+              </div>
+              <div class="field">
+                <label>topics</label>
+                <input
+                  name="topics"
+                  value={(r.topics ?? []).join(", ")}
+                  placeholder="rust, version-control, merkle"
+                />
+                <div class="fd">
+                  Comma separated. Letters, digits, hyphen and dot; up to 20.
+                </div>
               </div>
               <div class="row">
                 <button class="primary" type="submit" disabled={this.busy}>save</button>

@@ -17,6 +17,24 @@ const PATHS = {
   link: `<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>`,
   commit: `<circle cx="12" cy="12" r="3"/><path d="M3 12h6M15 12h6"/>`,
   branch: `<path d="M6 3v12"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/>`,
+  /* An executable file. The exec bit is the more salient fact about a file
+     you can run than the language it happens to be written in. */
+  terminal: `<path d="m4 17 6-6-6-6"/><path d="M12 19h8"/>`,
+
+  /* One per well-known document. Three tabs sharing a page glyph told you
+     nothing; these are distinguishable at 12px, which is the whole point. */
+  book: `<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2Z"/><path d="M9 7h7M9 11h5"/>`,
+  scale: `<path d="M12 3v18M7 21h10"/><path d="M5 7h14"/><path d="m5 7-3 6a3 3 0 0 0 6 0Z"/><path d="m19 7-3 6a3 3 0 0 0 6 0Z"/>`,
+  people: `<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>`,
+  heart: `<path d="M19 14c1.5-1.5 3-3.3 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.8 0-3 .5-4.5 2-1.5-1.5-2.7-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.2 1.5 4 3 5.5l7 7Z"/>`,
+  shield: `<path d="M20 13c0 5-3.5 7.5-7.7 8.9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1 1 0 0 1 1.6 0C14.6 3.8 17 5 19 5a1 1 0 0 1 1 1Z"/><path d="m9 12 2 2 4-4"/>`,
+
+  /* Brand marks. These are filled logos, not line icons, so each path sets
+     its own fill and clears the stroke — loom-icon's svg carries
+     fill:none;stroke:currentColor, and an outlined octocat is unreadable. */
+  github: `<path fill="currentColor" stroke="none" d="M12 .5C5.37.5 0 5.87 0 12.5c0 5.3 3.44 9.8 8.21 11.39.6.11.82-.26.82-.58v-2.03c-3.34.73-4.04-1.61-4.04-1.61-.55-1.39-1.34-1.76-1.34-1.76-1.09-.75.08-.73.08-.73 1.2.08 1.84 1.24 1.84 1.24 1.07 1.84 2.81 1.31 3.5 1 .11-.78.42-1.31.76-1.61-2.67-.3-5.47-1.34-5.47-5.96 0-1.32.47-2.39 1.24-3.23-.12-.31-.54-1.53.12-3.18 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.29-1.55 3.3-1.23 3.3-1.23.66 1.65.24 2.87.12 3.18.77.84 1.24 1.91 1.24 3.23 0 4.63-2.8 5.65-5.48 5.95.43.37.81 1.1.81 2.22v3.29c0 .32.22.7.83.58A12.01 12.01 0 0 0 24 12.5C24 5.87 18.63.5 12 .5z"/>`,
+  gitlab: `<path fill="currentColor" stroke="none" d="m23.6 9.6-.03-.09-3.26-8.5a.85.85 0 0 0-.34-.4.88.88 0 0 0-1 .05.88.88 0 0 0-.29.45l-2.2 6.73H7.52L5.32 1.11a.86.86 0 0 0-.29-.45.88.88 0 0 0-1-.5.85.85 0 0 0-.34.4L.42 9.51l-.3.09a6.05 6.05 0 0 0 2 7l.1.01.03.02 5.05 3.78 2.5 1.9 1.52 1.15a1.01 1.01 0 0 0 1.22 0l1.52-1.15 2.5-1.9 5.08-3.8.01-.01a6.06 6.06 0 0 0 2-6.99z"/>`,
+
   /* File-kind icons. All 24x24 stroke, like everything else, so they sit at
      the same visual weight as the folder and file glyphs they replace. */
   code: `<path d="m16 18 6-6-6-6"/><path d="m8 6-6 6 6 6"/>`,

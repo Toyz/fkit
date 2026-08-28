@@ -31,6 +31,9 @@ export interface Repo {
   description: string | null;
   visibility: "public" | "private";
   default_branch: string;
+  /** Where the thing this repository builds actually lives. "" when unset. */
+  homepage: string;
+  topics: string[];
   created_at: string;
   updated_at: string;
   access: "none" | "read" | "write" | "admin";
@@ -433,9 +436,10 @@ export const api = {
   reopenMerge: (owner: string, name: string, number: number) =>
     request<MergeRequest>(`/repos/${owner}/${name}/merges/${number}/reopen`, { method: "POST" }),
 
-  readme: (owner: string, name: string, ref: string) =>
+  readme: (owner: string, name: string, ref: string, path = "") =>
     request<{ name: string; content: string } | null>(
-      `/repos/${owner}/${name}/readme/${encodeURIComponent(ref)}`,
+      `/repos/${owner}/${name}/readme/${encodeURIComponent(ref)}` +
+        (path ? `/${path.split("/").map(encodeURIComponent).join("/")}` : ""),
     ),
 
   // account

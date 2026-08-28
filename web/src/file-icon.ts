@@ -28,6 +28,8 @@ add("blob", "exe dll so dylib a o bin wasm class pyc elf img iso");
 
 /** Files whose whole name is the signal, extension or not. */
 const BY_NAME: Record<string, string> = {
+  // ".env", ".env.example", ".env.prod" — the stem is the whole signal.
+  env: "gear",
   dockerfile: "gear",
   makefile: "gear",
   cargo: "gear",
@@ -55,4 +57,23 @@ export function fileIcon(name: string): string {
   if (lower.startsWith(".") && !bare.includes(".")) return BY_EXT[bare] ?? "gear";
 
   return "file";
+}
+
+/**
+ * Directories that are recognisably something.
+ *
+ * Only a handful earn their own mark: a folder icon says "folder", which is
+ * already obvious, so a different glyph has to buy real recognition.
+ */
+const DIRS: Record<string, string> = {
+  ".github": "github",
+  ".gitlab": "gitlab",
+  ".vscode": "gear",
+  ".idea": "gear",
+  ".cargo": "gear",
+  ".claude": "gear",
+};
+
+export function dirIcon(name: string): string {
+  return DIRS[name.toLowerCase()] ?? "folder";
 }

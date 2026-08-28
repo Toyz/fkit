@@ -57,6 +57,8 @@ pub struct RepoRow {
     pub description: Option<String>,
     pub visibility: String,
     pub default_branch: String,
+    pub homepage: String,
+    pub topics: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -81,6 +83,8 @@ pub struct RepoView {
     pub description: Option<String>,
     pub visibility: String,
     pub default_branch: String,
+    pub homepage: String,
+    pub topics: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// The viewer's effective access, so the UI can hide controls it would be
@@ -170,6 +174,10 @@ pub struct UpdateRepoReq {
     pub visibility: Option<String>,
     #[serde(default)]
     pub default_branch: Option<String>,
+    #[serde(default)]
+    pub homepage: Option<String>,
+    #[serde(default)]
+    pub topics: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]

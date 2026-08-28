@@ -314,11 +314,22 @@ async fn update_repo(
         return Err(AppError::bad("visibility must be 'public' or 'private'"));
     }
 
+    let homepage = match &body.homepage {
+        Some(h) => Some(clean_homepage(h)?),
+        None => None,
+    };
+    let topics = match &body.topics {
+        Some(t) => Some(clean_topics(t)?),
+        None => None,
+    };
+
     sqlx::query(
         "UPDATE repos SET
             description    = COALESCE($2, description),
             visibility     = COALESCE($3, visibility),
             default_branch = COALESCE($4, default_branch),
+            homepage       = COALESCE($5, homepage),
+            topics         = COALESCE($6, topics),
             updated_at     = now()
          WHERE id = $1",
     )
@@ -326,6 +337,8 @@ async fn update_repo(
     .bind(&body.description)
     .bind(&body.visibility)
     .bind(&body.default_branch)
+    .bind(&homepage)
+    .bind(&topics)
     .execute(&state.db)
     .await?;
 
@@ -337,6 +350,58 @@ async fn update_repo(
         .fetch_one(&state.db)
         .await?;
     Ok(Json(super::repo_view(&updated, &owner_lc, access)))
+}
+
+/// Validate a homepage URL.
+///
+/// The browser renders this as a link on a page the viewer trusts, so the
+/// scheme is the whole security question: `javascript:` and `data:` execute in
+/// the viewer's session, and everything else is at best a broken link. Only
+/// http and https are stored. An empty string clears it.
+fn clean_homepage(raw: &str) -> AppResult<String> {
+    let h = raw.trim();
+    if h.is_empty() {
+        return Ok(String::new());
+    }
+    let lower = h.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return Err(AppError::bad("a website must start with http:// or https://"));
+    }
+    // A URL is a link, not a document: control characters in one are a way to
+    // smuggle something past a naive renderer.
+    if h.chars().any(|c| c.is_control()) {
+        return Err(AppError::bad("that URL contains control characters"));
+    }
+    if h.len() > 512 {
+        return Err(AppError::bad("that URL is too long"));
+    }
+    Ok(h.to_string())
+}
+
+/// Normalise topics: lower-case, de-duplicated, bounded.
+fn clean_topics(raw: &[String]) -> AppResult<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for t in raw {
+        let t = t.trim().to_ascii_lowercase();
+        if t.is_empty() {
+            continue;
+        }
+        if t.len() > 32 {
+            return Err(AppError::bad(format!("topic '{t}' is longer than 32 characters")));
+        }
+        if !t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.') {
+            return Err(AppError::bad(format!(
+                "topic '{t}' may only contain letters, digits, hyphen and dot"
+            )));
+        }
+        if !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    if out.len() > 20 {
+        return Err(AppError::bad("at most 20 topics"));
+    }
+    Ok(out)
 }
 
 async fn delete_repo(

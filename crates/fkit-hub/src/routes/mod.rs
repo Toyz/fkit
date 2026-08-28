@@ -55,6 +55,8 @@ pub fn repo_view(repo: &RepoRow, owner: &str, access: Access) -> RepoView {
         description: repo.description.clone(),
         visibility: repo.visibility.clone(),
         default_branch: repo.default_branch.clone(),
+        homepage: repo.homepage.clone(),
+        topics: repo.topics.clone(),
         created_at: repo.created_at,
         updated_at: repo.updated_at,
         access: access.as_str().to_string(),

@@ -24,6 +24,7 @@ pub fn routes() -> Router<AppState> {
         .route("/repos/{owner}/{name}/commits/{ref}", get(commits))
         .route("/repos/{owner}/{name}/commit/{hash}", get(commit_detail))
         .route("/repos/{owner}/{name}/readme/{ref}", get(readme))
+        .route("/repos/{owner}/{name}/readme/{ref}/{*path}", get(readme_at))
         .route("/repos/{owner}/{name}/lastcommits/{ref}", get(last_commits_root))
         .route("/repos/{owner}/{name}/lastcommits/{ref}/{*path}", get(last_commits_path))
         .route("/repos/{owner}/{name}/raw/{ref}/{*path}", get(raw))
@@ -319,5 +320,22 @@ async fn readme(
     let (store, _, tree) = open(&state, &viewer, &owner, &name, &r).await?;
     Ok(Json(
         content::find_readme(&store, tree).map(|(n, c)| ReadmeResponse { name: n, content: c }),
+    ))
+}
+
+/// The README of a subdirectory.
+///
+/// `find_readme` already works on any tree — it was only ever called with the
+/// root — so browsing into a directory that documents itself now shows that
+/// documentation, the same as the top level does.
+async fn readme_at(
+    State(state): State<AppState>,
+    viewer: Viewer,
+    Path((owner, name, r, path)): Path<(String, String, String, String)>,
+) -> AppResult<Json<Option<ReadmeResponse>>> {
+    let (store, _, tree) = open(&state, &viewer, &owner, &name, &r).await?;
+    let dir = content::resolve_dir(&store, tree, &path)?;
+    Ok(Json(
+        content::find_readme(&store, dir).map(|(n, c)| ReadmeResponse { name: n, content: c }),
     ))
 }
