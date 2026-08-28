@@ -21,7 +21,7 @@ add("code", "rs ts tsx js jsx mjs cjs py go rb java c h cc cpp hpp cs kt swift "
 add("doc", "md markdown mdx txt rst adoc org tex pdf doc docx rtf");
 add("image", "png jpg jpeg gif webp avif bmp ico svg tiff heic");
 add("gear", "json yaml yml toml ini cfg conf env properties xml plist editorconfig " +
-            "gitignore fkitignore dockerignore lock");
+            "gitignore fkitignore fkthat dockerignore lock");
 add("archive", "zip tar gz tgz bz2 xz zst 7z rar jar war");
 add("db", "db sqlite sqlite3 sql3 mdb parquet");
 add("blob", "exe dll so dylib a o bin wasm class pyc elf img iso");

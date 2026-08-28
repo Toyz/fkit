@@ -407,7 +407,7 @@ fn is_executable(_m: &fs::Metadata) -> bool {
     false
 }
 
-/// Dead-simple ignore rules, read from `.fkitignore`.
+/// Dead-simple ignore rules, read from `.fkitignore` or `.fkthat`.
 ///
 /// Supported patterns (deliberately minimal — no full glob engine):
 ///   * `target`    — matches any component with that exact name
@@ -420,6 +420,14 @@ pub struct Ignore {
     dirs: Vec<String>,
 }
 
+/// Both names for the same file, in the order they are read.
+///
+/// If a repository has both, both apply. The alternative — first one wins —
+/// means adding the second file silently does nothing, and a rule that is
+/// present in the tree and quietly not in effect is the worst outcome an
+/// ignore file can produce.
+pub const IGNORE_FILES: [&str; 2] = [".fkitignore", ".fkthat"];
+
 impl Ignore {
     pub fn empty() -> Ignore {
         Ignore { names: vec![], suffixes: vec![], dirs: vec![] }
@@ -430,22 +438,29 @@ impl Ignore {
         // The repo's own metadata is never part of a snapshot.
         ig.names.push(".fkit".into());
 
-        if let Ok(text) = fs::read_to_string(repo_root.join(".fkitignore")) {
-            for line in text.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                if let Some(rest) = line.strip_suffix('/') {
-                    ig.dirs.push(rest.to_string());
-                } else if let Some(rest) = line.strip_prefix("*.") {
-                    ig.suffixes.push(format!(".{rest}"));
-                } else {
-                    ig.names.push(line.to_string());
-                }
+        for file in IGNORE_FILES {
+            if let Ok(text) = fs::read_to_string(repo_root.join(file)) {
+                ig.extend_from(&text);
             }
         }
         ig
+    }
+
+    /// Parse rules out of one ignore file's contents.
+    fn extend_from(&mut self, text: &str) {
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(rest) = line.strip_suffix('/') {
+                self.dirs.push(rest.to_string());
+            } else if let Some(rest) = line.strip_prefix("*.") {
+                self.suffixes.push(format!(".{rest}"));
+            } else {
+                self.names.push(line.to_string());
+            }
+        }
     }
 
     pub fn matches(&self, name: &str, is_dir: bool) -> bool {
@@ -463,6 +478,40 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fkit-ingest-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         (Store::open(&dir).unwrap(), dir)
+    }
+
+    #[test]
+    fn either_ignore_filename_is_read() {
+        for name in super::IGNORE_FILES {
+            let dir = std::env::temp_dir()
+                .join(format!("fkit-ign-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(name), "target/\n*.log\nsecret.txt\n").unwrap();
+
+            let ig = Ignore::load(&dir);
+            assert!(ig.matches("target", true), "{name}: a directory rule");
+            assert!(ig.matches("run.log", false), "{name}: a suffix rule");
+            assert!(ig.matches("secret.txt", false), "{name}: an exact name");
+            assert!(!ig.matches("keep.rs", false), "{name}: everything else stays");
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn both_ignore_files_apply_together() {
+        // Whichever name someone reaches for, a rule that is present in the
+        // tree must be in effect — the second file cannot be silently dead.
+        let dir = std::env::temp_dir().join(format!("fkit-ign-both-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(".fkitignore"), "target/\n").unwrap();
+        fs::write(dir.join(".fkthat"), "*.log\n").unwrap();
+
+        let ig = Ignore::load(&dir);
+        assert!(ig.matches("target", true), "the rule from .fkitignore");
+        assert!(ig.matches("run.log", false), "the rule from .fkthat");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -5,6 +5,10 @@
 # nothing at all. See `Ignore` in fkit-core/src/ingest.rs for the whole grammar
 # — exact names, `*.suffix`, and `name/` for directories only.
 
+# git's own state. fkit tracks this tree, not git's bookkeeping about it —
+# and .git churns on every git operation, so a snapshot would never settle.
+.git/
+
 # Build output — regenerable, and huge.
 target/
 node_modules/
