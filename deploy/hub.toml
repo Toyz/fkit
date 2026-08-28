@@ -2,7 +2,7 @@
 # Environment variables override this file.
 
 [server]
-secure_cookies = true            # Caddy terminates TLS. false if no proxy.
+secure_cookies = true            # false if you reach the hub over plain http
 open_registration = false        # first account on an empty server still gets in
 require_auth = false             # public repos stay readable without an account
 default_repo_visibility = "private"

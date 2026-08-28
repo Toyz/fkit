@@ -32,8 +32,7 @@ toolchain assumptions — at the cost of a cold build under QEMU.
 ## 2. Put the deployment files on the server
 
 ```sh
-scp docker-compose.prod.yml Caddyfile deploy/hub.toml .env.prod.example \
-    server:/opt/fkit/
+scp docker-compose.prod.yml deploy/hub.toml .env.prod.example server:/opt/fkit/
 ssh server 'cd /opt/fkit && mv .env.prod.example .env.prod'
 ```
 
@@ -53,20 +52,21 @@ RESEND_API_KEY=                                # optional
 Migrations run on boot either way — the hub needs a database it can create
 tables in, not a specific one.
 
-Point `fkit.work` at the server's public address first. Caddy proves control of
-the name over port 80, so that record has to resolve before the first start.
-
 ## 3. Start it
 
 ```sh
 cd /opt/fkit
 docker compose --env-file .env.prod -f docker-compose.prod.yml \
-  --profile bundled-db --profile tls up -d          # drop bundled-db for (a)
-docker compose -f docker-compose.prod.yml logs -f caddy hub
+  --profile bundled-db up -d          # drop the profile if you set DATABASE_URL
+docker compose -f docker-compose.prod.yml logs -f hub
 ```
 
-Caddy gets a Let's Encrypt certificate on its own and renews it. Migrations run
-on boot. The first account you register becomes the administrator — do that
+The hub listens on `BIND_ADDR:HUB_PORT` (`127.0.0.1:7500` by default) — point
+your proxy at that. It must pass WebSocket upgrades through: the sync protocol
+is WebSocket end to end, so a proxy that mangles `Upgrade` breaks push and
+clone while leaving the web UI looking perfectly healthy.
+
+Migrations run on boot. The first account you register becomes the administrator — do that
 immediately, then close registration in **admin → instance** and bring anyone
 else in from **admin → invites**.
 
@@ -77,12 +77,12 @@ https://fkit.work
 fkit clone wss://fkit.work/helba/fkit
 ```
 
-### Without a public domain
+### Cookies and TLS
 
-Drop `--profile tls`, set `BIND_ADDR` to the server's address on your private
-network, and clear `FKIT_SECURE_COOKIES`. That variable is the one to get right:
-a `Secure` cookie sent over `http://` is discarded by the browser, and the
-symptom is a login that appears to succeed and then isn't.
+`secure_cookies` in `hub.toml` is the one to get right. Leave it `true` when
+something terminates TLS in front. Set it `false` if you reach the hub over
+plain `http://` — a `Secure` cookie sent over http is discarded by the browser,
+and the symptom is a login that appears to succeed and then isn't.
 
 For a private CA or a certificate minted for a name that only exists on an
 overlay network, point clients at the root:
@@ -118,7 +118,7 @@ make push TAG=v2
 # on the server
 docker compose --env-file .env.prod -f docker-compose.prod.yml pull
 docker compose --env-file .env.prod -f docker-compose.prod.yml \
-  --profile bundled-db --profile tls up -d
+  --profile bundled-db up -d
 ```
 
 Data lives in the `pgdata` and `repodata` volumes and survives an image swap.

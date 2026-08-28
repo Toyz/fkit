@@ -1,56 +1,21 @@
-# fkit hub — deployment compose.
+# fkit hub — deployment. Pulls a published image; the server needs no toolchain.
 #
-# Unlike docker-compose.yml this does NOT build: it pulls a published image, so
-# the server never needs a Rust toolchain, a Node install, or the source tree.
+#   docker compose --env-file .env.prod -f docker-compose.prod.yml \
+#     --profile bundled-db up -d
 #
-#   1. On your machine:   make push TAG=v1
-#   2. Copy this file, hub.toml, Caddyfile and .env.prod to the server
-#   3. On the server:     docker compose -f docker-compose.prod.yml \
-#                           --profile bundled-db --profile tls up -d
+# Drop --profile bundled-db and set DATABASE_URL to use a database you already
+# have. Settings are in hub.toml; only secrets come from .env.prod, because the
+# environment overrides the file.
 #
-# ---- the database -----------------------------------------------------------
-# Two options, and neither is the default forced on you:
-#
-#   Bundled     add --profile bundled-db and set POSTGRES_PASSWORD.
-#   Your own    set DATABASE_URL and leave the profile off. Nothing local
-#               starts, and POSTGRES_PASSWORD is not needed at all.
-#
-# Migrations run on boot either way; the hub needs a database it can create
-# tables in, not a specific one.
-#
-# ---- reachability -----------------------------------------------------------
-# Two shapes, chosen by whether you start the `tls` profile.
-#
-# Public, on a domain (fkit.work):
-#
-#     docker compose --env-file .env.prod -f docker-compose.prod.yml \
-#       --profile tls up -d
-#
-#   Caddy terminates TLS and forwards to the hub over the compose network, so
-#   BIND_ADDR stays 127.0.0.1 and the hub is never directly exposed. Set
-#   FKIT_SECURE_COOKIES=1 — with TLS in front, session cookies should not be
-#   allowed to travel any other way.
-#
-# Private, on an overlay network:
-#
-#     docker compose --env-file .env.prod -f docker-compose.prod.yml up -d
-#
-#   No Caddy. Set BIND_ADDR to the server's address on that network, and that
-#   is the whole access-control story. Leave FKIT_SECURE_COOKIES unset while
-#   you reach it over plain http://: a Secure cookie sent over http is
-#   discarded by the browser, which looks precisely like a login that silently
-#   fails.
-#
-# BIND_ADDR defaults to 127.0.0.1 either way, so a deploy that forgets it is
-# reachable from the server itself rather than from the whole internet.
+# The hub speaks plain HTTP on BIND_ADDR:HUB_PORT — point your proxy at it. It
+# defaults to 127.0.0.1, so forgetting to set it means "local only" rather than
+# "the whole internet". Whatever terminates TLS must pass WebSocket upgrades
+# through: the sync protocol is WebSocket end to end, and a proxy that mangles
+# Upgrade breaks push and clone while the web UI looks perfectly healthy.
 
 name: fkit
 
 services:
-  # The bundled database, for when you do not already have one. It lives in the
-  # `bundled-db` profile so that pointing DATABASE_URL at a managed Postgres —
-  # RDS, Neon, a box you already run — does not also start a second server you
-  # have to ignore. See the DATABASE_URL note below.
   postgres:
     image: postgres:17-alpine
     profiles: [bundled-db]
@@ -58,16 +23,11 @@ services:
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-fkit}
       POSTGRES_DB: ${POSTGRES_DB:-fkit_hub}
-      # Not `:?` — compose interpolates every service whether or not its
-      # profile is active, so a required-variable check here would block an
-      # external-database deploy that has no use for the variable. The postgres
-      # image refuses to initialise without a password and says so plainly, and
-      # that only happens when this service is actually started.
+      # Not `:?` — compose interpolates inactive profiles too, so a required
+      # check here would break external-database deploys that never use it.
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
     volumes:
       - pgdata:/var/lib/postgresql/data
-    # Deliberately not published. Only the hub needs to reach it, and it does
-    # so over the compose network.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-fkit} -d $${POSTGRES_DB:-fkit_hub}"]
       interval: 10s
@@ -78,49 +38,20 @@ services:
     image: ${FKIT_IMAGE:-ghcr.io/toyz/fkit-hub}:${FKIT_TAG:-latest}
     restart: unless-stopped
     depends_on:
-      # Only enforced when the bundled-db profile is active; with an external
-      # database there is no local service to wait on, and the hub retries its
-      # first connection anyway.
       postgres:
         condition: service_healthy
         required: false
-    # Settings live in hub.toml. Only secrets and things the image owns are
-    # passed as environment variables here, because the environment OVERRIDES
-    # the file — anything set below silently wins over what hub.toml says, and
-    # a setting that appears in both places is a setting nobody can trust.
     environment:
-      # A connection string carries a password, so it never goes in the file.
       DATABASE_URL: ${DATABASE_URL:-postgres://${POSTGRES_USER:-fkit}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-fkit_hub}}
-      # Likewise the Resend key. Everything else about mail is in [email].
       RESEND_API_KEY: ${RESEND_API_KEY:-}
       RUST_LOG: ${RUST_LOG:-fkit_hub=info,tower_http=warn}
     ports:
       - "${BIND_ADDR:-127.0.0.1}:${HUB_PORT:-7500}:7500"
     volumes:
       - repodata:/var/lib/fkit/data
-      # /etc/fkit/hub.toml is one of the paths the hub checks unprompted, so
-      # mounting it here needs no flag. Read-only: the hub never writes it, and
-      # an instance setting changed from the web belongs in the database.
+      # A path the hub checks on its own, so no flag is needed.
       - ./hub.toml:/etc/fkit/hub.toml:ro
-
-  # Started only with `--profile tls`. Without it the hub is whatever
-  # BIND_ADDR says and nothing terminates TLS.
-  caddy:
-    image: caddy:2-alpine
-    profiles: [tls]
-    restart: unless-stopped
-    depends_on: [hub]
-    ports:
-      - "80:80"     # required for the ACME HTTP challenge, not just redirects
-      - "443:443"
-      - "443:443/udp"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddydata:/data      # certificates and account keys — losing this
-      - caddyconfig:/config  # means re-issuing on every restart
 
 volumes:
   pgdata:
   repodata:
-  caddydata:
-  caddyconfig:
