@@ -26,7 +26,7 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     permissions:
       contents: read
       packages: write
@@ -51,8 +51,10 @@ jobs:
 
       # zstd is a C library built through cc, so the musl target needs a musl
       # C compiler. Without it the link fails only at the very end of a long
-      # build, which is the worst place to find out.
-      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      # build, which is the worst place to find out. `file` is what the
+      # static-link assertion below is written against, and the self-hosted
+      # runner image ships neither.
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools file
 
       - uses: Swatinem/rust-cache@v2
         with:
