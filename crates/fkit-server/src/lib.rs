@@ -44,12 +44,20 @@ impl RepoHost for DiskHost {
         &self.repo.store
     }
 
+    /// Every ref, branches and tags alike.
+    ///
+    /// `list_refs` is branches only, so the daemon used to advertise no tags
+    /// at all — a clone from fkitd silently dropped them while the same clone
+    /// from the hub kept them.
     fn refs(&self) -> Result<Vec<(String, Hash)>> {
-        Ok(self.repo.list_refs()?.into_iter().collect())
+        Ok(self.repo.all_refs()?.into_iter().collect())
     }
 
     fn read_ref(&self, branch: &str) -> Result<Option<Hash>> {
-        self.repo.read_ref(branch)
+        match branch.strip_prefix(Repo::TAG_PREFIX) {
+            Some(tag) => self.repo.read_tag(tag),
+            None => self.repo.read_ref(branch),
+        }
     }
 
     fn can_write(&self) -> bool {
@@ -59,6 +67,22 @@ impl RepoHost for DiskHost {
     fn advance_ref(&self, branch: &str, tip: Hash, force: bool) -> Result<RefUpdate> {
         let lock = ref_lock(&self.name);
         let _guard = lock.lock().unwrap();
+
+        // A tag does not move. It has no ancestry to fast-forward along, so
+        // the branch rule would let a later commit repoint it just by being a
+        // descendant — the same reasoning as the hub applies.
+        if let Some(tag) = branch.strip_prefix(Repo::TAG_PREFIX) {
+            if let Some(old) = self.repo.read_tag(tag)? {
+                if old == tip {
+                    return Ok(RefUpdate::AlreadyCurrent);
+                }
+                if !force {
+                    return Ok(RefUpdate::NotFastForward);
+                }
+            }
+            self.repo.write_tag(tag, tip, true)?;
+            return Ok(RefUpdate::Updated);
+        }
 
         if let Some(old) = self.repo.read_ref(branch)? {
             if old == tip {

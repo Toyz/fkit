@@ -26,17 +26,32 @@ add("archive", "zip tar gz tgz bz2 xz zst 7z rar jar war");
 add("db", "db sqlite sqlite3 sql3 mdb parquet");
 add("blob", "exe dll so dylib a o bin wasm class pyc elf img iso");
 
-/** Files whose whole name is the signal, extension or not. */
+/**
+ * Files whose whole name is the signal, extension or not.
+ *
+ * The well-known documents use the same icons the document tabs do — one file
+ * showing a generic page in the listing and a scales-of-justice in the tab
+ * strip is two answers to the same question.
+ */
 const BY_NAME: Record<string, string> = {
   // ".env", ".env.example", ".env.prod" — the stem is the whole signal.
   env: "gear",
   dockerfile: "gear",
   makefile: "gear",
   cargo: "gear",
-  license: "doc",
-  licence: "doc",
-  readme: "doc",
-  changelog: "doc",
+  justfile: "gear",
+  readme: "book",
+  license: "scale",
+  licence: "scale",
+  copying: "scale",
+  contributing: "people",
+  code_of_conduct: "heart",
+  "code-of-conduct": "heart",
+  codeofconduct: "heart",
+  security: "shield",
+  changelog: "history",
+  authors: "people",
+  maintainers: "people",
 };
 
 export function fileIcon(name: string): string {

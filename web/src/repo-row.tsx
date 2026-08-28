@@ -84,7 +84,7 @@ export function repoRow(r: Repo, opts: RepoRowOptions = {}) {
   const priv = r.visibility === "private";
   const counts = [
     r.branches > 1 ? `${r.branches} branches` : null,
-    // Tag count is not in the listing payload yet; branches alone is honest.
+    r.tags > 0 ? `${r.tags} ${r.tags === 1 ? "tag" : "tags"}` : null,
   ].filter(Boolean).join(" · ");
 
   return (

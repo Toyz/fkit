@@ -38,7 +38,7 @@ import {
   type Repo,
 } from "../api";
 import { linkHandler, go } from "../nav";
-import { renderMarkdown } from "../markdown";
+import { renderMarkdown, type MarkdownContext } from "../markdown";
 import { Session } from "../session";
 import { highlight, languageFor, type Tok } from "../highlight";
 import "../components/branch-picker";
@@ -1575,10 +1575,54 @@ export class PageRepo extends LoomElement {
         ) : (
           // The renderer escapes everything before generating markup, so
           // rawHTML here is safe for untrusted repository content.
-          <div class="md" rawHTML={renderMarkdown(body)}></div>
+          <div
+            class="md"
+            rawHTML={renderMarkdown(
+              body,
+              // Both the README and any doc tab sit in the directory being
+              // browsed, so relative paths resolve against that.
+              this.mdContext(
+                this.loc?.view.kind === "tree" ? (this.loc.view.path ?? "") : "",
+              ),
+            )}
+          ></div>
         )}
       </div>
     );
+  }
+
+  /**
+   * Resolve repository-relative paths in a rendered document.
+   *
+   * Relative to the directory the document itself lives in, so a README in
+   * `docs/` referring to `logo.png` means `docs/logo.png`, and `../a.png`
+   * climbs out. Images go to the raw endpoint — which serves real image types
+   * and nothing else executable — and links go to the blob view rather than
+   * downloading.
+   */
+  private mdContext(docDir: string): MarkdownContext {
+    const at = this.loc!;
+    const ref = this.ref();
+
+    const resolve = (rel: string): string => {
+      // Strip a query or fragment before joining, and put it back after.
+      const cut = rel.search(/[?#]/);
+      const suffix = cut === -1 ? "" : rel.slice(cut);
+      const bare = cut === -1 ? rel : rel.slice(0, cut);
+
+      const parts = docDir ? docDir.split("/") : [];
+      for (const seg of bare.split("/")) {
+        if (seg === "" || seg === ".") continue;
+        if (seg === "..") parts.pop();
+        else parts.push(seg);
+      }
+      return parts.map(encodeURIComponent).join("/") + suffix;
+    };
+
+    return {
+      raw: (rel) => api.rawUrl(at.owner, at.name, ref, resolve(rel)),
+      page: (rel) => `/${at.owner}/${at.name}/blob/${encodeURIComponent(ref)}/${resolve(rel)}`,
+    };
   }
 
   /** Switch the document pane. "" means the README, which is already loaded. */

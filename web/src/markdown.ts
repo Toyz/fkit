@@ -21,19 +21,42 @@ function safeHref(raw: string): string | null {
   return null;
 }
 
+/**
+ * How a repository-relative path in a document becomes a URL.
+ *
+ * A README that says `![logo](docs/logo.png)` means a file in the repository,
+ * not a path on the site — without this the browser resolves it against the
+ * current page and asks for something that does not exist.
+ */
+export interface MarkdownContext {
+  /** A path whose *bytes* are wanted: images. */
+  raw: (path: string) => string;
+  /** A path a reader should be *taken to*: links. */
+  page: (path: string) => string;
+}
+
+/** Is this URL relative to the document, rather than absolute or an anchor? */
+function isRelative(url: string): boolean {
+  return !/^[a-z][a-z0-9+.-]*:/i.test(url) && !url.startsWith("/") && !url.startsWith("#");
+}
+
 /** Inline formatting, applied to already-escaped text. */
-function inline(text: string): string {
+function inline(text: string, ctx?: MarkdownContext): string {
   return (
     text
       // `code` first, so its contents are not treated as markup
       .replace(/`([^`]+)`/g, (_, c) => `<code>${c}</code>`)
       .replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (m, alt, src) => {
         const href = safeHref(src);
-        return href ? `<img src="${href}" alt="${alt}" loading="lazy">` : m;
+        if (!href) return m;
+        const url = ctx && isRelative(href) ? ctx.raw(href) : href;
+        return `<img src="${url}" alt="${alt}" loading="lazy">`;
       })
       .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (m, label, url) => {
         const href = safeHref(url);
-        return href ? `<a href="${href}" rel="noopener noreferrer">${label}</a>` : m;
+        if (!href) return m;
+        const to = ctx && isRelative(href) ? ctx.page(href) : href;
+        return `<a href="${to}" rel="noopener noreferrer">${label}</a>`;
       })
       .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
       .replace(/(^|\W)_([^_]+)_(?=\W|$)/g, "$1<em>$2</em>")
@@ -42,7 +65,7 @@ function inline(text: string): string {
   );
 }
 
-export function renderMarkdown(src: string): string {
+export function renderMarkdown(src: string, ctx?: MarkdownContext): string {
   const lines = escapeHtml(src.replace(/\r\n/g, "\n")).split("\n");
   const out: string[] = [];
 
@@ -84,7 +107,7 @@ export function renderMarkdown(src: string): string {
     if (heading) {
       closeList();
       const level = heading[1].length;
-      out.push(`<h${level}>${inline(heading[2])}</h${level}>`);
+      out.push(`<h${level}>${inline(heading[2], ctx)}</h${level}>`);
       i++;
       continue;
     }
@@ -106,9 +129,9 @@ export function renderMarkdown(src: string): string {
       const rows: string[][] = [];
       while (i < lines.length && /^\s*\|/.test(lines[i])) rows.push(cells(lines[i++]));
       out.push(
-        `<table><thead><tr>${head.map((h) => `<th>${inline(h)}</th>`).join("")}</tr></thead>` +
+        `<table><thead><tr>${head.map((h) => `<th>${inline(h, ctx)}</th>`).join("")}</tr></thead>` +
           `<tbody>${rows
-            .map((r) => `<tr>${r.map((c) => `<td>${inline(c)}</td>`).join("")}</tr>`)
+            .map((r) => `<tr>${r.map((c) => `<td>${inline(c, ctx)}</td>`).join("")}</tr>`)
             .join("")}</tbody></table>`,
       );
       continue;
@@ -123,7 +146,7 @@ export function renderMarkdown(src: string): string {
         out.push(`<${want}>`);
         listType = want;
       }
-      out.push(`<li>${inline((bullet ?? numbered)![1])}</li>`);
+      out.push(`<li>${inline((bullet ?? numbered)![1], ctx)}</li>`);
       i++;
       continue;
     }
@@ -135,7 +158,7 @@ export function renderMarkdown(src: string): string {
         buf.push(lines[i].replace(/^\s*&gt;\s?/, ""));
         i++;
       }
-      out.push(`<blockquote>${inline(buf.join(" "))}</blockquote>`);
+      out.push(`<blockquote>${inline(buf.join(" "), ctx)}</blockquote>`);
       continue;
     }
 
@@ -149,7 +172,7 @@ export function renderMarkdown(src: string): string {
     ) {
       para.push(lines[i++]);
     }
-    out.push(`<p>${inline(para.join(" "))}</p>`);
+    out.push(`<p>${inline(para.join(" "), ctx)}</p>`);
   }
 
   closeList();

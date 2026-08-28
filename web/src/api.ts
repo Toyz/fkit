@@ -40,6 +40,7 @@ export interface Repo {
   /** Tip of the default branch; null until something has been pushed. */
   head: Head | null;
   branches: number;
+  tags: number;
 }
 
 export interface Ref {

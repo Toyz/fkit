@@ -62,6 +62,7 @@ pub fn repo_view(repo: &RepoRow, owner: &str, access: Access) -> RepoView {
         access: access.as_str().to_string(),
         head: None,
         branches: 0,
+        tags: 0,
     }
 }
 
@@ -101,7 +102,11 @@ pub async fn attach_heads(state: &AppState, views: &mut [RepoView]) {
 
     for v in views.iter_mut() {
         let Some(refs) = tips.get(&v.id) else { continue };
-        v.branches = refs.len() as i64;
+        // Counted separately: `refs` is every ref, and tags live in the same
+        // namespace. Counting the lot reported a repository with one branch
+        // and three tags as having four branches.
+        v.branches = refs.keys().filter(|n| !fkit_core::session::is_tag(n)).count() as i64;
+        v.tags = refs.keys().filter(|n| fkit_core::session::is_tag(n)).count() as i64;
 
         let Some(target) = refs.get(&v.default_branch) else { continue };
         let Ok(bytes) = <[u8; 32]>::try_from(target.as_slice()) else { continue };

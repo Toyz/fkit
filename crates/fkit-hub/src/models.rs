@@ -97,6 +97,9 @@ pub struct RepoView {
     /// How many branches exist. One is the uninteresting case, so the UI only
     /// says anything when there is more than one.
     pub branches: i64,
+    /// How many tags. Counted apart from branches: both are refs, and tags
+    /// share the branch namespace behind a prefix.
+    pub tags: i64,
 }
 
 /// A one-line summary of a commit, for a listing that should say what the
