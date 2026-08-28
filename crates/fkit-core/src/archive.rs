@@ -155,7 +155,11 @@ pub fn write_tar<W: Write>(
                     );
                 }
                 let pad = (512 - (written % 512)) % 512;
-                w.write_all(&vec![0u8; pad as usize])?;
+                // From a const, not a fresh allocation: a repository with
+                // 100,000 files padded 100,000 times, and the allocator cost
+                // showed up as tar running several times slower than zip for
+                // the same bytes.
+                w.write_all(&ZEROS[..pad as usize])?;
             }
         }
     }
@@ -215,8 +219,8 @@ fn tar_header(
     // expects, whatever the spec's wording allows.
     h[148..156].fill(b' ');
     let sum: u32 = h.iter().map(|b| *b as u32).sum();
-    let text = format!("{sum:06o}\0 ");
-    h[148..156].copy_from_slice(text.as_bytes());
+    octal(&mut h[148..155], sum as u64, 6);
+    h[155] = b' ';
 
     Ok(h)
 }
@@ -236,11 +240,26 @@ fn split_name(name: &str) -> Result<(&str, &str)> {
     bail!("path too long for a tar archive: {name}")
 }
 
+const ZEROS: [u8; 512] = [0u8; 512];
+
 /// Right-aligned octal, NUL-terminated: the format every tar field uses.
+///
+/// Written by hand rather than through `format!`. Five of these run per header,
+/// and a header runs per file — half a million short-lived allocations for a
+/// large repository, to produce at most twelve digits.
 fn octal(field: &mut [u8], value: u64, digits: usize) {
-    let text = format!("{value:0>digits$o}", digits = digits);
-    field[..text.len()].copy_from_slice(text.as_bytes());
-    field[text.len()] = 0;
+    field[..digits].fill(b'0');
+    field[digits] = 0;
+    let mut v = value;
+    let mut i = digits;
+    while i > 0 {
+        i -= 1;
+        field[i] = b'0' + (v & 0b111) as u8;
+        v >>= 3;
+        if v == 0 {
+            break;
+        }
+    }
 }
 
 fn join(root: &str, path: &str) -> String {

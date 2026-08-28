@@ -78,6 +78,13 @@ struct RepoStats {
     /// What the filesystem actually holds, after chunk deduplication and
     /// compression. Not the size of a checkout, which is generally larger.
     bytes: u64,
+    /// Bytes an archive of the default branch would contain — the checkout
+    /// size, which is what the limit below is measured against.
+    archive_bytes: u64,
+    /// This server's archive limit, 0 for none. Sent so the UI can decline to
+    /// offer a download that the server would refuse, rather than handing
+    /// someone a button whose only outcome is an error.
+    archive_limit: u64,
 }
 
 /// Size and history counts for one repository.
@@ -101,7 +108,14 @@ async fn repo_stats(
     // Commits only, so this stays a walk of the history rather than of every
     // chunk in the repository.
     let mut commits = 0usize;
+    let mut archive_bytes = 0u64;
     if let Some(tip) = ref_target(&state, &repo, &repo.default_branch).await? {
+        // Directory objects only — the same cheap walk the archive route does.
+        if let Ok(fkit_core::Object::Commit(c)) = store.get(tip)
+            && let Ok(p) = fkit_core::archive::plan(&store, c.tree, "")
+        {
+            archive_bytes = p.bytes;
+        }
         let mut seen = std::collections::HashSet::new();
         let mut stack = vec![tip];
         while let Some(h) = stack.pop() {
@@ -115,7 +129,13 @@ async fn repo_stats(
         }
     }
 
-    Ok(Json(RepoStats { commits, objects, bytes }))
+    Ok(Json(RepoStats {
+        commits,
+        objects,
+        bytes,
+        archive_bytes,
+        archive_limit: state.max_archive_bytes,
+    }))
 }
 
 async fn ref_target(state: &AppState, repo: &RepoRow, name: &str) -> AppResult<Option<Hash>> {

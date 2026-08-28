@@ -7,6 +7,18 @@
  */
 import { LoomElement, component, css, styles, reactive, prop, mount, query } from "@toyz/loom";
 
+/** Bytes, for a label. Local so the component stays self-contained. */
+function size(bytes: number): string {
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let v = bytes;
+  let u = 0;
+  while (v >= 1024 && u < units.length - 1) {
+    v /= 1024;
+    u += 1;
+  }
+  return u === 0 ? `${bytes} B` : `${v.toFixed(1)} ${units[u]}`;
+}
+
 const sheet = css`
   /* Shadow roots do not inherit the document's box-sizing reset, so an input
      with width:100% and padding overflows its own dialog. */
@@ -51,6 +63,7 @@ const sheet = css`
     display: block; font-size: 10.5px; color: var(--faint);
     text-transform: uppercase; letter-spacing: .07em; margin-bottom: 7px;
   }
+  .dl .lbl .sz { text-transform: none; letter-spacing: 0; margin-left: 7px; color: var(--muted); }
   .dl .fmts { display: flex; gap: 6px; }
   .fmt {
     display: inline-flex; align-items: center; gap: 6px;
@@ -71,6 +84,9 @@ export class CloneButton extends LoomElement {
   @prop accessor visibility = "public";
   /** Base for the archive links, e.g. `/api/repos/helba/fkit/archive/main`. */
   @prop accessor archive = "";
+  /** Bytes an archive would hold, and the server's cap. 0 = no cap. */
+  @prop accessor archiveBytes = 0;
+  @prop accessor archiveLimit = 0;
 
   @reactive accessor open = false;
   @reactive accessor copied = "";
@@ -123,6 +139,52 @@ export class CloneButton extends LoomElement {
     );
   }
 
+  /**
+   * The download row.
+   *
+   * When the server would refuse the archive, the links are not offered at
+   * all — a button whose only possible outcome is an error is worse than no
+   * button, and the reason is stated instead. The check is the same one the
+   * server makes, from a size it computed off the tree.
+   */
+  private download() {
+    const over =
+      this.archiveLimit > 0 && this.archiveBytes > this.archiveLimit;
+
+    if (over) {
+      return (
+        <div class="dl">
+          <span class="lbl">download</span>
+          <div class="note" style="margin:0;padding:0">
+            This repository holds {size(this.archiveBytes)}, and this server
+            will not build an archive over {size(this.archiveLimit)}. Clone it
+            instead — that transfers only what you do not already have.
+          </div>
+        </div>
+      );
+    }
+
+    return (
+      <div class="dl">
+        <span class="lbl">
+          download this ref
+          {this.archiveBytes > 0 ? <span class="sz">{size(this.archiveBytes)}</span> : null}
+        </span>
+        <div class="fmts">
+          {/* Real links, so middle-click and "save as" behave and the browser
+              owns the download. The server streams, so a large repository
+              starts arriving immediately rather than after it is built. */}
+          {["zip", "tar.gz", "tar"].map((f) => (
+            <a class="fmt" href={`${this.archive}.${f}`} download>
+              <loom-icon name="archive" size={12}></loom-icon>
+              {f}
+            </a>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
   update() {
     return (
       <div>
@@ -136,23 +198,7 @@ export class CloneButton extends LoomElement {
           <div class="pop">
             {this.row("cmd", "clone", `fkit clone ${this.url}`)}
             {this.row("url", "url", this.url)}
-            {this.archive ? (
-              <div class="dl">
-                <span class="lbl">download this ref</span>
-                <div class="fmts">
-                  {/* Real links, so middle-click and "save as" behave and the
-                      browser owns the download. The server streams, so a
-                      large repository starts arriving immediately rather
-                      than after it has been built somewhere. */}
-                  {["zip", "tar.gz", "tar"].map((f) => (
-                    <a class="fmt" href={`${this.archive}.${f}`} download>
-                      <loom-icon name="archive" size={12}></loom-icon>
-                      {f}
-                    </a>
-                  ))}
-                </div>
-              </div>
-            ) : null}
+            {this.archive ? this.download() : null}
             <div class="note">
               {this.visibility === "public"
                 ? "Public — cloning needs no account. Pushing needs a token."

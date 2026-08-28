@@ -286,6 +286,10 @@ export interface RepoStats {
   commits: number;
   objects: number;
   bytes: number;
+  /** Bytes an archive would contain. */
+  archive_bytes: number;
+  /** The server's archive limit; 0 means none. */
+  archive_limit: number;
 }
 
 export interface Profile {
