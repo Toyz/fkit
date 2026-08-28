@@ -82,6 +82,7 @@ struct LimitsSection {
     /// Reject a push larger than this, in bytes. 0 disables the limit.
     max_push_bytes: Option<u64>,
     /// Refuse an archive whose contents exceed this, in bytes. 0 disables it.
+    /// Defaults to 1 GiB — see `Config::default`.
     max_archive_bytes: Option<u64>,
 }
 
@@ -147,7 +148,13 @@ impl Default for Config {
             max_connections: 16,
             max_inline_blob: 2 * 1024 * 1024,
             max_push_bytes: 0,
-            max_archive_bytes: 0,
+            // 1 GiB. Unlike the other limits this defaults to *something*: an
+            // archive is built on demand for whoever asks, so an unbounded
+            // default lets a stranger point the server at its largest
+            // repository repeatedly. The size is known from the tree before
+            // any work starts, so exceeding it costs a rejection, not a
+            // half-finished download.
+            max_archive_bytes: 1024 * 1024 * 1024,
             email_from: None,
             public_url: None,
             env_email: EnvEmail::default(),
@@ -406,9 +413,10 @@ max_push_bytes = 0
 
 # Refuse to build an archive of more than this many bytes of content (bytes).
 # The size is known from the tree before any file is read, so an oversized
-# request is refused immediately rather than part-way through a download.
-# 0 disables the limit.
-max_archive_bytes = 0
+# request is refused immediately rather than part-way through a download, and
+# the web UI stops offering the buttons rather than handing out a link that
+# only errors. 0 disables the limit. Default 1 GiB.
+max_archive_bytes = 1073741824
 "#;
 
 #[cfg(test)]
@@ -446,6 +454,9 @@ mod tests {
         assert_eq!(f.server.default_repo_visibility.as_deref(), Some("private"));
         assert_eq!(f.storage.data_dir, Some(PathBuf::from("./fkit-hub-data")));
         assert_eq!(f.limits.max_inline_blob, Some(2 * 1024 * 1024));
+        // The template is documentation, so it has to state the real default
+        // rather than a round number somebody liked.
+        assert_eq!(f.limits.max_archive_bytes, Some(Config::default().max_archive_bytes));
     }
 
     #[test]
