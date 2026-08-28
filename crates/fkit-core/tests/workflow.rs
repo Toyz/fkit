@@ -5,7 +5,7 @@
 
 use fkit_core::checkout::checkout_tree;
 use fkit_core::object::Object;
-use fkit_core::repo::{diff_trees, Head, Repo};
+use fkit_core::repo::{diff_trees, CommitAs, Head, Repo};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -292,4 +292,65 @@ fn gc_keeps_a_commit_that_only_a_tag_points_at() {
 
     // And the tag still resolves to it afterwards.
     assert_eq!(repo.read_tag("v1.0").unwrap(), Some(released));
+}
+
+/// An importer replaying a history from elsewhere has to preserve who wrote
+/// each commit and when. Without that, a mirrored project becomes one author
+/// committing everything in the same second, which resembles a history without
+/// being one.
+#[test]
+fn an_import_records_another_author_and_time() {
+    let t = Tmp::new("commit-as");
+    let repo = Repo::init(&t.0).unwrap();
+    write(&t.0, "a.txt", "one");
+
+    let who = CommitAs {
+        author: Some("Ada Lovelace <ada@example.com>".into()),
+        timestamp: Some(1_234_567_890),
+    };
+    let res = repo.commit_as("imported", &who).unwrap();
+
+    let Object::Commit(c) = repo.store.get(res.commit).unwrap() else {
+        panic!("expected a commit");
+    };
+    assert_eq!(c.author, "Ada Lovelace <ada@example.com>");
+    assert_eq!(c.timestamp, 1_234_567_890);
+}
+
+/// Replaying the same import twice must land on the same commit, or a mirror
+/// would rewrite its own history on every run and never fast-forward.
+#[test]
+fn an_import_is_reproducible() {
+    let a = Tmp::new("commit-as-a");
+    let b = Tmp::new("commit-as-b");
+    let who = CommitAs {
+        author: Some("Ada Lovelace <ada@example.com>".into()),
+        timestamp: Some(1_234_567_890),
+    };
+
+    let ra = Repo::init(&a.0).unwrap();
+    write(&a.0, "a.txt", "one");
+    let first = ra.commit_as("imported", &who).unwrap().commit;
+
+    let rb = Repo::init(&b.0).unwrap();
+    write(&b.0, "a.txt", "one");
+    let second = rb.commit_as("imported", &who).unwrap().commit;
+
+    assert_eq!(first, second, "same tree, author, time and message");
+}
+
+/// The ordinary path must be untouched: no overrides means the configured
+/// author and the current clock.
+#[test]
+fn an_unset_override_falls_back_to_the_configured_author() {
+    let t = Tmp::new("commit-as-default");
+    let repo = Repo::init(&t.0).unwrap();
+    write(&t.0, "a.txt", "one");
+
+    let res = repo.commit_as("plain", &CommitAs::default()).unwrap();
+    let Object::Commit(c) = repo.store.get(res.commit).unwrap() else {
+        panic!("expected a commit");
+    };
+    assert_eq!(c.author, repo.author());
+    assert!(c.timestamp > 0, "an unset date means now, not zero");
 }

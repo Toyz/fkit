@@ -360,6 +360,20 @@ impl Repo {
     }
 
     pub fn commit(&self, message: &str) -> Result<CommitResult> {
+        self.commit_as(message, &CommitAs::default())
+    }
+
+    /// Commit, optionally recording someone else's name and someone else's
+    /// clock.
+    ///
+    /// This exists for importers. Replaying a history from elsewhere has to
+    /// preserve who wrote each commit and when, or the result is a single
+    /// author committing an entire project in the same second — which is not a
+    /// history, only a shape that resembles one.
+    ///
+    /// Both fields are part of the commit's hash, so an import is reproducible:
+    /// replaying the same source twice produces the same fkit commits.
+    pub fn commit_as(&self, message: &str, who: &CommitAs) -> Result<CommitResult> {
         let snap = self.snapshot_writing()?;
         let parent = self.head_commit()?;
         let merging = self.merge_head()?;
@@ -390,8 +404,8 @@ impl Repo {
         let commit = Commit {
             tree: snap.hash,
             parents,
-            author: self.author(),
-            timestamp: now_unix(),
+            author: who.author.clone().unwrap_or_else(|| self.author()),
+            timestamp: who.timestamp.unwrap_or_else(now_unix),
             message: message.to_string(),
         };
         let (id, _) = self.store.put(&Object::Commit(commit))?;
@@ -505,6 +519,15 @@ pub struct Snapshot {
     pub stats: crate::store::WriteStats,
     /// Trees and file nodes that were computed but never written to disk.
     pub objects: std::collections::HashMap<Hash, Object>,
+}
+
+/// Who a commit is recorded as, and when. `None` on either field means the
+/// ordinary thing: the configured author, and now.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommitAs {
+    pub author: Option<String>,
+    /// Unix seconds.
+    pub timestamp: Option<i64>,
 }
 
 #[derive(Debug)]

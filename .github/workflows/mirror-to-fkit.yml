@@ -1,12 +1,23 @@
 # Mirror main into the fkit hub — fkit hosting its own source.
 #
-# This does not translate git history. It clones the hub repository, replaces
-# its working tree with this checkout, and makes one fkit commit per update to
-# main. So fkit's history is a record of what main looked like, in fkit's own
-# object model, with real diffs between snapshots — not a re-encoded git graph.
-# Cloning first is what makes that work: committing into a fresh `fkit init`
-# every run would produce a parentless commit the hub would refuse to fast
-# forward onto.
+# One fkit commit per *git commit*, not per push. A push of five commits used to
+# collapse into a single snapshot, which lost both the shape of the history and
+# who wrote it: every commit came out authored by "fkit ci", seconds apart.
+# Each git commit is now replayed in order, carrying its original author and its
+# original timestamp.
+#
+# This still is not a re-encoded git graph — a merge's two parents become one
+# linear step, and the fkit hashes are fkit's own. It is a faithful replay of
+# what main looked like at each commit, in fkit's object model, with real diffs
+# between them.
+#
+# Where it resumes from is written into the commit messages themselves: each one
+# ends with `git <sha>`, and the newest such trailer in the mirror's log says
+# what has already been replayed. There is no state kept anywhere else.
+#
+# Cloning first is what makes the chain work: committing into a fresh
+# `fkit init` every run would produce a parentless commit the hub would refuse
+# to fast forward onto.
 #
 # Secrets:
 #   FKIT_REMOTE   wss://fkit.work/helba/fkit
@@ -38,8 +49,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # A snapshot mirror only ever needs the tip.
-          fetch-depth: 1
+          # Replaying commit by commit needs the commits. A shallow checkout has
+          # only the tip, and every run would look like a single change.
+          fetch-depth: 0
 
       # The CLI comes out of the image we already publish rather than being
       # compiled here: it is then demonstrably the same binary the hub is
@@ -74,11 +86,10 @@ jobs:
           sudo install -m 0755 ./fkit-bin /usr/local/bin/fkit
           rm -f ./fkit-bin
 
-      - name: Push this tree to fkit
+      - name: Replay main into fkit
         env:
           FKIT_TOKEN: ${{ secrets.FKIT_TOKEN }}
           FKIT_REMOTE: ${{ secrets.FKIT_REMOTE }}
-          COMMIT_MSG: ${{ github.event.head_commit.message }}
         run: |
           set -euo pipefail
           test -n "${FKIT_REMOTE:-}" || { echo "FKIT_REMOTE is not set" >&2; exit 1; }
@@ -89,35 +100,69 @@ jobs:
                     exit 1 ;;
           esac
 
-          # Clone what the hub already has, so this run's commit has a parent.
+          # Clone what the hub already has, so this run's commits have a parent.
           # A repository nobody has pushed to yet has nothing to clone, and
           # `fkit init` is then the right start.
           if fkit clone "$FKIT_REMOTE" mirror 2>/dev/null; then
             echo "cloned existing history"
           else
-            echo "nothing to clone — starting a first commit"
+            echo "nothing to clone — starting from the beginning"
             mkdir -p mirror
             ( cd mirror && fkit init . )
           fi
 
-          # Replace the working tree wholesale. Deletions have to propagate: a
-          # file removed on main must be removed here, so this cannot be a copy
-          # over the top. Only .fkit survives.
-          find mirror -mindepth 1 -maxdepth 1 ! -name .fkit -exec rm -rf {} +
-          tar -cf - --exclude=./.git --exclude=./mirror . | tar -xf - -C mirror
+          # Where we left off. The trailer is written by this job, so the newest
+          # one in the log is the last git commit already mirrored.
+          last=$( (cd mirror && fkit log 2>/dev/null) \
+                  | grep -oE 'git [0-9a-f]{40}' | head -1 | cut -d' ' -f2 || true )
 
-          cd mirror
-          fkit config author.name "fkit ci"
-          fkit config author.email "ci@fkit.work"
-          fkit remote "$FKIT_REMOTE"
-
-          # Nothing changed is a normal outcome — a re-run, or a push that only
-          # touched ignored paths — and not a failure.
-          if fkit status | grep -q "working tree clean"; then
-            echo "no change since the last mirror"
-            exit 0
+          if [ -n "$last" ] && git cat-file -e "$last^{commit}" 2>/dev/null; then
+            range="$last..HEAD"
+            echo "resuming after $last"
+          else
+            # First run, or the recorded commit is no longer in this history
+            # (a force-push). Replaying everything is the only honest option:
+            # picking up from the tip would silently skip whatever came between.
+            range="HEAD"
+            [ -n "$last" ] && echo "recorded commit $last is gone — replaying from the beginning"
+            echo "no resume point — replaying the whole history"
           fi
 
-          fkit commit -m "$(printf '%s\n\ngit %s' \
-            "${COMMIT_MSG:-sync from main}" "${{ github.sha }}")"
+          commits=$(git rev-list --reverse "$range")
+          if [ -z "$commits" ]; then
+            echo "nothing new since the last mirror"
+            exit 0
+          fi
+          echo "replaying $(echo "$commits" | wc -l) commit(s)"
+
+          cd mirror
+          fkit remote "$FKIT_REMOTE"
+
+          for sha in $commits; do
+            # Replace the working tree wholesale, so deletions propagate. Only
+            # .fkit survives. `git archive` gives the exact tree at that commit
+            # without disturbing the checkout we are reading from.
+            find . -mindepth 1 -maxdepth 1 ! -name .fkit -exec rm -rf {} +
+            git -C .. archive "$sha" | tar -xf - -C .
+
+            name=$(git -C .. log -1 --format=%an "$sha")
+            email=$(git -C .. log -1 --format=%ae "$sha")
+            when=$(git -C .. log -1 --format=%at "$sha")
+            subject=$(git -C .. log -1 --format=%B "$sha")
+
+            # A commit that only touched ignored paths leaves the tree
+            # identical, and fkit refuses an empty commit. That is a skip, not
+            # a failure — the next commit still gets its own entry.
+            if fkit status | grep -q "working tree clean"; then
+              echo "  skip  ${sha:0:10}  (no change fkit can see)"
+              continue
+            fi
+
+            fkit commit \
+              --author "$name <$email>" \
+              --date "$when" \
+              -m "$(printf '%s\n\ngit %s' "$subject" "$sha")" >/dev/null
+            echo "  ok    ${sha:0:10}  $name"
+          done
+
           fkit push

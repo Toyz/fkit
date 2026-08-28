@@ -5,6 +5,7 @@
 //! few dozen lines of matching.
 
 use anyhow::{bail, Context, Result};
+use fkit_core::repo::CommitAs;
 use fkit_core::checkout::checkout_tree;
 use fkit_core::diff as linediff;
 use fkit_core::fsck::fsck;
@@ -321,13 +322,74 @@ fn cmd_status(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Refuse to record a commit as nobody.
+///
+/// This used to be a warning, and a warning is the wrong shape for it: the
+/// author is baked into the commit and into its hash, so by the time anyone
+/// reads the note the history already says `unknown` or whatever $USER
+/// happened to be on the machine. It cannot be corrected afterwards without
+/// rewriting every commit that followed.
+///
+/// The legacy single-key `author` still counts, so repositories configured
+/// before name and email were split apart keep working.
+fn require_author(repo: &Repo) -> Result<()> {
+    let set = |k: &str| repo.config_get(k).is_some_and(|v| !v.trim().is_empty());
+    let env_set = std::env::var("FKIT_AUTHOR").is_ok_and(|v| !v.trim().is_empty());
+
+    if (set("author.name") && set("author.email")) || set("author") || env_set {
+        return Ok(());
+    }
+
+    let missing = if set("author.name") {
+        "author.email is not set"
+    } else if set("author.email") {
+        "author.name is not set"
+    } else {
+        "no author is configured"
+    };
+
+    bail!(
+        "{missing} — a commit records who made it, and that cannot be fixed later.\n\n\
+         \x20 fkit config --global author.name \"Your Name\"\n\
+         \x20 fkit config --global author.email you@example.com\n\n\
+         Drop --global to set it for this repository only, or pass\n\
+         \x20 fkit commit --author \"Name <you@example.com>\"\n\
+         for a single commit."
+    )
+}
+
+/// Unix seconds — what a commit stores, and what `git log --format=%at`
+/// prints, so an importer needs no conversion.
+///
+/// Deliberately not a date parser. Accepting "yesterday" or a local-time string
+/// would mean a timezone guess, and a history imported into the wrong timezone
+/// is wrong in a way nobody notices until much later. `date -d <whatever> +%s`
+/// converts anything else.
+fn parse_date(raw: &str) -> Result<i64> {
+    raw.trim()
+        .parse::<i64>()
+        .with_context(|| format!("--date wants unix seconds, not '{raw}' (try: date -d ... +%s)"))
+}
+
 fn cmd_commit(args: &[String]) -> Result<()> {
     let mut message: Option<String> = None;
+    let mut who = CommitAs::default();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "-m" | "--message" => {
                 message = Some(args.get(i + 1).context("-m needs a message")?.clone());
+                i += 2;
+            }
+            // Both of these exist for importers replaying a history from
+            // somewhere else; see `Repo::commit_as`.
+            "--author" => {
+                who.author = Some(args.get(i + 1).context("--author needs a value")?.clone());
+                i += 2;
+            }
+            "--date" => {
+                let raw = args.get(i + 1).context("--date needs a value")?;
+                who.timestamp = Some(parse_date(raw)?);
                 i += 2;
             }
             other => bail!("unexpected argument '{other}'"),
@@ -336,15 +398,12 @@ fn cmd_commit(args: &[String]) -> Result<()> {
     let message = message.context("usage: fkit commit -m <message>")?;
 
     let repo = here()?;
-    if repo.author_is_default() {
-        println!(
-            "note: no author configured, using \"{}\". Set one with:\n\
-             \x20 fkit config --global author.name \"Your Name\"\n\
-             \x20 fkit config --global author.email you@example.com\n",
-            repo.author()
-        );
+    // An explicit --author is the answer to "who wrote this", so it satisfies
+    // the requirement on its own.
+    if who.author.is_none() {
+        require_author(&repo)?;
     }
-    let res = repo.commit(&message)?;
+    let res = repo.commit_as(&message, &who)?;
     let branch = match repo.head()? {
         Head::Branch(b) => b,
         Head::Detached(_) => "(detached)".into(),
