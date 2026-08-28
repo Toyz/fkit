@@ -278,6 +278,12 @@ export interface EmailStatus {
   url_from_env: boolean;
 }
 
+export interface RepoStats {
+  commits: number;
+  objects: number;
+  bytes: number;
+}
+
 export interface Profile {
   username: string;
   display_name: string | null;
@@ -363,6 +369,8 @@ export const api = {
 
   // repos
   repos: () => request<Repo[]>("/repos"),
+  repoStats: (owner: string, name: string) =>
+    request<RepoStats>(`/repos/${owner}/${name}/stats`),
   profile: (username: string) => request<Profile>(`/users/${encodeURIComponent(username)}`),
   repo: (owner: string, name: string) => request<Repo>(`/repos/${owner}/${name}`),
   createRepo: (input: { name: string; description?: string; visibility: string }) =>

@@ -34,6 +34,7 @@ import {
   type LastCommit,
   type Patch,
   type Ref,
+  type RepoStats,
   type Repo,
 } from "../api";
 import { linkHandler, go } from "../nav";
@@ -45,6 +46,7 @@ import "../components/clone-button";
 import "../components/fkit-select";
 import "../components/fkit-choice";
 import { adoptInto } from "../adopt";
+import { fileIcon } from "../file-icon";
 import { confirmAction } from "../components/fkit-dialog";
 
 type View =
@@ -128,18 +130,71 @@ const codeSheet = css`
   .pu { color: var(--tok-punct); }
 `;
 
+/* Shared with `loom-virtual`'s shadow root, so one set of rules covers the
+   grouped list and the virtualized one. */
 const commitSheet = css`
+  /* The rail is drawn on the row, not built from an element inside it: one
+     fewer node per commit, and nothing that can be laid out into the wrong
+     grid row. */
   .c {
-    display: grid; grid-template-columns: minmax(0, 1fr) auto auto;
-    gap: 12px; align-items: center; padding: 0 12px; height: 34px;
+    position: relative;
+    display: grid; grid-template-columns: minmax(0, 1fr) auto;
+    gap: 10px; align-items: center;
+    padding: 7px 12px 7px 34px;
     border-bottom: 1px solid var(--border);
   }
+  .c::before {
+    content: ""; position: absolute; left: 18px; top: 0; bottom: 0;
+    width: 1px; background: var(--border);
+  }
+  .c::after {
+    content: ""; position: absolute; left: 15px; top: 50%;
+    width: 7px; height: 7px; margin-top: -3.5px;
+    border-radius: 50%; background: var(--faint);
+    box-shadow: 0 0 0 3px var(--surface);
+  }
+  .c:hover::after { background: var(--accent); box-shadow: 0 0 0 3px var(--raised); }
+  /* The line starts at the first commit of a day and stops at the last one,
+     rather than running out of the panel at either end. */
+  .day + .c::before { top: 50%; }
+  .c:last-child::before { bottom: 50%; }
+  .c:last-child { border-bottom: 0; }
   .c:hover { background: var(--raised); }
-  .m { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-       text-decoration: none; }
+
+  /* A continuous line with a node per commit: history reads as a sequence
+     rather than as a table that happens to be in order. */
+
+  .body { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+  .m {
+    color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    text-decoration: none; font-size: 12.5px;
+  }
   .m:hover { color: var(--accent); }
-  .by { color: var(--muted); font-size: 11px; }
-  .sha { color: var(--accent); font-size: 12px; text-decoration: none; }
+  .by { color: var(--faint); font-size: 11px; font-family: var(--sans); }
+
+  .acts { display: flex; align-items: center; gap: 10px; }
+  .sha {
+    color: var(--muted); font-size: 11.5px; text-decoration: none;
+    font-variant-numeric: tabular-nums;
+  }
+  .sha:hover { color: var(--accent); }
+  .ghost { color: var(--faint); display: flex; padding: 2px; }
+  .ghost:hover { color: var(--accent); }
+
+  /* A date header, not a row: no hover, no border, and it carries the rail
+     through so the line is unbroken between days. */
+  .day {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 12px 8px 14px;
+    font-size: 11px; color: var(--faint);
+    background: var(--raised);
+    border-bottom: 1px solid var(--border);
+  }
+  .day loom-icon { opacity: .8; }
+  .day .n {
+    margin-left: auto; font-variant-numeric: tabular-nums;
+  }
+  .empty { padding: 30px 14px; text-align: center; color: var(--faint); font-size: 12px; }
 `;
 
 const sheet = css`
@@ -171,13 +226,60 @@ const sheet = css`
   /* ---- file rows: fixed height, aligned size column ---- */
   /* name | last commit | when | size — the commit column is the widest thing
      that is still optional, so it gets the flexible track and truncates. */
+  /* The bar above the file list: who touched this last, and what they said.
+     Sits directly on top of the panel, sharing its border, so the two read as
+     one object rather than as a strip floating above a box. */
+  .latest {
+    display: flex; align-items: center; gap: 10px;
+    padding: 7px 12px; font-size: 12px;
+    background: var(--raised);
+    border: 1px solid var(--border);
+    border-bottom: 0;
+    border-radius: var(--radius) var(--radius) 0 0;
+  }
+  .latest .who { color: var(--text); flex: none; }
+  .latest .msg {
+    color: var(--muted); font-family: var(--sans);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    flex: 1; min-width: 0;
+  }
+  .latest .msg:hover { color: var(--accent); }
+  .latest .sha {
+    color: var(--muted); font-size: 11.5px; flex: none;
+    font-variant-numeric: tabular-nums;
+  }
+  .latest .sha:hover { color: var(--accent); }
+  .latest .when { color: var(--faint); font-size: 11px; flex: none; }
+  .latest .count {
+    display: inline-flex; align-items: center; gap: 6px;
+    color: var(--muted); font-size: 11.5px; flex: none;
+    padding-left: 12px; border-left: 1px solid var(--border);
+  }
+  .latest .count:hover { color: var(--text); text-decoration: none; }
+  .latest .count b { color: var(--text); font-weight: 400; }
+  /* The list below it loses its own top corners so the seam is invisible. */
+  .latest + .panel.files { border-radius: 0 0 var(--radius) var(--radius); }
+  @media (max-width: 700px) {
+    .latest .sha, .latest .when { display: none; }
+  }
+
+  /* The name takes what it needs, the message takes the rest, and the two
+     right-hand columns are fixed so they line up down the list. The name used
+     to be pinned to a 8–22rem band, which parked every commit message in the
+     middle of the row with a gulf on both sides. */
   .files .r {
     display: grid;
-    grid-template-columns: 15px minmax(8rem, 22rem) minmax(0, 1fr) auto auto;
+    grid-template-columns: 15px auto minmax(0, 1fr) 92px 62px;
     align-items: center; gap: 12px;
     height: var(--row); padding: 0 12px;
     border-bottom: 1px solid var(--border);
   }
+  .files .fn { white-space: nowrap; }
+  .files .sz {
+    color: var(--faint); font-size: 11px; text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+  .files .when { text-align: right; }
   .files .msg {
     color: var(--muted); font-size: 12px;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -562,6 +664,7 @@ export class PageRepo extends LoomElement {
   @inject("session") accessor session!: Session;
   @reactive accessor repo: Repo | null = null;
   @reactive accessor refs: Ref[] = [];
+  @reactive accessor stats: RepoStats | null = null;
   @reactive accessor error = "";
   @reactive accessor notFound = false;
 
@@ -618,6 +721,12 @@ export class PageRepo extends LoomElement {
         this.repo = null;
         this.repo = await api.repo(at.owner, at.name);
         this.refs = await api.refs(at.owner, at.name);
+        // Decoration: a failure here must not take the page with it.
+        this.stats = null;
+        void api
+          .repoStats(at.owner, at.name)
+          .then((s) => (this.stats = s))
+          .catch(() => undefined);
       }
     } catch (e) {
       this.notFound = e instanceof ApiError && e.status === 404;
@@ -792,6 +901,23 @@ export class PageRepo extends LoomElement {
             <dd>{r.visibility}</dd>
             <dt>default</dt>
             <dd class="mono">{r.default_branch}</dd>
+            {/* A count, not a list. The ref picker above already enumerates
+                branches and can filter them; a sidebar list capped at five is
+                a lie once a repository has fifty. */}
+            <dt>branches</dt>
+            <dd>{this.branches().length}</dd>
+            {this.stats ? (
+              <>
+                <dt>commits</dt>
+                <dd>{this.stats.commits.toLocaleString()}</dd>
+                <dt>objects</dt>
+                <dd>{this.stats.objects.toLocaleString()}</dd>
+                {/* What the store holds, after chunk deduplication and
+                    compression — not the size of a checkout. */}
+                <dt>size</dt>
+                <dd>{humanSize(this.stats.bytes)}</dd>
+              </>
+            ) : null}
             <dt>created</dt>
             <dd>{relativeTime(r.created_at)}</dd>
           </dl>
@@ -827,25 +953,47 @@ export class PageRepo extends LoomElement {
           ) : null}
         </section>
 
-        <section>
-          <h3>
-            branches
-            <span class="n">{this.branches().length}</span>
-          </h3>
-          <ul class="mini">
-            {this.branches().slice(0, 5).map((b) => {
-              const href = `/${at.owner}/${at.name}/tree/${b.name}`;
-              return (
-                <li>
-                  <loom-icon name="branch" size={12}></loom-icon>
-                  <a href={href} onClick={linkHandler(href)}>{b.name}</a>
-                  <span class="when">{relativeTime(b.updated_at)}</span>
-                </li>
-              );
-            })}
-          </ul>
-        </section>
       </aside>
+    );
+  }
+
+  /**
+   * The latest commit on whatever is being browsed, above the file list.
+   *
+   * Taken from the ref's own head rather than fetching the log: the refs call
+   * already carries the tip commit for every branch and tag, so this costs
+   * nothing extra. Browsing a bare commit hash has no ref to read, and the bar
+   * is simply omitted rather than showing a guess.
+   */
+  private renderLatest() {
+    const at = this.loc!;
+    const ref = this.ref();
+    const head = this.refs.find((r) => r.name === ref)?.head;
+    if (!head) return null;
+
+    const commit = `/${at.owner}/${at.name}/commit/${head.commit}`;
+    const history = `/${at.owner}/${at.name}/commits/${ref}`;
+
+    return (
+      <div class="latest">
+        <span class="who">{authorName(head.author)}</span>
+        <a class="msg" href={commit} onClick={linkHandler(commit)} title={head.summary}>
+          {head.summary || "(no message)"}
+        </a>
+        <a class="sha" href={commit} onClick={linkHandler(commit)}>{head.short}</a>
+        <span class="when">{relativeTime(head.timestamp)}</span>
+        <a class="count" href={history} onClick={linkHandler(history)}>
+          <loom-icon name="history" size={12}></loom-icon>
+          {this.stats ? (
+            <>
+              <b>{this.stats.commits.toLocaleString()}</b>{" "}
+              {this.stats.commits === 1 ? "commit" : "commits"}
+            </>
+          ) : (
+            "history"
+          )}
+        </a>
+      </div>
     );
   }
 
@@ -877,7 +1025,13 @@ export class PageRepo extends LoomElement {
         <div class="r">
           <span class={`ic ${e.kind === "dir" ? "d" : ""}`}>
             <loom-icon
-              name={e.kind === "dir" ? "folder" : e.kind === "symlink" ? "link" : "file"}
+              name={
+                e.kind === "dir"
+                  ? "folder"
+                  : e.kind === "symlink"
+                    ? "link"
+                    : fileIcon(e.name)
+              }
               size={13}
             ></loom-icon>
           </span>
@@ -1009,22 +1163,53 @@ export class PageRepo extends LoomElement {
     const at = this.loc!;
     const list = this.commits ?? [];
 
+    // Grouped by the day the commit was made, the way you actually think about
+    // history — "what happened Tuesday", not "rows 40 through 60". The flat
+    // list gave every commit the same weight and left a gulf between the
+    // message and its metadata.
+    const groups: { day: string; items: Commit[] }[] = [];
+    for (const c of list) {
+      const day = new Date(c.timestamp * 1000).toLocaleDateString(undefined, {
+        weekday: "short",
+        day: "numeric",
+        month: "short",
+        year: "numeric",
+      });
+      const last = groups[groups.length - 1];
+      if (last && last.day === day) last.items.push(c);
+      else groups.push({ day, items: [c] });
+    }
+
     const row = (c: Commit) => {
       const href = `/${at.owner}/${at.name}/commit/${c.hash}`;
+      const tree = `/${at.owner}/${at.name}/tree/${c.hash}`;
       return (
         <div class="c">
-          <a class="m" href={href} onClick={linkHandler(href)}>
-            {c.summary || "(no message)"}
-          </a>
-          <span class="by">{authorName(c.author)} · {relativeTime(c.timestamp)}</span>
-          <a class="sha" href={href} onClick={linkHandler(href)}>{c.short}</a>
+          <span class="body">
+            <a class="m" href={href} onClick={linkHandler(href)}>
+              {c.summary || "(no message)"}
+            </a>
+            <span class="by">
+              {authorName(c.author)} committed {relativeTime(c.timestamp)}
+            </span>
+          </span>
+          <span class="acts">
+            <a class="sha" href={href} onClick={linkHandler(href)} title="View this commit">
+              {c.short}
+            </a>
+            <a class="ghost" href={tree} onClick={linkHandler(tree)} title="Browse files at this commit">
+              <loom-icon name="folder" size={12}></loom-icon>
+            </a>
+          </span>
         </div>
       );
     };
 
+    // Virtualizing cannot carry the day headers with it, so a long history
+    // stays flat rather than pretending to be grouped and scrolling wrong.
     if (list.length > 200) {
       const v = (
-        <loom-virtual class="vlist" items={list} estimatedHeight={34} overscan={8}>
+        <loom-virtual class="vlist" items={list} estimatedHeight={44} overscan={8}>
           {row}
         </loom-virtual>
       ) as unknown as HTMLElement & { pinToBottom: boolean };
@@ -1032,7 +1217,31 @@ export class PageRepo extends LoomElement {
       adoptInto(v, commitSheet);
       return <div class="panel commits">{v}</div>;
     }
-    return <div class="panel commits">{list.map(row)}</div>;
+
+    if (list.length === 0) {
+      return (
+        <div class="panel commits">
+          <div class="empty">nothing committed on this branch yet</div>
+        </div>
+      );
+    }
+
+    // Flattened rather than nested in fragments: a fragment returned from
+    // inside a .map did not keep its children in order here, which put the
+    // rail dots one row out and left one dangling past the end of the list.
+    const out: unknown[] = [];
+    for (const g of groups) {
+      out.push(
+        <div class="day">
+          <loom-icon name="commit" size={12}></loom-icon>
+          {g.day}
+          <span class="n">{g.items.length}</span>
+        </div>,
+      );
+      for (const c of g.items) out.push(row(c));
+    }
+
+    return <div class="panel commits">{out}</div>;
   }
 
   private renderCommitDetail() {
@@ -2254,6 +2463,7 @@ fkit push</pre>
               ) : (
                 <div class="split">
                   <div class="main">
+                    {this.renderLatest()}
                     {this.renderTree(v.path)}
                     {this.renderReadme()}
                   </div>

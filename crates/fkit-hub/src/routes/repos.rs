@@ -22,6 +22,7 @@ pub fn routes() -> Router<AppState> {
         .route("/repos/{owner}/{name}", patch(update_repo))
         .route("/repos/{owner}/{name}", delete(delete_repo))
         .route("/repos/{owner}/{name}/refs", get(list_refs))
+        .route("/repos/{owner}/{name}/stats", get(repo_stats))
         .route(
             "/repos/{owner}/{name}/collaborators",
             get(list_collaborators).post(add_collaborator),
@@ -66,6 +67,80 @@ async fn list_repos(State(state): State<AppState>, viewer: Viewer) -> AppResult<
     }
     super::attach_heads(&state, &mut out).await;
     Ok(Json(out))
+}
+
+#[derive(serde::Serialize)]
+struct RepoStats {
+    /// Commits reachable from the default branch.
+    commits: usize,
+    /// Objects in the store — chunks, files, trees, entries and commits.
+    objects: usize,
+    /// What the filesystem actually holds, after chunk deduplication and
+    /// compression. Not the size of a checkout, which is generally larger.
+    bytes: u64,
+}
+
+/// Size and history counts for one repository.
+///
+/// The byte figure is a directory walk rather than a sum of object sizes: the
+/// store packs and compresses, so adding up decoded objects would be wrong in
+/// two directions at once. A packed store is a handful of files, so the walk
+/// is cheap even for a repository of a few gigabytes.
+async fn repo_stats(
+    State(state): State<AppState>,
+    viewer: Viewer,
+    axum::extract::Path((owner, name)): axum::extract::Path<(String, String)>,
+) -> AppResult<Json<RepoStats>> {
+    let (repo, _, _) = super::load_repo(&state, &viewer, &owner, &name).await?;
+    let store = state.store_for(repo.id).map_err(AppError::Internal)?;
+
+    let dir = state.data_dir.join("repos").join(repo.id.to_string()).join("objects");
+    let bytes = dir_size(&dir);
+    let objects = store.iter_ids().map(|v| v.len()).unwrap_or(0);
+
+    // Commits only, so this stays a walk of the history rather than of every
+    // chunk in the repository.
+    let mut commits = 0usize;
+    if let Some(tip) = ref_target(&state, &repo, &repo.default_branch).await? {
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![tip];
+        while let Some(h) = stack.pop() {
+            if !seen.insert(h) {
+                continue;
+            }
+            if let Ok(fkit_core::Object::Commit(c)) = store.get(h) {
+                commits += 1;
+                stack.extend(c.parents);
+            }
+        }
+    }
+
+    Ok(Json(RepoStats { commits, objects, bytes }))
+}
+
+async fn ref_target(state: &AppState, repo: &RepoRow, name: &str) -> AppResult<Option<Hash>> {
+    let row: Option<(Vec<u8>,)> =
+        sqlx::query_as("SELECT target FROM refs WHERE repo_id = $1 AND name = $2")
+            .bind(repo.id)
+            .bind(name)
+            .fetch_optional(&state.db)
+            .await?;
+    Ok(row.and_then(|(b,)| <[u8; 32]>::try_from(b.as_slice()).ok()).map(Hash))
+}
+
+/// Total size of every file beneath `dir`.
+fn dir_size(dir: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|e| match e.file_type() {
+            Ok(t) if t.is_dir() => dir_size(&e.path()),
+            Ok(_) => e.metadata().map(|m| m.len()).unwrap_or(0),
+            Err(_) => 0,
+        })
+        .sum()
 }
 
 /// A person's public page: who they are, and the repositories the viewer is
