@@ -426,13 +426,13 @@ fn load_index(path: &Path, segment: u32, out: &mut HashMap<Hash, Located>) -> Re
         );
     }
     let body = &data[IDX_MAGIC.len()..];
-    let whole = body.len() - (body.len() % IDX_ENTRY);
-    if whole != body.len() {
+    let (entries, tail) = body.as_chunks::<IDX_ENTRY>();
+    if !tail.is_empty() {
         // A partial trailing entry is a torn write from a crash. Ignoring it is
         // safe: the object is simply absent and will be written again.
-        tracing_note(path, body.len() - whole);
+        tracing_note(path, tail.len());
     }
-    for e in body[..whole].chunks_exact(IDX_ENTRY) {
+    for e in entries {
         let hash = Hash(e[..HASH_LEN].try_into().unwrap());
         let offset = u64::from_le_bytes(e[HASH_LEN..HASH_LEN + 8].try_into().unwrap());
         let stored = u32::from_le_bytes(e[HASH_LEN + 8..HASH_LEN + 12].try_into().unwrap());

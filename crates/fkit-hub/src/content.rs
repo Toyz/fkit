@@ -405,7 +405,7 @@ fn count_ahead(store: &Store, from: Hash, exclude: Hash, cap: usize) -> (Vec<Com
         }
     }
     // Newest first.
-    out.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    out.sort_by_key(|c| std::cmp::Reverse(c.timestamp));
     (out, total)
 }
 
