@@ -378,7 +378,15 @@ const sheet = css`
     border-bottom: 1px solid var(--border); font-size: 12px;
   }
   .df-toggle { padding: 2px 4px; }
+  /* The rotation is a class, not a style= prop on the icon. LoomIcon sizes
+     itself by writing --_s/--_c/--_f/--_sw as inline styles on its own host,
+     and loom's JSX sets style with setAttribute, which replaces the whole
+     declaration -- so a style prop there wipes the icon's own size and it
+     renders at the SVG's intrinsic size instead of 12px. It only appears after
+     a toggle: applyVars() re-runs on the icon's own render and on its size
+     watcher, and neither fires when just the parent re-renders. */
   .df-toggle loom-icon { transition: transform .12s; display: block; }
+  .df-toggle loom-icon.closed { transform: rotate(-90deg); }
   .df-path { color: var(--text); text-decoration: none; overflow: hidden;
              text-overflow: ellipsis; white-space: nowrap; }
   a.df-path:hover { color: var(--accent); }
@@ -858,16 +866,16 @@ export class PageRepo extends LoomElement {
       <div class="df">
         <div class="df-head">
           <button
-            class="bare fd-toggle"
+            class="bare df-toggle"
             onClick={() =>
               (this.collapsed = { ...this.collapsed, [f.path]: isOpen })
             }
             title={isOpen ? "collapse" : "expand"}
           >
             <loom-icon
+              class={isOpen ? "" : "closed"}
               name="chevron"
               size={12}
-              style={isOpen ? "" : "transform:rotate(-90deg)"}
             ></loom-icon>
           </button>
           <span class={`st ${f.status}`}>
