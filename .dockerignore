@@ -1,0 +1,9 @@
+target/
+web/node_modules/
+web/dist/
+fkit-data/
+fkit-hub-data/
+.fkit/
+.git/
+*.md
+!README.md

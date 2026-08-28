@@ -1,0 +1,25 @@
+[package]
+name = "fkit-core"
+description = "Content-addressed storage and Merkle DAG primitives for fkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Compression is a feature, not a hard dependency. `--no-default-features`
+# keeps fkit-core at blake3 + anyhow, which is a property worth being able to
+# state precisely rather than approximately.
+[features]
+default = ["compression", "tls"]
+compression = ["dep:zstd"]
+# wss:// support in the WebSocket client. Off in a build that only ever speaks
+# to a hub on a trusted network, which keeps rustls out of the binary.
+tls = ["dep:rustls", "dep:webpki-roots", "dep:rustls-pki-types"]
+
+[dependencies]
+blake3.workspace = true
+anyhow.workspace = true
+zstd = { version = "0.13", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"], optional = true }
+webpki-roots = { version = "1", optional = true }
+rustls-pki-types = { version = "1", features = ["std"], optional = true }

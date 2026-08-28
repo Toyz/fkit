@@ -1,0 +1,45 @@
+# syntax=docker/dockerfile:1.7
+#
+# Assemble an image from artifacts that are already built.
+#
+# The self-contained `Dockerfile` compiles everything inside the build, which is
+# what you want locally and for anyone building from source — one command, no
+# toolchain assumptions. It is the wrong shape for CI: every run starts with a
+# target directory containing only dependencies, so all four workspace crates
+# recompile from scratch, and Docker's layer cache cannot help because the layer
+# changes whenever the source does.
+#
+# CI instead builds natively with a real incremental cargo cache and hands the
+# finished binaries here. The image is then a copy, and takes seconds.
+#
+# Expects, relative to the build context:
+#   bin/fkit  bin/fkitd  bin/fkit-hub   static, x86_64-unknown-linux-musl
+#   web/                                the built frontend
+FROM alpine:3.21
+
+RUN apk add --no-cache ca-certificates tini \
+ && adduser -D -u 10001 -h /var/lib/fkit fkit
+
+COPY bin/fkit-hub /usr/local/bin/fkit-hub
+COPY bin/fkitd    /usr/local/bin/fkitd
+COPY bin/fkit     /usr/local/bin/fkit
+COPY web/         /srv/web/
+
+RUN chmod 0755 /usr/local/bin/fkit-hub /usr/local/bin/fkitd /usr/local/bin/fkit \
+ && mkdir -p /var/lib/fkit/data && chown -R fkit:fkit /var/lib/fkit
+
+USER fkit
+WORKDIR /var/lib/fkit
+
+ENV FKIT_DATA=/var/lib/fkit/data \
+    FKIT_WEB_DIR=/srv/web \
+    FKIT_LISTEN=0.0.0.0:7500
+
+EXPOSE 7500 7420
+
+# tini reaps zombies and forwards signals, so graceful shutdown actually works.
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["fkit-hub"]
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+  CMD wget -qO- http://127.0.0.1:7500/_health || exit 1

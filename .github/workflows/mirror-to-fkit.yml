@@ -1,0 +1,106 @@
+# Mirror main into the fkit hub — fkit hosting its own source.
+#
+# This does not translate git history. It clones the hub repository, replaces
+# its working tree with this checkout, and makes one fkit commit per update to
+# main. So fkit's history is a record of what main looked like, in fkit's own
+# object model, with real diffs between snapshots — not a re-encoded git graph.
+# Cloning first is what makes that work: committing into a fresh `fkit init`
+# every run would produce a parentless commit the hub would refuse to fast
+# forward onto.
+#
+# Secrets:
+#   FKIT_REMOTE   wss://fkit.work/helba/fkit
+#   FKIT_TOKEN    an fkit access token with write access to that repository
+#
+# The remote must be wss:// for anything crossing the public internet. The
+# sync protocol carries the access token in its opening frame, so a ws:// URL
+# to a public host hands that token to the network.
+name: mirror to fkit
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  # Two runs pushing snapshots at once would race for the branch tip and the
+  # loser's push would be rejected. Newer wins; an intermediate snapshot of
+  # main is worth nothing.
+  group: mirror-to-fkit
+  cancel-in-progress: true
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # A snapshot mirror only ever needs the tip.
+          fetch-depth: 1
+
+      # The CLI comes out of the image we already publish rather than being
+      # compiled here: it is then demonstrably the same binary the hub is
+      # running against, and the step takes seconds instead of minutes.
+      - name: Fetch the fkit CLI
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          image=ghcr.io/${{ github.repository_owner }}/fkit-hub:latest
+          docker pull -q "$image"
+          cid=$(docker create "$image")
+          docker cp "$cid:/usr/local/bin/fkit" ./fkit-bin
+          docker rm "$cid" >/dev/null
+          sudo install -m 0755 ./fkit-bin /usr/local/bin/fkit
+          rm -f ./fkit-bin
+
+      - name: Push this tree to fkit
+        env:
+          FKIT_TOKEN: ${{ secrets.FKIT_TOKEN }}
+          FKIT_REMOTE: ${{ secrets.FKIT_REMOTE }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+          test -n "${FKIT_REMOTE:-}" || { echo "FKIT_REMOTE is not set" >&2; exit 1; }
+          case "$FKIT_REMOTE" in
+            wss://*) ;;
+            ws://127.0.0.1*|ws://localhost*) ;;
+            ws://*) echo "refusing to send an access token over plain ws:// to a remote host" >&2
+                    exit 1 ;;
+          esac
+
+          # Clone what the hub already has, so this run's commit has a parent.
+          # A repository nobody has pushed to yet has nothing to clone, and
+          # `fkit init` is then the right start.
+          if fkit clone "$FKIT_REMOTE" mirror 2>/dev/null; then
+            echo "cloned existing history"
+          else
+            echo "nothing to clone — starting a first commit"
+            mkdir -p mirror
+            ( cd mirror && fkit init . )
+          fi
+
+          # Replace the working tree wholesale. Deletions have to propagate: a
+          # file removed on main must be removed here, so this cannot be a copy
+          # over the top. Only .fkit survives.
+          find mirror -mindepth 1 -maxdepth 1 ! -name .fkit -exec rm -rf {} +
+          tar -cf - --exclude=./.git --exclude=./mirror . | tar -xf - -C mirror
+
+          cd mirror
+          fkit config author.name "fkit ci"
+          fkit config author.email "ci@fkit.work"
+          fkit remote "$FKIT_REMOTE"
+
+          # Nothing changed is a normal outcome — a re-run, or a push that only
+          # touched ignored paths — and not a failure.
+          if fkit status | grep -q "working tree clean"; then
+            echo "no change since the last mirror"
+            exit 0
+          fi
+
+          fkit commit -m "$(printf '%s\n\ngit %s' \
+            "${COMMIT_MSG:-sync from main}" "${{ github.sha }}")"
+          fkit push

@@ -1,0 +1,15 @@
+[package]
+name = "fkit-server"
+description = "Hosting daemon: serves and accepts fkit objects and refs over HTTP"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "fkitd"
+path = "src/main.rs"
+
+[dependencies]
+fkit-core.workspace = true
+anyhow.workspace = true

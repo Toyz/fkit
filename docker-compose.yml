@@ -1,0 +1,87 @@
+# fkit hub — Postgres, the forge, and (optionally) the standalone daemon.
+#
+#   docker compose up -d --build
+#   open http://localhost:7500
+#
+# The first account you register becomes the server administrator.
+
+name: fkit
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: fkit
+      POSTGRES_DB: fkit_hub
+      # No default on purpose: a fallback password is a password everyone knows.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?missing — run 'make setup' to generate .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # Not published by default: only the hub needs to reach it. Uncomment to
+    # inspect the database from the host.
+    # ports: ["55432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fkit -d fkit_hub"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  hub:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    # Wait for Postgres to accept connections, not merely to have started —
+    # otherwise the first boot races the database and dies on migrations.
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Overridable for the same reason as the deployment compose: someone may
+      # already have a Postgres they would rather point at. Unset, it is the
+      # bundled service, which is what `make up` is for.
+      DATABASE_URL: ${DATABASE_URL:-postgres://fkit:${POSTGRES_PASSWORD}@postgres:5432/fkit_hub}
+      FKIT_LISTEN: 0.0.0.0:7500
+      FKIT_DATA: /var/lib/fkit/data
+      FKIT_WEB_DIR: /srv/web
+      RUST_LOG: ${RUST_LOG:-fkit_hub=info,tower_http=warn}
+      # Set this when running behind a TLS-terminating proxy so session cookies
+      # are marked Secure. Do NOT set it for plain-HTTP local use, or the browser
+      # will refuse to store the cookie and login will appear to silently fail.
+      # FKIT_SECURE_COOKIES: "1"
+      # Outbound mail (password resets). All three are optional; without a key
+      # the hub simply has no reset flow and says so on the sign-in page.
+      # An unset variable stays empty here rather than failing the container.
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      FKIT_EMAIL_FROM: ${FKIT_EMAIL_FROM:-}
+      FKIT_PUBLIC_URL: ${FKIT_PUBLIC_URL:-}
+    ports:
+      - "${HUB_PORT:-7500}:7500"
+    volumes:
+      - repodata:/var/lib/fkit/data
+
+  # The minimal file-backed daemon: no accounts, no web UI, one shared token.
+  # Useful for a private box or CI. Disabled by default — start it with:
+  #   docker compose --profile standalone up -d
+  fkitd:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    profiles: ["standalone"]
+    restart: unless-stopped
+    command: ["fkitd", "--listen", "0.0.0.0:7420", "--data", "/var/lib/fkit/data"]
+    environment:
+      # Without this the daemon is completely open. It refuses to be quiet
+      # about that at startup.
+      # fkitd itself refuses to bind a public address without this set.
+      FKIT_TOKEN: ${FKIT_TOKEN:-}
+    ports:
+      - "${FKITD_PORT:-7420}:7420"
+    volumes:
+      - daemondata:/var/lib/fkit/data
+
+volumes:
+  pgdata:
+  repodata:
+  daemondata:

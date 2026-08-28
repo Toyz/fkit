@@ -1,0 +1,125 @@
+/*
+ * fkit hub — visual language.
+ *
+ * The premise: this is an instrument, not a marketing page. A forge is opened
+ * dozens of times a day to answer structural questions — what changed, where
+ * does this path go, which commit is this. So:
+ *
+ *   - Monospace is the STRUCTURAL typeface. Paths, hashes, branches, sizes and
+ *     file names are data, and data is easier to scan when the columns line up.
+ *     The proportional face is reserved for prose: descriptions and READMEs.
+ *   - Geometry is sharp. 2px radii, hairline rules, no drop shadows. Depth is
+ *     communicated by a change of ground, not by floating things.
+ *   - One accent, used only where it means something (links and the active
+ *     tab). Status colours are a separate axis and never borrowed for decoration.
+ *   - Density over padding. Rows are 30px, not 56px.
+ *
+ * The palette is the project's own: the teal/rose pair the fkit documentation
+ * uses for "unchanged" and "changed" carries straight through to added/removed
+ * here, so the diff colours mean the same thing everywhere.
+ *
+ * No webfonts. This page should paint on the first frame.
+ */
+:root {
+  color-scheme: dark light;
+
+  /* Ground: near-black with a slight cool-green cast, so it does not read as
+     the default #0d1117 every dark UI ships. */
+  --bg:        #090d0d;
+  --surface:   #0f1514;
+  --raised:    #151d1c;
+  --border:    #1d2726;
+  --border-hi: #2b3937;
+
+  --text:      #dde5e3;
+  --muted:     #7d908c;
+  --faint:     #556864;
+
+  /* Single structural accent. */
+  --accent:      #4fb3a6;
+  --accent-weak: #16302c;
+
+  /* Status axis — deliberately distinct from the accent. */
+  --added:    #4fb3a6;
+  --removed:  #e2679a;
+  --modified: #d9a441;
+
+  /* Syntax colours.
+     Tuned to sit *within* the interface palette rather than importing a stock
+     editor theme: comments recede, strings take the accent's hue, and keywords
+     are the only genuinely saturated colour on the page. */
+  --tok-comment: #5b6f6b;
+  --tok-string:  #6fbfa8;
+  --tok-number:  #d9a441;
+  --tok-keyword: #c98bd9;
+  --tok-type:    #6aa9d9;
+  --tok-fn:      #dbc06a;
+  --tok-punct:   #8ea19d;
+
+  /* The gutter reads as a margin, not a second column: a hair darker than the
+     surface, with numbers quiet enough to ignore until you look for them. */
+  --gutter-bg: #0c1211;
+  --gutter-fg: #46534f;
+
+  --radius: 3px;
+
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, "JetBrains Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+
+  --row: 30px;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg:        #f7f8f7;
+    --surface:   #ffffff;
+    --raised:    #eef1f0;
+    --border:    #dae0de;
+    --border-hi: #bdc7c4;
+
+    --text:      #0e1817;
+    --muted:     #566461;
+    --faint:     #7f8f8b;
+
+    --accent:      #14776b;
+    --accent-weak: #dcece9;
+
+    --added:    #14776b;
+    --removed:  #b83a6b;
+    --modified: #91661a;
+
+    --tok-comment: #7c8c88;
+    --tok-string:  #0f766e;
+    --tok-number:  #9a6700;
+    --tok-keyword: #8b3fa8;
+    --tok-type:    #1f6bb0;
+    --tok-fn:      #8a6d1f;
+    --tok-punct:   #6b7a77;
+
+    --gutter-bg: #f2f5f4;
+    --gutter-fg: #9aa8a4;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  /* Mono is the default: everything structural inherits it, and prose opts out. */
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+::selection { background: var(--accent-weak); }
+
+/* Thin, quiet scrollbars — a file tree should not be framed in chrome. */
+* { scrollbar-width: thin; scrollbar-color: var(--border-hi) transparent; }
+*::-webkit-scrollbar { width: 9px; height: 9px; }
+*::-webkit-scrollbar-thumb { background: var(--border-hi); border: 2px solid var(--bg); border-radius: 5px; }
+*::-webkit-scrollbar-track { background: transparent; }

@@ -1,0 +1,130 @@
+# fkit hub — deployment compose.
+#
+# Unlike docker-compose.yml this does NOT build: it pulls a published image, so
+# the server never needs a Rust toolchain, a Node install, or the source tree.
+#
+#   1. On your machine:   make push TAG=v1
+#   2. Copy this file and .env.prod to the server
+#   3. On the server:     docker compose -f docker-compose.prod.yml \
+#                           --profile bundled-db --profile tls up -d
+#
+# ---- the database -----------------------------------------------------------
+# Two options, and neither is the default forced on you:
+#
+#   Bundled     add --profile bundled-db and set POSTGRES_PASSWORD.
+#   Your own    set DATABASE_URL and leave the profile off. Nothing local
+#               starts, and POSTGRES_PASSWORD is not needed at all.
+#
+# Migrations run on boot either way; the hub needs a database it can create
+# tables in, not a specific one.
+#
+# ---- reachability -----------------------------------------------------------
+# Two shapes, chosen by whether you start the `tls` profile.
+#
+# Public, on a domain (fkit.work):
+#
+#     docker compose --env-file .env.prod -f docker-compose.prod.yml \
+#       --profile tls up -d
+#
+#   Caddy terminates TLS and forwards to the hub over the compose network, so
+#   BIND_ADDR stays 127.0.0.1 and the hub is never directly exposed. Set
+#   FKIT_SECURE_COOKIES=1 — with TLS in front, session cookies should not be
+#   allowed to travel any other way.
+#
+# Private, on an overlay network:
+#
+#     docker compose --env-file .env.prod -f docker-compose.prod.yml up -d
+#
+#   No Caddy. Set BIND_ADDR to the server's address on that network, and that
+#   is the whole access-control story. Leave FKIT_SECURE_COOKIES unset while
+#   you reach it over plain http://: a Secure cookie sent over http is
+#   discarded by the browser, which looks precisely like a login that silently
+#   fails.
+#
+# BIND_ADDR defaults to 127.0.0.1 either way, so a deploy that forgets it is
+# reachable from the server itself rather than from the whole internet.
+
+name: fkit
+
+services:
+  # The bundled database, for when you do not already have one. It lives in the
+  # `bundled-db` profile so that pointing DATABASE_URL at a managed Postgres —
+  # RDS, Neon, a box you already run — does not also start a second server you
+  # have to ignore. See the DATABASE_URL note below.
+  postgres:
+    image: postgres:17-alpine
+    profiles: [bundled-db]
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-fkit}
+      POSTGRES_DB: ${POSTGRES_DB:-fkit_hub}
+      # Not `:?` — compose interpolates every service whether or not its
+      # profile is active, so a required-variable check here would block an
+      # external-database deploy that has no use for the variable. The postgres
+      # image refuses to initialise without a password and says so plainly, and
+      # that only happens when this service is actually started.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # Deliberately not published. Only the hub needs to reach it, and it does
+    # so over the compose network.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-fkit} -d $${POSTGRES_DB:-fkit_hub}"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+
+  hub:
+    image: ${FKIT_IMAGE:-ghcr.io/toyz/fkit-hub}:${FKIT_TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      # Only enforced when the bundled-db profile is active; with an external
+      # database there is no local service to wait on, and the hub retries its
+      # first connection anyway.
+      postgres:
+        condition: service_healthy
+        required: false
+    environment:
+      # Set DATABASE_URL to use a database you already have. Left unset, it is
+      # built from the bundled service's credentials.
+      DATABASE_URL: ${DATABASE_URL:-postgres://${POSTGRES_USER:-fkit}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-fkit_hub}}
+      FKIT_LISTEN: 0.0.0.0:7500        # inside the container; the bind below is what matters
+      FKIT_DATA: /var/lib/fkit/data
+      FKIT_WEB_DIR: /srv/web
+      RUST_LOG: ${RUST_LOG:-fkit_hub=info,tower_http=warn}
+
+      # Links in outbound mail. Must be an address the recipient can actually
+      # open — on a ZT-only instance that is the ZT address, not fkit.work.
+      FKIT_PUBLIC_URL: ${FKIT_PUBLIC_URL:-}
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      FKIT_EMAIL_FROM: ${FKIT_EMAIL_FROM:-}
+
+      # Set to 1 when Caddy (or any TLS proxy) is in front. Leave unset for a
+      # plain-http overlay deployment.
+      FKIT_SECURE_COOKIES: ${FKIT_SECURE_COOKIES:-}
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${HUB_PORT:-7500}:7500"
+    volumes:
+      - repodata:/var/lib/fkit/data
+
+  # Started only with `--profile tls`. Without it the hub is whatever
+  # BIND_ADDR says and nothing terminates TLS.
+  caddy:
+    image: caddy:2-alpine
+    profiles: [tls]
+    restart: unless-stopped
+    depends_on: [hub]
+    ports:
+      - "80:80"     # required for the ACME HTTP challenge, not just redirects
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddydata:/data      # certificates and account keys — losing this
+      - caddyconfig:/config  # means re-issuing on every restart
+
+volumes:
+  pgdata:
+  repodata:
+  caddydata:
+  caddyconfig:

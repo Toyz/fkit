@@ -1,0 +1,398 @@
+# fkit
+
+A version control system built on a real Merkle DAG and content-addressed
+storage, written to be read.
+
+```
+fkit init                 fkit commit -m "..."      fkit push
+fkit status               fkit log                  fkit pull
+fkit switch <branch>      fkit merkle <hash>        fkit clone ws://host/repo
+```
+
+## What makes it different from git
+
+Git is *almost* content-addressed: objects are named by hash, but a file is
+stored as one whole blob. Change one byte of a 400 MB file and git writes a new
+400 MB object, clawing the space back later with delta compression during `gc`.
+
+fkit splits files with **content-defined chunking** before hashing, so a file is
+itself a Merkle tree over its chunks:
+
+```
+bigdata.bin  (12 MB)
+└── file node  level 1
+    ├── file node  level 0 ──┬── chunk a3f2…  8.9 KiB
+    │                        ├── chunk 91bc…  10.5 KiB
+    │                        └── …256 chunks
+    └── file node  level 0 ──┴── …
+```
+
+Measured on a 12 MB file in this repo's own test suite:
+
+| change | objects written | bytes written |
+|---|---|---|
+| initial commit | 1582 | 11.5 MiB |
+| flip one byte mid-file | **4** | **18.5 KiB** |
+| prepend 2 MB at the front | 272 | 2.0 MiB |
+
+The prepend is the interesting one. Every byte offset in the file shifts, yet
+only the genuinely new data is stored — because chunk boundaries are chosen by a
+rolling hash of the content, not by position. Fixed-size chunking loses ~100% of
+reuse on that edit; there is a test asserting exactly that contrast.
+
+## On a real repository
+
+Measured on an operating-system project: 100,484 files across 3,337 directories,
+including build trees, vendored dependencies and disk images.
+
+| | |
+|---|---|
+| logical content read | **154.5 GiB** |
+| ingest time | **2 min 09 s** (~1.2 GiB/s, 16 cores) |
+| unique objects stored | 310,374 |
+| duplicate references | 3,204,369 |
+| **store on disk** | **1.2 GB** — 128× smaller |
+
+`du` reports that tree as 9.4 GB because it counts a hard-linked or sparse inode
+once. There are 154.5 GiB of bytes reachable through paths, and fkit read every
+one of them. Almost all of the reduction is deduplication rather than
+compression: build output is the same bytes over and over, and a
+content-addressed store notices.
+
+Getting there required fixing two things that only show up at this scale — a
+buffer compaction in the chunker that was memmoving 64 KB per 8 KB produced, and
+ingest running on one core. Both are described in `chunker.rs` and `ingest.rs`.
+
+## The five object types
+
+Everything in the repository is one of these, and every arrow between them is a
+hash rather than a pointer:
+
+```
+Commit ──tree──> Tree ──> Entries ──entry──> Tree ──> … ──> File ──> Chunk
+  │              (levels)  (a run of          (subdir)      (levels)  (bytes)
+  │                         directory entries)
+  └──parent──> Commit ──> …
+```
+
+Note the symmetry: **`Tree`/`Entries` is to a directory exactly what
+`File`/`Chunk` is to a file.** Both are interior nodes over content-defined runs
+of leaves, and both are cut by hashing the content rather than counting
+positions. A directory is *not* a flat list — that is git's design, and it means
+adding one file to a directory of 100 000 rewrites all of it. Here it rewrites
+one run:
+
+| directory of 4000 files | bytes of listing rewritten |
+|---|---|
+| flat tree (git-shaped) | the whole listing |
+| chunked runs (fkit) | **< 40 KB** |
+
+Because a node's hash covers its children's hashes, one root hash pins every
+byte beneath it. That single property buys:
+
+- **Integrity** — `fkit fsck` re-hashes every object and compares it to its own
+  name. No external checksum, signature, or trusted party involved.
+- **Proofs** — `fkit prove <path>` emits a compact inclusion proof; anyone can
+  check that a file belongs to a commit hash **without the repository**. See
+  below.
+- **Cheap diffs** — equal subtree hashes are provably identical, so `fkit diff`
+  skips them without reading a file.
+- **Cheap sync** — see below.
+- **Safe transfer** — a peer cannot substitute content, because the receiver
+  recomputes the hash of everything it is given.
+
+## Proofs
+
+Because a node's hash covers its children's hashes, you can prove a file belongs
+to a commit by shipping only the *siblings* along the path from that file to the
+root. The verifier recomputes each parent hash and compares the result against a
+commit hash they already trust.
+
+```sh
+$ fkit prove src/lib.rs -o lib.proof
+proof for src/lib.rs
+  root    750cfc446cf898ee4ea1133fa6d2d52d36a8805e937be580cc0cf6249be1b0ec
+  steps   5 nodes, 605 B
+
+$ cd /somewhere/else          # no repository here
+$ fkit verify lib.proof --root 750cfc446cf8...
+verified
+  src/lib.rs (19 B) is in 750cfc446c
+```
+
+**605 bytes** to prove one path in a 3002-file repository. Tampering with any
+step, splicing a valid node from another tree, or verifying against the wrong
+root are all rejected — the chain, not just each link, is checked.
+
+Git cannot offer this: its trees are flat, so a proof would have to carry every
+sibling name in every directory along the path.
+
+## Storage
+
+Objects live in append-only segments with a small index, not one file each:
+
+```sh
+$ fkit pack
+packing 6026 loose object(s)…
+  moved 6026 object(s), 340.0 KiB into segments
+  verified: every object still hashes to its own name
+```
+
+| 3002-file repository | files on disk | disk used |
+|---|---|---|
+| loose objects (git-shaped) | 6026 | 24 MB |
+| packed segments | **2** | **648 KB** |
+
+Content-defined chunking produces many small objects, and one inode each means
+most of them occupy a 4 KiB block to hold a few hundred bytes. Each writer owns
+its own segment, so concurrent writers never contend and there is nothing to
+lock. A torn index entry from a crash is detected by size and ignored — the
+object is simply absent and gets rewritten, never wrongly located.
+
+Objects are zstd-compressed **individually**, so any one is still a single seek,
+and the compressed form is kept only when it actually helps — a chunk of random
+or already-compressed data would otherwise grow by a few bytes and cost CPU on
+every read:
+
+```
+$ fkit stats
+packed      127 object(s)
+  compressed 83
+  546.6 KiB of object data stored in 25.2 KiB
+```
+
+Compression is a cargo feature. `--no-default-features` keeps `fkit-core` at
+exactly blake3 + anyhow.
+
+## Garbage collection
+
+```sh
+fkit gc --dry-run     # what would go
+fkit gc               # collect, keeping anything younger than 24h
+fkit gc --prune-all   # ignore the age guard
+```
+
+An object is garbage when no ref reaches it. The subtlety is not finding them —
+that is a graph walk — but *not deleting one that is about to become reachable*.
+A push writes objects and then moves a ref; in between, its objects are
+unreachable by definition. Nothing in a content-addressed store records intent,
+so the only honest defence is time, and unreachable objects younger than the age
+guard are never collected.
+
+Packed objects cannot be unlinked individually — they are bytes inside a shared
+segment — so segments are **compacted**: survivors are written and fsynced into a
+new segment before any original is removed, which means a crash leaves harmless
+duplicates and never a gap. A segment is only rewritten when enough of it is
+actually dead to be worth the I/O.
+
+`fkit pack` also folds small segments together, since every writing process
+creates its own.
+
+## Merging
+
+```sh
+fkit merge feature            # three-way merge, or conflict markers + MERGE_HEAD
+```
+
+Merge base is the best common ancestor over the commit DAG. Trees merge with a
+single hash comparison wherever a subtree is unchanged on one side, however large
+it is. Files that both sides edited go through a diff3 line merge; overlapping
+edits become conflict markers.
+
+A conflicted merge deliberately does **not** commit. The merged tree lands in the
+working directory and `MERGE_HEAD` records the other parent, so the eventual
+`fkit commit` still records two parents rather than pretending the branches never
+met.
+
+## Sync
+
+`fkit push` and `fkit pull` speak a small binary protocol over a WebSocket. The
+negotiation is four lines of idea:
+
+1. Ask for the tip commit.
+2. For each object received, look at the hashes it references.
+3. Request only the ones you don't already have.
+4. Repeat until nothing is missing.
+
+No inventory is ever exchanged. An unchanged directory is a single hash
+comparison and its entire subtree is skipped — not transferred, not enumerated,
+not even named. In this repo's tests, a two-file change to a 3 MB repository
+syncs as 7 objects and 549 bytes.
+
+## Hosting
+
+There are two servers. They speak the **same protocol** — the session loop lives
+once in `fkit-core::session` and each supplies a `RepoHost` for where refs live
+and who is allowed to move them.
+
+### `fkit-hub` — the forge
+
+Accounts, per-repo permissions, a web UI, and Postgres-backed refs. The web page
+and the sync socket share one port and one URL: `https://hub/you/proj` in a
+browser and `ws://hub/you/proj` from the CLI are the same repository, told apart
+by the `Upgrade` header.
+
+```sh
+make up          # generates .env with random secrets, then builds and starts
+```
+
+Then open <http://localhost:7500>. The first account you register becomes the
+server administrator.
+
+```sh
+# on the client
+fkit remote ws://your-host:7500/you/my-repo
+export FKIT_TOKEN=fkit_pat_...      # created under Settings → access tokens
+fkit push
+```
+
+Configuration is layered — `defaults < fkit-hub.toml < environment < flags`:
+
+```sh
+fkit-hub --print-config-template > fkit-hub.toml
+```
+
+| knob | effect |
+|---|---|
+| `server.open_registration` | turn off public sign-up (the first admin account is still allowed) |
+| `server.require_auth` | require a login for *everything*, including public repos |
+| `server.default_repo_visibility` | what a new repository gets when unspecified |
+| `server.secure_cookies` | set behind TLS; **leave off for plain HTTP**, or the browser drops the cookie and login appears to fail silently |
+
+Per-repository visibility is independent of all that: a public instance can host
+private repositories, and a public repository on it is readable — and cloneable —
+by someone with no account at all, while still refusing their pushes.
+
+### `fkitd` — the minimal daemon
+
+No accounts, no UI, refs as files, one optional shared token. Good for a private
+box or CI.
+
+```sh
+FKIT_TOKEN=your-secret fkitd --listen 0.0.0.0:7420 --data /var/lib/fkit
+```
+
+It **refuses to start** on a non-loopback address without a token unless you pass
+`--insecure-no-auth`. A warning in a container log is not a safety mechanism.
+
+### Security notes
+
+* Passwords are Argon2id. Session cookies and access tokens are 256-bit random
+  values stored as a BLAKE3 digest — a slow KDF on a high-entropy token buys
+  nothing and costs ~15 ms on every request.
+* A repository you cannot see returns **404, not 403**, everywhere including the
+  sync endpoint, so error codes cannot be used to enumerate private repos.
+* Ref updates are fast-forward-only unless forced. In the hub the check and the
+  write share a transaction with the ref row locked; `fkitd` can only manage a
+  per-process lock, which is the honest limit of file-backed refs.
+* There is no TLS. Put the hub behind a terminating proxy and set
+  `secure_cookies`.
+
+## Layout
+
+```
+crates/
+  fkit-core/     the engine — read the modules in this order:
+    hash.rs        how things are named (BLAKE3)
+    object.rs      the four node types and their canonical encoding
+    chunker.rs     content-defined chunking, and why fixed-size fails
+    store.rs       the CAS on disk (loose + packed)
+    pack.rs        append-only segments, their index, and compression
+    gc.rs          reachability, the age guard, and segment compaction
+    diff.rs        Myers line diff, and why it is line-aware
+    merge.rs       merge base, three-way tree and line merge
+    proof.rs       Merkle inclusion proofs
+    ingest.rs      filesystem -> Merkle DAG, in parallel
+    repo.rs        refs, HEAD, commits, diffing
+    checkout.rs    Merkle DAG -> filesystem
+    proto.rs       the sync wire protocol
+    session.rs     the server-side session loop, over a RepoHost
+    ws.rs          RFC 6455, hand-rolled
+    fsck.rs        whole-store verification
+  fkit-cli/      the `fkit` binary
+  fkit-server/   `fkitd` — lib + thin binary, disk-backed RepoHost
+  fkit-hub/      `fkit-hub` — the forge: axum, sqlx, Postgres-backed RepoHost
+web/             the UI — Loom web components, no runtime dependencies
+```
+
+`fkit-core` has **two dependencies**: `blake3` and `anyhow`. The WebSocket layer,
+its SHA-1 and base64, every binary encoding, and the argument parsing are written
+out longhand — it is meant to be read end to end. The hub is where that stops
+being a virtue: it uses axum, tokio and sqlx, because hand-rolling HTTP routing
+and the Postgres wire protocol would be effort with no insight at the end of it.
+
+The frontend is [Loom](https://github.com/Toyz/loom) — decorator-driven web
+components, JSX compiled to real DOM, no virtual DOM. ~44 KB gzipped total, no
+webfonts, and it paints on the first frame. Large files and long histories go
+through `<loom-virtual>`, and syntax highlighting is a line-aware tokenizer
+(`web/src/highlight.ts`) written specifically so it composes with virtualization
+— every off-the-shelf highlighter returns one HTML string for a whole document,
+which you cannot slice per line.
+
+## Design decisions worth knowing about
+
+**No staging area.** `commit` snapshots the working tree as it is. Git's index
+exists largely because hashing every file on every status check was too slow in
+2005; with BLAKE3 and content-defined chunking, re-snapshotting is cheap enough
+that the extra concept isn't worth the confusion.
+
+**`status` never writes.** Hashing is a pure function of content, so a dry-run
+sink computes exactly the same hashes as a real commit and reports what a commit
+*would* store, without touching disk.
+
+**Checkout takes an explicit "from" tree.** It is not inferred from HEAD, because
+`clone` and `pull` have both already moved HEAD by the time they check out.
+Inferring it there silently produces an empty diff and writes nothing — which is
+precisely the bug that shipped here once, and is now covered by two regression
+tests in `tests/workflow.rs`.
+
+**Untracked files are never deleted.** Removals are computed from the *tracked*
+set only, so `--force` cannot eat a file fkit has never seen.
+
+## Not done yet
+
+- **On-disk pack index.** The index is loaded into memory at open (~48 bytes per
+  object). Fine to a few million objects; past that it wants a sorted on-disk
+  index with binary search.
+- **Recursive merge base.** Criss-cross histories can have several equally-good
+  bases. fkit picks one and reports the ambiguity rather than merging them into a
+  virtual base the way git does.
+- **TLS.** Both servers speak plain `ws://`. Terminate TLS in front.
+- **Packfiles.** Every object is its own file: simple to reason about, hard on
+  filesystems at very large object counts.
+- **Cross-repo dedup.** Each repository has its own store, so the same vendored
+  dependency in two repos is stored twice. Sharing one pool needs refcounting
+  and care about private data.
+
+## Tests
+
+```sh
+make test        # cargo test --workspace, then tsc --noEmit for the UI
+```
+
+107 Rust tests, zero clippy warnings. The ones that document the actual ideas:
+
+- `chunker::insertion_only_perturbs_local_chunks` — a 10-byte insert into 4 MB
+  leaves >95% of chunks untouched
+- `chunker::fixed_size_chunking_would_have_failed_the_previous_test` — the
+  contrast case
+- `chunker::chunk_sizes_are_actually_variable` — catches a chunker that has
+  silently degenerated into fixed-size
+- `ingest::small_edit_stores_almost_nothing_new` — a 1-byte edit to 8 MB
+  re-stores under 2%
+- `sync::incremental_sync_transfers_only_the_delta`
+- `sync::a_lying_peer_is_rejected`
+- `ingest::adding_one_file_to_a_large_directory_rewrites_almost_nothing`
+- `proof::a_step_from_a_different_tree_cannot_be_spliced_in`
+- `proof::a_proof_is_small_even_for_a_large_repository`
+- `pack::a_torn_index_entry_is_ignored_not_fatal`
+- `pack::incompressible_objects_are_stored_raw`
+- `gc::young_objects_are_spared_even_when_unreachable`
+- `gc::a_mostly_live_segment_is_left_alone`
+- `merge::a_rebuilt_tree_hashes_the_same_as_an_ingested_one`
+- `diff::reconstruction_holds_for_a_range_of_edits`
+- `workflow::checkout_into_an_empty_directory_writes_everything`
+
+## License
+
+MIT — see [LICENSE](LICENSE).

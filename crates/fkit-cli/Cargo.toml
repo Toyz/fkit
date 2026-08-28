@@ -1,0 +1,16 @@
+[package]
+name = "fkit-cli"
+description = "The fkit command-line client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The crate is `fkit-cli` but the binary users type is just `fkit`.
+[[bin]]
+name = "fkit"
+path = "src/main.rs"
+
+[dependencies]
+fkit-core.workspace = true
+anyhow.workspace = true

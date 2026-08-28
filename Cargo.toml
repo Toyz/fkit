@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/fkit-core",
+    "crates/fkit-cli",
+    "crates/fkit-server",
+    "crates/fkit-hub",
+]
+
+# Pinned once, inherited everywhere. Keeps versions from drifting between
+# crates, which is the main thing that makes a multi-crate repo annoying.
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/Toyz/fkit"
+
+[workspace.dependencies]
+fkit-core = { path = "crates/fkit-core" }
+blake3 = "1"
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

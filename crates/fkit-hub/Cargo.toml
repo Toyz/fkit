@@ -1,0 +1,33 @@
+[package]
+name = "fkit-hub"
+description = "fkit hub: a Postgres-backed forge with auth, permissions, and a web UI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "fkit-hub"
+path = "src/main.rs"
+
+[dependencies]
+fkit-core.workspace = true
+anyhow.workspace = true
+axum = { version = "0.8.9", features = ["ws", "macros"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+tower-http = { version = "0.7.0", features = ["fs", "trace", "compression-gzip", "set-header"] }
+argon2 = { version = "0.6", features = ["password-hash", "alloc", "getrandom"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+uuid = { version = "1.26.0", features = ["v4", "serde"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+thiserror = "2.0.20"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tower = "0.5.3"
+futures = "0.3.34"
+sqlx = { version = "0.9", default-features = false, features = ["chrono", "derive", "json", "macros", "migrate", "postgres", "runtime-tokio", "tls-rustls", "uuid"] }
+getrandom = "0.4"
+blake3.workspace = true
+toml = "1.1.4"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "http2", "rustls"] }

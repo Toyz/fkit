@@ -1,0 +1,115 @@
+# Build and publish the hub image.
+#
+# The binaries are compiled natively on the runner rather than inside the
+# Docker build, so cargo's incremental cache actually applies: a source-only
+# change recompiles the workspace crates and nothing else. Building inside the
+# image would start every run with a target directory holding dependencies and
+# no workspace crates, and Docker's layer cache cannot help with a layer that
+# changes whenever the source does.
+#
+# `Dockerfile.dist` then just copies the artifacts in. The self-contained
+# `Dockerfile` still exists for `make image` and for anyone building from
+# source with one command.
+name: image
+
+on:
+  push:
+    tags: ["v*"]
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ${{ github.repository_owner }}/fkit-hub
+  # Static, so the runtime image needs no libc beyond what Alpine ships.
+  TARGET: x86_64-unknown-linux-musl
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # --- frontend ---------------------------------------------------
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: web
+      - run: npm run build
+        working-directory: web
+
+      # --- binaries ---------------------------------------------------
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      # zstd is a C library built through cc, so the musl target needs a musl
+      # C compiler. Without it the link fails only at the very end of a long
+      # build, which is the worst place to find out.
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.TARGET }}
+          # Share the cache between tag builds and main builds: they compile
+          # the same crates, and a tag push should not start cold.
+          shared-key: image
+
+      - run: cargo build --release --workspace --target ${{ env.TARGET }}
+
+      - name: Assemble the build context
+        run: |
+          set -euo pipefail
+          mkdir -p ctx/bin
+          cp target/${{ env.TARGET }}/release/fkit \
+             target/${{ env.TARGET }}/release/fkitd \
+             target/${{ env.TARGET }}/release/fkit-hub ctx/bin/
+          strip ctx/bin/* || true
+          cp -r web/dist ctx/web
+          cp Dockerfile.dist ctx/
+          # A dynamically linked binary here would run on the runner and fail
+          # in Alpine, so the assumption is checked rather than hoped for.
+          # musl reports "static-pie linked", not "statically linked"; both are
+          # static, and matching only the latter rejects every real build.
+          for b in ctx/bin/*; do
+            file "$b" | grep -qE "static-pie linked|statically linked" \
+              || { echo "$b is not static:"; file "$b"; exit 1; }
+          done
+          ls -lh ctx/bin
+
+      # --- publish ----------------------------------------------------
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          # From the permissions block above; no PAT to manage.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE }}
+          # A tag push publishes that version and moves :latest; a push to main
+          # publishes :main only, so "latest" always means something released.
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: ctx
+          file: ctx/Dockerfile.dist
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

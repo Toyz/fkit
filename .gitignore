@@ -1,0 +1,23 @@
+# Build output
+target/
+web/node_modules/
+web/dist/
+
+# Local data: repositories, object stores, Postgres volumes
+fkit-data/
+fkit-hub-data/
+
+# fkit's own working directory, once this repo is hosted in fkit as well
+.fkit/
+
+# Secrets. Only the .example files are tracked.
+.env
+.env.prod
+!.env.example
+!.env.prod.example
+
+# Local overrides
+fkit-hub.toml
+docker-compose.override.yml
+
+.DS_Store

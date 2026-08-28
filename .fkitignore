@@ -1,0 +1,13 @@
+# Build output — regenerable, and huge.
+target/
+
+# Editor and OS noise
+.DS_Store
+*.swp
+
+# Generated secrets — never committed.
+.env
+
+# Frontend
+node_modules/
+dist/

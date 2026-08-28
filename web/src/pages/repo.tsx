@@ -1,0 +1,1973 @@
+/**
+ * The repository page: file browser, blob view, history, commit diffs, settings.
+ *
+ * This is a single component registered on the catch-all `*` route rather than
+ * one component per view. Two reasons:
+ *
+ *  1. Loom's route patterns match a single segment per `:param` and have no
+ *     splat, but file paths contain slashes. Parsing the path here handles
+ *     `/owner/repo/blob/main/crates/core/src/lib.rs` cleanly.
+ *  2. The repo header, branch picker and tabs stay mounted while you navigate
+ *     between files, so sub-navigation does not refetch repository metadata or
+ *     flash the whole page.
+ */
+import { LoomElement, component, css, styles, reactive, mount, inject } from "@toyz/loom";
+import { route } from "@toyz/loom/router";
+import { base } from "../ui";
+import { settingsLayout } from "../ui-settings";
+import {
+  api,
+  authorName,
+  humanSize,
+  syncUrl,
+  relativeTime,
+  ApiError,
+  type BlobResponse,
+  type Commit,
+  type CommitDetail,
+  type Entry,
+  type Collaborator,
+  type Comparison,
+  type FileDiff,
+  type MergeRequest,
+  type MergeRequestDetail,
+  type LastCommit,
+  type Patch,
+  type Ref,
+  type Repo,
+} from "../api";
+import { linkHandler, go } from "../nav";
+import { renderMarkdown } from "../markdown";
+import { Session } from "../session";
+import { highlight, languageFor, type Tok } from "../highlight";
+import "../components/branch-picker";
+import "../components/clone-button";
+import "../components/fkit-select";
+import "../components/fkit-choice";
+import { adoptInto } from "../adopt";
+import { confirmAction } from "../components/fkit-dialog";
+
+type View =
+  | { kind: "tree"; ref: string; path: string }
+  | { kind: "blob"; ref: string; path: string }
+  | { kind: "commits"; ref: string }
+  | { kind: "commit"; hash: string }
+  | { kind: "compare"; base: string; head: string }
+  | { kind: "merges" }
+  | { kind: "merge"; number: number }
+  | { kind: "settings"; section: string }
+  | { kind: "unknown" };
+
+/** Parse `/owner/repo/<kind>/<ref>/<path…>` out of the current location. */
+function parse(): { owner: string; name: string; view: View } | null {
+  const segs = location.pathname.split("/").filter(Boolean).map(decodeURIComponent);
+  if (segs.length < 2) return null;
+  const [owner, name, kind, ...rest] = segs;
+
+  if (!kind) return { owner, name, view: { kind: "tree", ref: "", path: "" } };
+  if (kind === "settings") {
+    return { owner, name, view: { kind: "settings", section: rest[0] ?? "general" } };
+  }
+  if (kind === "merges") {
+    const n = rest[0] ? Number(rest[0]) : NaN;
+    return {
+      owner,
+      name,
+      view: Number.isFinite(n) ? { kind: "merge", number: n } : { kind: "merges" },
+    };
+  }
+  if (kind === "commit" && rest[0]) return { owner, name, view: { kind: "commit", hash: rest[0] } };
+  if (kind === "commits") return { owner, name, view: { kind: "commits", ref: rest[0] ?? "" } };
+  if (kind === "compare") {
+    // GitHub's spelling: /compare/base...head. Falling back to an empty head
+    // lets /compare/<base> mean "pick something to compare against".
+    const spec = rest.join("/");
+    const [b, h] = spec.includes("...") ? spec.split("...") : [spec, ""];
+    return { owner, name, view: { kind: "compare", base: b ?? "", head: h ?? "" } };
+  }
+  if (kind === "tree" || kind === "blob") {
+    const [ref, ...path] = rest;
+    return { owner, name, view: { kind, ref: ref ?? "", path: path.join("/") } };
+  }
+  return { owner, name, view: { kind: "unknown" } };
+}
+
+/**
+ * Code rows, adopted into `<loom-virtual>`'s shadow root as well as used by the
+ * non-virtualized path, so one set of rules covers both.
+ *
+ * The gutter is `position: sticky; left: 0` — scroll a long line sideways and
+ * the line numbers stay put instead of sliding away, which is the difference
+ * between a code viewer and a `<pre>` in a box.
+ */
+const codeSheet = css`
+  .cl { display: flex; font-size: 12px; line-height: 19px; min-height: 19px; }
+  .cl:hover { background: var(--raised); }
+  .cl:hover .ln { color: var(--muted); }
+  .ln {
+    flex: none;
+    position: sticky; left: 0; z-index: 1;
+    text-align: right;
+    padding-right: 14px;
+    color: var(--gutter-fg);
+    background: var(--gutter-bg);
+    user-select: none;
+    font-variant-numeric: tabular-nums;
+    font-size: 11px;
+  }
+  .src { white-space: pre; padding: 0 16px 0 14px; }
+
+  .cm { color: var(--tok-comment); font-style: italic; }
+  .st { color: var(--tok-string); }
+  .nu { color: var(--tok-number); }
+  .kw { color: var(--tok-keyword); }
+  .ty { color: var(--tok-type); }
+  .fn { color: var(--tok-fn); }
+  .pu { color: var(--tok-punct); }
+`;
+
+const commitSheet = css`
+  .c {
+    display: grid; grid-template-columns: minmax(0, 1fr) auto auto;
+    gap: 12px; align-items: center; padding: 0 12px; height: 34px;
+    border-bottom: 1px solid var(--border);
+  }
+  .c:hover { background: var(--raised); }
+  .m { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+       text-decoration: none; }
+  .m:hover { color: var(--accent); }
+  .by { color: var(--muted); font-size: 11px; }
+  .sha { color: var(--accent); font-size: 12px; text-decoration: none; }
+`;
+
+const sheet = css`
+  /* Header reads like a path, because that is what it is. */
+  .head { border-bottom: 1px solid var(--border); margin-bottom: 12px; }
+  .title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding-bottom: 8px; }
+  .title .ic { color: var(--faint); display: flex; }
+  .title .p { font-size: 15px; font-weight: 600; }
+  .title .p .own { color: var(--muted); font-weight: 400; }
+  .desc { font-family: var(--sans); color: var(--muted); font-size: 12px; margin: -4px 0 8px; }
+
+  .tabs { display: flex; gap: 2px; }
+  .tabs a {
+    display: flex; align-items: center; gap: 6px;
+    padding: 5px 10px; color: var(--muted); font-size: 12px;
+    border-bottom: 2px solid transparent; margin-bottom: -1px;
+  }
+  .tabs a loom-icon { opacity: .7; }
+  .tabs a.on loom-icon { opacity: 1; color: var(--accent); }
+  .tabs a:hover { color: var(--text); text-decoration: none; }
+  .tabs a.on { color: var(--text); border-bottom-color: var(--accent); }
+
+  .toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+  select.branch { width: auto; font-size: 12px; padding: 3px 6px; }
+  .crumbs { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; font-size: 13px; }
+  .crumbs .sep { color: var(--faint); }
+  .crumbs .cur { font-weight: 600; }
+
+  /* ---- file rows: fixed height, aligned size column ---- */
+  /* name | last commit | when | size — the commit column is the widest thing
+     that is still optional, so it gets the flexible track and truncates. */
+  .files .r {
+    display: grid;
+    grid-template-columns: 15px minmax(8rem, 22rem) minmax(0, 1fr) auto auto;
+    align-items: center; gap: 12px;
+    height: var(--row); padding: 0 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  .files .msg {
+    color: var(--muted); font-size: 12px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    text-decoration: none;
+  }
+  .files a.msg:hover { color: var(--accent); }
+  .files .when { color: var(--faint); font-size: 11px; white-space: nowrap; }
+  @media (max-width: 900px) {
+    .files .r { grid-template-columns: 15px minmax(0, 1fr) auto; }
+    .files .msg, .files .when { display: none; }
+  }
+  .files .r:last-child { border-bottom: 0; }
+  .files .r:hover { background: var(--raised); }
+  .files .ic { color: var(--faint); display: flex; }
+  .files .ic.d { color: var(--accent); }
+  .files a { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .files a:hover { color: var(--accent); }
+  .files .sz { color: var(--faint); font-size: 11px; font-variant-numeric: tabular-nums; }
+
+  /* ---- blob ----
+     Row rules live in codeSheet so the plain and virtualized paths share them. */
+  .code { overflow-x: auto; }
+
+  /* The virtual list scrolls inside itself, so give it a real height. */
+  .vcode { display: block; height: calc(100vh - 230px); min-height: 320px; }
+  .vlist { display: block; height: calc(100vh - 210px); min-height: 320px; }
+
+  /* ---- commits ---- (rules in commitSheet, shared with the virtual path) */
+  .commits .c:last-child { border-bottom: 0; }
+
+  /* ---- diff ---- */
+  .ch {
+    display: grid; grid-template-columns: 12px minmax(0, 1fr) auto;
+    gap: 10px; align-items: center; height: var(--row); padding: 0 12px;
+    border-bottom: 1px solid var(--border); font-size: 12px;
+  }
+  .ch:last-child { border-bottom: 0; }
+  .st { font-weight: 700; text-align: center; }
+  .st.added { color: var(--added); }
+  .st.removed { color: var(--removed); }
+  .st.modified { color: var(--modified); }
+  .st.typechanged { color: var(--muted); }
+  .delta { color: var(--faint); font-size: 11px; font-variant-numeric: tabular-nums; }
+
+  /* ---- collaborators ---- */
+  .collab-add { display: flex; gap: 8px; align-items: center; }
+  .collab-add input { flex: 1; }
+  .ok { color: var(--added); font-size: 12px; }
+  .sec .panel { margin-top: 12px; }
+  .sec > h1 + .lead + .panel, .sec > h1 + .panel { margin-top: 12px; }
+  form.stack { display: flex; flex-direction: column; gap: 13px; }
+  .fd {
+    color: var(--muted); font-size: 11.5px; font-family: var(--sans);
+    margin-top: 4px; line-height: 1.45;
+  }
+  .collab-note {
+    color: var(--muted); font-size: 11.5px; font-family: var(--sans);
+    margin-top: 9px; line-height: 1.5;
+  }
+  .collab {
+    display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto;
+    align-items: center; gap: 12px;
+    padding: 0 14px; height: var(--row); border-top: 1px solid var(--border);
+  }
+  .collab .cu { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .collab-empty, .loading {
+    padding: 12px 14px; color: var(--muted); font-size: 12px;
+    border-top: 1px solid var(--border); font-family: var(--sans);
+  }
+
+  /* ---- setup instructions ---- */
+  /* A centred column: the panel is full width but the instructions are a
+     reading measure, and left-anchoring them left a dead half-screen. */
+  .setup { display: flex; flex-direction: column; gap: 15px; max-width: 620px; margin: 0 auto; }
+  .setup-block { display: flex; flex-direction: column; gap: 5px; }
+  /* Label and copy button share a baseline above the block, so the button is
+     where the eye already is rather than floating over the code. */
+  .setup-label {
+    display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+    font-size: 11px; text-transform: uppercase; letter-spacing: .07em; color: var(--muted);
+  }
+  .setup-label button { font-size: 11px; text-transform: none; letter-spacing: 0; }
+  .cmd-block {
+    margin: 0; padding: 9px 12px; overflow-x: auto;
+    background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
+    font-family: var(--mono); font-size: 12px; line-height: 1.7; color: var(--text);
+    white-space: pre;
+  }
+  .cmd-block.url { color: var(--accent); }
+  .setup-note {
+    display: flex; align-items: flex-start; gap: 8px;
+    color: var(--muted); font-size: 12px; font-family: var(--sans); line-height: 1.5;
+    padding-top: 3px;
+  }
+  .setup-note loom-icon { flex: none; margin-top: 3px; }
+  .setup-note code { font-family: var(--mono); font-size: 11px; }
+
+  /* ---- commit header ----
+     One block. The summary is the only large type; author, age and hash sit on
+     a single quiet line beneath it rather than in a second bordered box. */
+  .chead {
+    border: 1px solid var(--border); border-radius: var(--radius);
+    background: var(--surface); padding: 13px 15px; margin-bottom: 12px;
+  }
+  .chead-top { display: flex; align-items: flex-start; gap: 12px; }
+  .csummary { font-size: 14px; font-weight: 600; flex: 1; line-height: 1.4; }
+  .cbody {
+    margin: 9px 0 0; white-space: pre-wrap; color: var(--muted);
+    font-size: 12px; line-height: 1.55;
+  }
+  .cmeta {
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    margin-top: 11px; padding-top: 10px; border-top: 1px solid var(--border);
+    color: var(--faint); font-size: 11px;
+  }
+  .cmeta .who { color: var(--muted); }
+  .cmeta .hash { color: var(--muted); }
+  .cmeta .parent a { font-size: 11px; }
+
+  /* ---- compare ---- */
+  .cmp-bar {
+    display: flex; align-items: center; gap: 9px; flex-wrap: wrap;
+    padding: 9px 12px; margin-bottom: 12px;
+    border: 1px solid var(--border); border-radius: var(--radius);
+    background: var(--surface); font-size: 12px;
+  }
+
+  /* The verdict is the whole point of the page, so it gets the only coloured
+     rail on the screen and sits above everything else. */
+  .verdict {
+    display: flex; align-items: flex-start; gap: 11px;
+    padding: 12px 14px; margin-bottom: 12px;
+    border: 1px solid var(--border); border-left-width: 2px;
+    border-radius: var(--radius); background: var(--surface);
+  }
+  .verdict.ok  { border-left-color: var(--added); }
+  .verdict.bad { border-left-color: var(--removed); }
+  .verdict .vmark { display: flex; margin-top: 1px; }
+  .verdict.ok  .vmark { color: var(--added); }
+  .verdict.bad .vmark { color: var(--removed); }
+  .vtitle { font-size: 13px; font-weight: 600; }
+  .vsub { color: var(--muted); font-size: 11px; margin-top: 3px; }
+  .howto {
+    font-size: 11px; color: var(--muted); background: var(--bg);
+    border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 4px 8px; white-space: nowrap;
+  }
+
+  /* ---- merge requests ---- */
+  .mrow {
+    display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto;
+    align-items: center; gap: 12px;
+    padding: 0 12px; height: 34px; border-bottom: 1px solid var(--border);
+  }
+  .mrow:last-child { border-bottom: 0; }
+  .mrow:hover { background: var(--raised); }
+  .mtitle {
+    color: var(--text); text-decoration: none;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .mtitle:hover { color: var(--accent); }
+  .num { color: var(--faint); }
+  .mbr { color: var(--muted); font-size: 11px; white-space: nowrap; }
+
+  /* State is the first thing scanned in a list of requests, so it gets a solid
+     chip rather than the hairline tag used elsewhere. */
+  .mstate {
+    font-size: 10px; text-transform: uppercase; letter-spacing: .07em;
+    padding: 2px 7px; border-radius: 2px; white-space: nowrap;
+    border: 1px solid transparent;
+  }
+  .mstate.open   { color: var(--added);    border-color: var(--added); }
+  .mstate.merged { color: var(--bg);       background: var(--accent); border-color: var(--accent); }
+  .mstate.closed { color: var(--muted);    border-color: var(--border-hi); }
+
+  /* ---- patch ----
+     Two gutters, old line and new line, because a single number cannot tell you
+     where a line sits on both sides. Added and removed rows are tinted rather
+     than only marked with a sigil: the eye finds a colour band down the page
+     faster than it finds a column of + and -. */
+  .patch-bar {
+    display: flex; align-items: center; gap: 12px;
+    padding: 7px 12px; margin-bottom: 10px;
+    border: 1px solid var(--border); border-radius: var(--radius);
+    background: var(--surface); font-size: 12px; color: var(--muted);
+  }
+  .plus  { color: var(--added); }
+  .minus { color: var(--removed); }
+
+  /* One file's diff. Named .df, not .fd — the shared settings sheet uses .fd
+     for a field description, and the later sheet wins, which put a bordered
+     surface around every line of help text on the settings tabs. */
+  .df {
+    border: 1px solid var(--border); border-radius: var(--radius);
+    background: var(--surface); margin-bottom: 10px; overflow: hidden;
+  }
+  .df-head {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 10px; background: var(--raised);
+    border-bottom: 1px solid var(--border); font-size: 12px;
+  }
+  .df-toggle { padding: 2px 4px; }
+  .df-toggle loom-icon { transition: transform .12s; display: block; }
+  .df-path { color: var(--text); text-decoration: none; overflow: hidden;
+             text-overflow: ellipsis; white-space: nowrap; }
+  a.df-path:hover { color: var(--accent); }
+  .df-head .counts { margin-left: auto; display: flex; gap: 8px; font-variant-numeric: tabular-nums; }
+  .df-note { padding: 10px 12px; color: var(--muted); font-size: 12px; font-family: var(--sans); }
+  .df-body { overflow-x: auto; }
+
+  .hh {
+    padding: 3px 12px; color: var(--faint); font-size: 11px;
+    background: var(--gutter-bg); border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+  }
+  .df-body > div:first-child .hh { border-top: 0; }
+
+  .dl { display: flex; font-size: 12px; line-height: 19px; min-height: 19px; }
+  .dl .no {
+    flex: none; width: 3.5rem; text-align: right; padding-right: 10px;
+    color: var(--gutter-fg); background: var(--gutter-bg);
+    user-select: none; font-variant-numeric: tabular-nums; font-size: 11px;
+  }
+  .dl .mk { flex: none; width: 1.6ch; text-align: center; user-select: none; color: var(--faint); }
+  .dl .dsrc { white-space: pre; padding-right: 16px; }
+
+  .dl.ins { background: color-mix(in srgb, var(--added) 13%, transparent); }
+  .dl.ins .mk { color: var(--added); }
+  .dl.del { background: color-mix(in srgb, var(--removed) 13%, transparent); }
+  .dl.del .mk { color: var(--removed); }
+  .dl:hover { filter: brightness(1.18); }
+
+  .cmsg .panel-body h2 { font-size: 13px; margin-bottom: 6px; }
+  .cmsg pre {
+    margin: 0 0 10px; white-space: pre-wrap; color: var(--muted); font-size: 12px;
+  }
+  .cmeta { color: var(--faint); font-size: 11px; display: flex; gap: 14px; flex-wrap: wrap; }
+
+  /* ---- readme: the one place prose typography takes over ---- */
+  .md { padding: 20px 24px; overflow-x: auto; font-family: var(--sans); font-size: 14px; line-height: 1.65; max-width: 900px; }
+  .md h1, .md h2 { border-bottom: 1px solid var(--border); padding-bottom: .25em; margin: 1.4em 0 .6em; }
+  .md h1:first-child { margin-top: 0; }
+  .md h3, .md h4 { margin: 1.3em 0 .4em; }
+  .md p { margin: 0 0 .9em; }
+  .md code { font-family: var(--mono); font-size: .85em; background: var(--raised); padding: .1em .35em; border-radius: 2px; }
+  .md pre { background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 11px 13px; overflow-x: auto; }
+  .md pre code { background: none; padding: 0; font-size: 12px; }
+  .md table { border-collapse: collapse; margin: 0 0 1em; font-size: 13px; }
+  .md th, .md td { border: 1px solid var(--border); padding: 5px 11px; text-align: left; }
+  .md th { background: var(--raised); }
+  .md blockquote { margin: 0 0 1em; padding: .1em 1em; border-left: 2px solid var(--border-hi); color: var(--muted); }
+  .md hr { border: 0; border-top: 1px solid var(--border); margin: 1.6em 0; }
+  .md img { max-width: 100%; }
+  .md ul, .md ol { padding-left: 1.5em; margin: 0 0 .9em; }
+  .md a { color: var(--accent); }
+
+  /* ---- settings ---- */
+  .settings { max-width: 620px; }
+  .danger { border-color: color-mix(in srgb, var(--removed) 35%, transparent); }
+  .cmd {
+    background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 7px 10px; font-size: 12px; overflow-x: auto; white-space: nowrap; color: var(--muted);
+  }
+  .cmd b { color: var(--text); font-weight: 400; }
+`;
+
+@route("*")
+@component("page-repo")
+@styles(base, settingsLayout, sheet, codeSheet, commitSheet)
+export class PageRepo extends LoomElement {
+  @inject("session") accessor session!: Session;
+  @reactive accessor repo: Repo | null = null;
+  @reactive accessor refs: Ref[] = [];
+  @reactive accessor error = "";
+  @reactive accessor notFound = false;
+
+  @reactive accessor entries: Entry[] | null = null;
+  @reactive accessor blob: BlobResponse | null = null;
+  @reactive accessor commits: Commit[] | null = null;
+  @reactive accessor detail: CommitDetail | null = null;
+  @reactive accessor readme: { name: string; content: string } | null = null;
+  /** Filled in after the tree renders, so the listing is never blocked on it. */
+  @reactive accessor lastCommits: Record<string, LastCommit> | null = null;
+  @reactive accessor copied = false;
+  /// Which setup block was most recently copied.
+  @reactive accessor copiedKey = "";
+  @reactive accessor patch: Patch | null = null;
+  @reactive accessor comparison: Comparison | null = null;
+  @reactive accessor merges: MergeRequest[] | null = null;
+  @reactive accessor mergeState: "open" | "merged" | "closed" | "all" = "open";
+  @reactive accessor mr: MergeRequestDetail | null = null;
+  @reactive accessor busy = false;
+  @reactive accessor collaborators: Collaborator[] | null = null;
+  @reactive accessor newRole = "write";
+  /// Transient "saved" confirmation on settings forms.
+  @reactive accessor notice = "";
+  /** Paths the reader has collapsed. */
+  @reactive accessor collapsed: Record<string, boolean> = {};
+
+  private loc = parse();
+
+  @mount
+  init() {
+    void this.reload();
+    const onNav = () => {
+      const next = parse();
+      const changedRepo =
+        !this.loc || !next || next.owner !== this.loc.owner || next.name !== this.loc.name;
+      this.loc = next;
+      void this.reload(changedRepo);
+    };
+    window.addEventListener("popstate", onNav);
+    return () => window.removeEventListener("popstate", onNav);
+  }
+
+  /** Fetch repo metadata (only when the repo changed) plus the current view. */
+  private async reload(refetchRepo = true) {
+    const at = this.loc;
+    if (!at) {
+      this.notFound = true;
+      return;
+    }
+    this.error = "";
+
+    try {
+      if (refetchRepo || !this.repo) {
+        this.repo = null;
+        this.repo = await api.repo(at.owner, at.name);
+        this.refs = await api.refs(at.owner, at.name);
+      }
+    } catch (e) {
+      this.notFound = e instanceof ApiError && e.status === 404;
+      this.error = this.notFound ? "" : (e as Error).message;
+      return;
+    }
+
+    await this.loadView();
+  }
+
+  private ref(): string {
+    const v = this.loc?.view;
+    const explicit = v && "ref" in v ? v.ref : "";
+    return explicit || this.repo?.default_branch || "main";
+  }
+
+  private async loadView() {
+    const at = this.loc;
+    if (!at || !this.repo) return;
+    const { owner, name } = at;
+    const v = at.view;
+
+    this.entries = null;
+    this.blob = null;
+    this.commits = null;
+    this.detail = null;
+    this.readme = null;
+    this.lastCommits = null;
+    this.copied = false;
+    this.copiedKey = "";
+    this.patch = null;
+    this.comparison = null;
+    this.merges = null;
+    this.mr = null;
+    this.collaborators = null;
+    this.notice = "";
+    this.busy = false;
+    this.collapsed = {};
+
+    // A repository with no commits has no refs to browse.
+    if (this.refs.length === 0 && v.kind !== "settings") return;
+
+    try {
+      if (v.kind === "tree") {
+        const t = await api.tree(owner, name, this.ref(), v.path);
+        this.entries = t.entries;
+
+        // Deliberately not awaited together with the listing: walking history
+        // for the commit column is the slow part, and the file names should be
+        // on screen immediately with the column filling in behind them.
+        void api
+          .lastCommits(owner, name, this.ref(), v.path)
+          .then((m) => {
+            if (this.loc?.view.kind === "tree" && this.loc.view.path === v.path) {
+              this.lastCommits = m;
+            }
+          })
+          .catch(() => {});
+
+        if (!v.path) this.readme = await api.readme(owner, name, this.ref());
+      } else if (v.kind === "blob") {
+        this.blob = await api.blob(owner, name, this.ref(), v.path);
+      } else if (v.kind === "commits") {
+        this.commits = await api.commits(owner, name, this.ref(), 100);
+      } else if (v.kind === "compare") {
+        const base = v.base || this.repo.default_branch;
+        const head = v.head || this.repo.default_branch;
+        this.comparison = await api.compare(owner, name, base, head);
+      } else if (v.kind === "settings") {
+        // Only an admin can read the collaborator list; a failure here is a
+        // permissions answer, not an error worth showing.
+        this.collaborators = await api.collaborators(owner, name).catch(() => []);
+      } else if (v.kind === "merges") {
+        this.merges = await api.merges(owner, name, this.mergeState);
+      } else if (v.kind === "merge") {
+        this.mr = await api.mergeRequest(owner, name, v.number);
+      } else if (v.kind === "commit") {
+        this.detail = await api.commit(owner, name, v.hash);
+        // The summary renders immediately; the line diff can take real work on
+        // a large commit, so it arrives separately.
+        void api
+          .patch(owner, name, v.hash)
+          .then((pp) => {
+            if (this.loc?.view.kind === "commit" && this.loc.view.hash === v.hash) {
+              this.patch = pp;
+            }
+          })
+          .catch(() => {});
+      }
+    } catch (e) {
+      this.error = (e as Error).message;
+    }
+  }
+
+  private switchRef(ref: string) {
+    const at = this.loc!;
+    const v = at.view;
+    const path = v.kind === "tree" || v.kind === "blob" ? v.path : "";
+    const kind = v.kind === "blob" ? "blob" : v.kind === "commits" ? "commits" : "tree";
+    go(`/${at.owner}/${at.name}/${kind}/${ref}${path ? "/" + path : ""}`);
+  }
+
+  // ---- rendering -------------------------------------------------------
+
+  private renderCrumbs(path: string) {
+    const at = this.loc!;
+    const r = this.ref();
+    const parts = path.split("/").filter(Boolean);
+    const rootHref = `/${at.owner}/${at.name}/tree/${r}`;
+    return (
+      <div class="crumbs">
+        <a href={rootHref} onClick={linkHandler(rootHref)}>{at.name}</a>
+        {parts.map((p, i) => {
+          const sub = parts.slice(0, i + 1).join("/");
+          const last = i === parts.length - 1;
+          const kind = last && this.loc!.view.kind === "blob" ? "blob" : "tree";
+          const href = `/${at.owner}/${at.name}/${kind}/${r}/${sub}`;
+          return (
+            <>
+              <span class="sep">/</span>
+              {last ? (
+                <strong>{p}</strong>
+              ) : (
+                <a href={href} onClick={linkHandler(href)}>{p}</a>
+              )}
+            </>
+          );
+        })}
+      </div>
+    );
+  }
+
+  private renderTree(path: string) {
+    const at = this.loc!;
+    const r = this.ref();
+    const rows: unknown[] = [];
+
+    if (path) {
+      const up = path.split("/").slice(0, -1).join("/");
+      const href = `/${at.owner}/${at.name}/tree/${r}${up ? "/" + up : ""}`;
+      rows.push(
+        <div class="r">
+          <span class="ic d"><loom-icon name="up" size={13}></loom-icon></span>
+          <a class="fn" href={href} onClick={linkHandler(href)}>..</a>
+          <span></span>
+          <span></span>
+          <span></span>
+        </div>,
+      );
+    }
+
+    for (const e of this.entries ?? []) {
+      const kind = e.kind === "dir" ? "tree" : "blob";
+      const href = `/${at.owner}/${at.name}/${kind}/${r}/${e.path}`;
+      const lc = this.lastCommits?.[e.name];
+      const chref = lc ? `/${at.owner}/${at.name}/commit/${lc.hash}` : "";
+      rows.push(
+        <div class="r">
+          <span class={`ic ${e.kind === "dir" ? "d" : ""}`}>
+            <loom-icon
+              name={e.kind === "dir" ? "folder" : e.kind === "symlink" ? "link" : "file"}
+              size={13}
+            ></loom-icon>
+          </span>
+          <a class="fn" href={href} onClick={linkHandler(href)}>
+            {e.name}
+            {e.kind === "exec" ? <span class="tag" style="margin-left:7px">exec</span> : null}
+          </a>
+          {lc ? (
+            <a class="msg" href={chref} onClick={linkHandler(chref)} title={lc.summary}>
+              {lc.summary || "(no message)"}
+            </a>
+          ) : (
+            <span class="msg"><span class="sk" style="width:min(80%,180px)"></span></span>
+          )}
+          <span class="when">
+            {lc ? relativeTime(lc.timestamp) : <span class="sk" style="width:52px"></span>}
+          </span>
+          <span class="sz">{e.kind === "dir" ? "" : humanSize(e.size)}</span>
+        </div>,
+      );
+    }
+    return <div class="panel files">{rows}</div>;
+  }
+
+  /** Above this many lines, the file is virtualized instead of fully rendered. */
+  private static readonly VIRTUALIZE_OVER = 400;
+
+  private renderBlob() {
+    const b = this.blob!;
+    const at = this.loc!;
+    const rawHref = api.rawUrl(at.owner, at.name, this.ref(), b.path);
+    const head = (
+      <div class="panel-head">
+        <span class="val">
+            {b.binary ? "binary" : `${b.lines} ${b.lines === 1 ? "line" : "lines"}`} ·{" "}
+            {humanSize(b.size)}
+          </span>
+        <span class="row">
+          <span class="faint val">{b.hash.slice(0, 12)}</span>
+          {b.content !== null ? (
+            <button class="bare val" onClick={() => void this.copyBlob(b.content ?? "")}>
+              <loom-icon name={this.copied ? "check" : "copy"} size={12}></loom-icon>
+              {this.copied ? "copied" : "copy"}
+            </button>
+          ) : null}
+          {/* A real link, so middle-click and "save as" behave. The server
+              forces text/plain + nosniff, so pushed HTML cannot execute here. */}
+          <a class="btn bare val" href={rawHref} target="_blank" rel="noopener noreferrer">
+            <loom-icon name="external" size={12}></loom-icon> raw
+          </a>
+        </span>
+      </div>
+    );
+
+    if (b.truncated) {
+      return <div class="panel">{head}<div class="empty">file is too large to display</div></div>;
+    }
+    if (b.binary) {
+      return <div class="panel">{head}<div class="empty">binary file not shown</div></div>;
+    }
+
+    const lang = languageFor(b.path);
+    const lines = highlight(b.content ?? "", lang);
+    // The gutter is sized from the widest line number so the code column never
+    // shifts as you scroll — the usual giveaway of a naively virtualized list.
+    const gutter = `${String(lines.length).length}ch`;
+
+    const row = (toks: Tok[], i: number) => (
+      <div class="cl">
+        <span class="ln" style={`width:calc(${gutter} + 26px)`}>{i + 1}</span>
+        <span class="src">
+          {toks.length === 0 ? " " : toks.map((t) => <span class={t.c}>{t.t}</span>)}
+        </span>
+      </div>
+    );
+
+    // A 40 000-line file is 40 000 DOM nodes rendered eagerly. Past a few
+    // hundred lines the virtual list keeps it to whatever fits on screen.
+    if (lines.length > PageRepo.VIRTUALIZE_OVER) {
+      const v = (
+        <loom-virtual class="vcode" items={lines} estimatedHeight={19} overscan={12}>
+          {row}
+        </loom-virtual>
+      ) as unknown as HTMLElement & { pinToBottom: boolean };
+      // `pinToBottom` defaults to true (it is built for chat logs) and JSX turns
+      // a `false` boolean into `removeAttribute`, which cannot clear it. Setting
+      // the property directly is what actually opens the file at the top.
+      v.pinToBottom = false;
+      adoptInto(v, codeSheet);
+      return <div class="panel">{head}{v}</div>;
+    }
+
+    return (
+      <div class="panel">
+        {head}
+        <div class="code">{lines.map(row)}</div>
+      </div>
+    );
+  }
+
+  private async copyBlob(text: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      this.copied = true;
+      setTimeout(() => (this.copied = false), 1400);
+    } catch {
+      this.error = "could not copy — the browser refused clipboard access";
+    }
+  }
+
+  private renderCommits() {
+    const at = this.loc!;
+    const list = this.commits ?? [];
+
+    const row = (c: Commit) => {
+      const href = `/${at.owner}/${at.name}/commit/${c.hash}`;
+      return (
+        <div class="c">
+          <a class="m" href={href} onClick={linkHandler(href)}>
+            {c.summary || "(no message)"}
+          </a>
+          <span class="by">{authorName(c.author)} · {relativeTime(c.timestamp)}</span>
+          <a class="sha" href={href} onClick={linkHandler(href)}>{c.short}</a>
+        </div>
+      );
+    };
+
+    if (list.length > 200) {
+      const v = (
+        <loom-virtual class="vlist" items={list} estimatedHeight={34} overscan={8}>
+          {row}
+        </loom-virtual>
+      ) as unknown as HTMLElement & { pinToBottom: boolean };
+      v.pinToBottom = false;
+      adoptInto(v, commitSheet);
+      return <div class="panel commits">{v}</div>;
+    }
+    return <div class="panel commits">{list.map(row)}</div>;
+  }
+
+  private renderCommitDetail() {
+    const d = this.detail!;
+    const at = this.loc!;
+    const body = d.message.split("\n").slice(1).join("\n").trim();
+    const browse = `/${at.owner}/${at.name}/tree/${d.hash}`;
+
+    return (
+      <div>
+        {/* One block, not two stacked boxes: the message is the headline, the
+            metadata is a quiet line under it, and the actions sit on the
+            baseline of the headline where the eye already is. */}
+        <div class="chead">
+          <div class="chead-top">
+            <h2 class="csummary">{d.summary || "(no message)"}</h2>
+            <a class="btn" href={browse} onClick={linkHandler(browse)}>
+              <loom-icon name="folder" size={12}></loom-icon> browse files
+            </a>
+          </div>
+          {body ? <pre class="cbody">{body}</pre> : null}
+          <div class="cmeta">
+            <span class="who">{authorName(d.author)}</span>
+            <span>{relativeTime(d.timestamp)}</span>
+            <span class="hash">{d.short}</span>
+            {d.parents.length > 1 ? <span class="tag on">merge</span> : null}
+            {d.parents.map((pp, i) => {
+              const href = `/${at.owner}/${at.name}/commit/${pp}`;
+              return (
+                <span class="parent">
+                  {d.parents.length > 1 ? `parent ${i + 1}` : "parent"}{" "}
+                  <a href={href} onClick={linkHandler(href)}>{pp.slice(0, 10)}</a>
+                </span>
+              );
+            })}
+          </div>
+        </div>
+        {this.renderPatch(d)}
+      </div>
+    );
+  }
+
+  /** One file's diff: a header strip, then its hunks. */
+  private renderFileDiff(f: FileDiff, atRef?: string) {
+    const at = this.loc!;
+    const isOpen = !this.collapsed[f.path];
+    const lang = languageFor(f.path);
+    const ref = atRef ?? this.detail?.hash ?? this.ref();
+    const href = `/${at.owner}/${at.name}/blob/${ref}/${f.path}`;
+
+    return (
+      <div class="df">
+        <div class="df-head">
+          <button
+            class="bare fd-toggle"
+            onClick={() =>
+              (this.collapsed = { ...this.collapsed, [f.path]: isOpen })
+            }
+            title={isOpen ? "collapse" : "expand"}
+          >
+            <loom-icon
+              name="chevron"
+              size={12}
+              style={isOpen ? "" : "transform:rotate(-90deg)"}
+            ></loom-icon>
+          </button>
+          <span class={`st ${f.status}`}>
+            {f.status === "added" ? "+" : f.status === "removed" ? "−" : f.status === "modified" ? "~" : "t"}
+          </span>
+          {f.status === "removed" ? (
+            <span class="df-path muted">{f.path}</span>
+          ) : (
+            <a class="df-path" href={href} onClick={linkHandler(href)}>{f.path}</a>
+          )}
+          <span class="counts">
+            {f.added > 0 ? <span class="plus">+{f.added}</span> : null}
+            {f.removed > 0 ? <span class="minus">{`−${f.removed}`}</span> : null}
+          </span>
+        </div>
+
+        {!isOpen ? null : f.too_large ? (
+          <div class="df-note">file is too large to diff ({humanSize(Math.max(f.old_size, f.new_size))})</div>
+        ) : f.binary ? (
+          <div class="df-note">binary file</div>
+        ) : f.only_line_endings ? (
+          <div class="df-note">line endings changed only</div>
+        ) : f.hunks.length === 0 ? (
+          <div class="df-note">no line changes</div>
+        ) : (
+          <div class="df-body">
+            {f.truncated ? (
+              <div class="df-note">
+                the two versions differ too much for a line diff — shown as a full replacement
+              </div>
+            ) : null}
+            {f.hunks.map((h) => (
+              <div>
+                <div class="hh">{h.header}</div>
+                {h.lines.map((l) => {
+                  const cls = l.op === "+" ? "ins" : l.op === "-" ? "del" : "eq";
+                  // Highlighting is per line here: a hunk is a fragment, so
+                  // multi-line constructs have no context to carry anyway.
+                  const toks = highlight(l.text, lang)[0] ?? [];
+                  return (
+                    <div class={`dl ${cls}`}>
+                      <span class="no">{l.old_no ?? ""}</span>
+                      <span class="no">{l.new_no ?? ""}</span>
+                      <span class="mk">{l.op}</span>
+                      <span class="dsrc">
+                        {toks.length === 0 ? " " : toks.map((t) => <span class={t.c}>{t.t}</span>)}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  private renderPatch(d: CommitDetail) {
+    if (d.changes.length === 0) {
+      return <div class="panel"><div class="empty">no changes</div></div>;
+    }
+
+    // Until the patch lands, show the path list we already have — it is the
+    // same information the summary carried, so nothing regresses while loading.
+    if (!this.patch) {
+      return (
+        <div class="panel">
+          {d.changes.map((c) => (
+            <div class="ch">
+              <span class={`st ${c.status}`}>
+                {c.status === "added" ? "+" : c.status === "removed" ? "−" : c.status === "modified" ? "~" : "t"}
+              </span>
+              <span>{c.path}</span>
+              <span class="sk" style="width:70px"></span>
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    const total = this.patch.files.reduce(
+      (acc, f) => ({ a: acc.a + f.added, r: acc.r + f.removed }),
+      { a: 0, r: 0 },
+    );
+
+    return (
+      <div>
+        <div class="patch-bar">
+          <span>{this.patch.files.length} file(s) changed</span>
+          <span class="plus">+{total.a}</span>
+          <span class="minus">{`−${total.r}`}</span>
+          {this.patch.truncated ? (
+            <span class="muted">
+              showing the first {this.patch.files.length} of {d.changes.length}
+            </span>
+          ) : null}
+        </div>
+        {this.patch.files.map((f) => this.renderFileDiff(f))}
+      </div>
+    );
+  }
+
+  private renderReadme() {
+    if (!this.readme) return null;
+    // The renderer escapes everything before generating markup, so `rawHTML`
+    // here is safe for untrusted README content.
+    return (
+      <div class="panel" style="margin-top:12px">
+        <div class="panel-head"><span>{this.readme.name}</span></div>
+        <div class="md" rawHTML={renderMarkdown(this.readme.content)}></div>
+      </div>
+    );
+  }
+
+  private renderCompare() {
+    const at = this.loc!;
+    const v = at.view as Extract<View, { kind: "compare" }>;
+    const c = this.comparison;
+
+    const swap = () => go(`/${at.owner}/${at.name}/compare/${v.head}...${v.base}`);
+    const pick = (which: "base" | "head") => (e: Event) => {
+      const value = (e as CustomEvent<string>).detail;
+      const base = which === "base" ? value : v.base;
+      const head = which === "head" ? value : v.head;
+      go(`/${at.owner}/${at.name}/compare/${base}...${head}`);
+    };
+
+    return (
+      <div>
+        <div class="cmp-bar">
+          <span class="muted">merge</span>
+          <branch-picker refs={this.refs} current={v.head} onPick={pick("head")}></branch-picker>
+          <span class="muted">into</span>
+          <branch-picker refs={this.refs} current={v.base} onPick={pick("base")}></branch-picker>
+          <button class="bare" onClick={swap} title="swap sides">swap</button>
+        </div>
+
+        {!c ? (
+          <div class="panel"><div class="loading">comparing</div></div>
+        ) : (
+          <div>
+            <div class={`verdict ${c.up_to_date ? "ok" : c.mergeable ? "ok" : "bad"}`}>
+              <span class="vmark">
+                <loom-icon name={c.mergeable && !c.up_to_date ? "check" : c.up_to_date ? "check" : "commit"} size={14}></loom-icon>
+              </span>
+              <div class="grow">
+                <div class="vtitle">
+                  {c.up_to_date
+                    ? `${v.base} already contains everything in ${v.head}`
+                    : c.fast_forward
+                      ? "fast-forward — no merge commit needed"
+                      : c.mergeable
+                        ? "these branches can be merged automatically"
+                        : `${c.conflicts.length} conflict(s) must be resolved by hand`}
+                </div>
+                <div class="vsub">
+                  {c.up_to_date ? (
+                    "Nothing to merge."
+                  ) : (
+                    <>
+                      {c.ahead} commit(s) ahead, {c.behind} behind
+                      {c.merge_base_short ? ` · common ancestor ${c.merge_base_short}` : " · unrelated histories"}
+                    </>
+                  )}
+                </div>
+              </div>
+              {!c.up_to_date && this.repo!.access !== "read" ? (
+                <button
+                  class="primary"
+                  disabled={this.busy}
+                  onClick={() => void this.openRequest(v.base, v.head)}
+                >
+                  open merge request
+                </button>
+              ) : null}
+              {!c.up_to_date ? (
+                <code class="howto">fkit merge {v.head}</code>
+              ) : null}
+            </div>
+
+            {c.conflicts.length > 0 ? (
+              <div class="panel" style="margin-bottom:12px">
+                <div class="panel-head"><span>conflicts</span></div>
+                {c.conflicts.map((x) => (
+                  <div class="ch">
+                    <span class="st modified"><loom-icon name="alert" size={12}></loom-icon></span>
+                    <span>{x.path}</span>
+                    <span class="muted" style="font-size:11px">{x.detail}</span>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+
+            {c.commits.length > 0 ? (
+              <div class="panel commits" style="margin-bottom:12px">
+                <div class="panel-head">
+                  <span>commits on {v.head}</span>
+                  <span class="val faint">{c.ahead}</span>
+                </div>
+                {c.commits.map((cm) => {
+                  const href = `/${at.owner}/${at.name}/commit/${cm.hash}`;
+                  return (
+                    <div class="c">
+                      <a class="m" href={href} onClick={linkHandler(href)}>
+                        {cm.summary || "(no message)"}
+                      </a>
+                      <span class="by">{authorName(cm.author)} · {relativeTime(cm.timestamp)}</span>
+                      <a class="sha" href={href} onClick={linkHandler(href)}>{cm.short}</a>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : null}
+
+            {c.files.length === 0 ? (
+              <div class="panel"><div class="empty">no file changes</div></div>
+            ) : (
+              <div>
+                <div class="patch-bar">
+                  <span>{c.files.length} file(s) changed</span>
+                  <span class="plus">
+                    +{c.files.reduce((a, f) => a + f.added, 0)}
+                  </span>
+                  <span class="minus">
+                    {`\u2212${c.files.reduce((a, f) => a + f.removed, 0)}`}
+                  </span>
+                </div>
+                {c.files.map((f) => this.renderFileDiff(f, v.head))}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  private stateTag(state: string) {
+    return <span class={`mstate ${state}`}>{state}</span>;
+  }
+
+  private renderMergeList() {
+    const at = this.loc!;
+    const list = this.merges;
+    const canOpen = this.repo!.access !== "read" && this.repo!.access !== "none";
+
+    return (
+      <div>
+        <div class="cmp-bar">
+          {(["open", "merged", "closed", "all"] as const).map((k) => (
+            <button
+              class={this.mergeState === k ? "" : "bare"}
+              onClick={async () => {
+                this.mergeState = k;
+                this.merges = null;
+                this.merges = await api.merges(at.owner, at.name, k);
+              }}
+            >
+              {k}
+            </button>
+          ))}
+          <div class="grow"></div>
+          {canOpen ? (
+            <a
+              class="btn primary"
+              href={`/${at.owner}/${at.name}/compare/${this.repo!.default_branch}...${this.ref()}`}
+              onClick={linkHandler(
+                `/${at.owner}/${at.name}/compare/${this.repo!.default_branch}...${this.ref()}`,
+              )}
+            >
+              <loom-icon name="plus" size={12}></loom-icon> new merge request
+            </a>
+          ) : null}
+        </div>
+
+        {list === null ? (
+          <div class="panel">
+            {[0, 1, 2].map(() => (
+              <div class="mrow sk-row">
+                <span class="sk" style="width:13px;height:13px"></span>
+                <span class="sk" style="width:min(50%,280px)"></span>
+                <span class="sk" style="width:90px"></span>
+              </div>
+            ))}
+          </div>
+        ) : list.length === 0 ? (
+          <div class="panel">
+            <div class="empty">
+              <h2>no {this.mergeState === "all" ? "" : this.mergeState} merge requests</h2>
+              <p class="prose">
+                Compare two branches to propose one.
+              </p>
+            </div>
+          </div>
+        ) : (
+          <div class="panel">
+            {list.map((m) => {
+              const href = `/${at.owner}/${at.name}/merges/${m.number}`;
+              return (
+                <div class="mrow">
+                  {this.stateTag(m.state)}
+                  <a class="mtitle" href={href} onClick={linkHandler(href)}>
+                    <span class="num">#{m.number}</span> {m.title}
+                  </a>
+                  <span class="mbr">
+                    {m.source_branch} <span class="faint">into</span> {m.target_branch}
+                  </span>
+                  <span class="faint" style="font-size:11px">{relativeTime(m.created_at)}</span>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  private async act(fn: () => Promise<unknown>, ok?: string) {
+    this.busy = true;
+    this.error = "";
+    this.notice = "";
+    try {
+      await fn();
+      if (ok) this.notice = ok;
+      const at = this.loc!;
+      if (at.view.kind === "merge") {
+        this.mr = await api.mergeRequest(at.owner, at.name, at.view.number);
+        this.refs = await api.refs(at.owner, at.name);
+      }
+    } catch (e) {
+      this.error = (e as Error).message;
+    } finally {
+      this.busy = false;
+    }
+  }
+
+  private renderMergeRequest() {
+    const at = this.loc!;
+    const m = this.mr;
+    if (!m) return <div class="panel"><div class="loading">loading merge request</div></div>;
+
+    const c = m.comparison;
+    const open = m.state === "open";
+
+    return (
+      <div>
+        <div class="chead">
+          <div class="chead-top">
+            <h2 class="csummary">
+              <span class="num">#{m.number}</span> {m.title}
+            </h2>
+            {this.stateTag(m.state)}
+          </div>
+          {m.description ? <pre class="cbody">{m.description}</pre> : null}
+          <div class="cmeta">
+            <span class="who">{m.author ?? "unknown"}</span>
+            <span>opened {relativeTime(m.created_at)}</span>
+            <span class="mbr">
+              {m.source_branch} <span class="faint">into</span> {m.target_branch}
+            </span>
+            {m.merge_commit ? (
+              <span class="parent">
+                merged as{" "}
+                <a
+                  href={`/${at.owner}/${at.name}/commit/${m.merge_commit}`}
+                  onClick={linkHandler(`/${at.owner}/${at.name}/commit/${m.merge_commit}`)}
+                >
+                  {m.merge_commit.slice(0, 10)}
+                </a>
+              </span>
+            ) : null}
+          </div>
+        </div>
+
+        {!c ? (
+          <div class="panel">
+            <div class="empty">
+              <h2>branches unavailable</h2>
+              <p class="prose">
+                One of the branches for this request no longer exists, so its diff cannot be shown.
+              </p>
+            </div>
+          </div>
+        ) : (
+          <div>
+            <div class={`verdict ${c.mergeable || c.up_to_date ? "ok" : "bad"}`}>
+              <span class="vmark">
+                <loom-icon name={c.mergeable || c.up_to_date ? "check" : "commit"} size={14}></loom-icon>
+              </span>
+              <div class="grow">
+                <div class="vtitle">
+                  {!open
+                    ? `This request is ${m.state}.`
+                    : c.up_to_date
+                      ? "Already merged — nothing left to apply."
+                      : c.fast_forward
+                        ? "Fast-forward: no merge commit needed."
+                        : c.mergeable
+                          ? "No conflicts. This can be merged."
+                          : `${c.conflicts.length} conflict(s) must be resolved first.`}
+                </div>
+                <div class="vsub">
+                  {c.ahead} commit(s) ahead, {c.behind} behind
+                  {c.merge_base_short ? ` · common ancestor ${c.merge_base_short}` : ""}
+                </div>
+              </div>
+
+              {open && m.can_merge && c.mergeable && !c.up_to_date ? (
+                <button
+                  class="primary"
+                  disabled={this.busy}
+                  onClick={() =>
+                    void this.act(() => api.performMerge(at.owner, at.name, m.number))
+                  }
+                >
+                  {this.busy ? "merging…" : `merge into ${m.target_branch}`}
+                </button>
+              ) : null}
+              {open && m.can_merge ? (
+                <button
+                  class="bare"
+                  disabled={this.busy}
+                  onClick={() => void this.act(() => api.closeMerge(at.owner, at.name, m.number))}
+                >
+                  close
+                </button>
+              ) : null}
+              {!open && m.state === "closed" && m.can_merge === false && this.repo!.access !== "read" ? (
+                <button
+                  class="bare"
+                  disabled={this.busy}
+                  onClick={() => void this.act(() => api.reopenMerge(at.owner, at.name, m.number))}
+                >
+                  reopen
+                </button>
+              ) : null}
+            </div>
+
+            {c.conflicts.length > 0 ? (
+              <div class="panel" style="margin-bottom:12px">
+                <div class="panel-head"><span>conflicts</span></div>
+                {c.conflicts.map((x) => (
+                  <div class="ch">
+                    <span class="st modified"><loom-icon name="alert" size={12}></loom-icon></span>
+                    <span>{x.path}</span>
+                    <span class="muted" style="font-size:11px">{x.detail}</span>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+
+            {c.commits.length > 0 ? (
+              <div class="panel commits" style="margin-bottom:12px">
+                <div class="panel-head">
+                  <span>commits</span>
+                  <span class="val faint">{c.ahead}</span>
+                </div>
+                {c.commits.map((cm) => {
+                  const href = `/${at.owner}/${at.name}/commit/${cm.hash}`;
+                  return (
+                    <div class="c">
+                      <a class="m" href={href} onClick={linkHandler(href)}>
+                        {cm.summary || "(no message)"}
+                      </a>
+                      <span class="by">{authorName(cm.author)} · {relativeTime(cm.timestamp)}</span>
+                      <a class="sha" href={href} onClick={linkHandler(href)}>{cm.short}</a>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : null}
+
+            {c.files.length > 0 ? (
+              <div>
+                <div class="patch-bar">
+                  <span>{c.files.length} file(s) changed</span>
+                  <span class="plus">+{c.files.reduce((a, f) => a + f.added, 0)}</span>
+                  <span class="minus">{`\u2212${c.files.reduce((a, f) => a + f.removed, 0)}`}</span>
+                </div>
+                {c.files.map((f) => this.renderFileDiff(f, m.source_branch))}
+              </div>
+            ) : null}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  /// Create a request from the compare view and go straight to it.
+  private async openRequest(base: string, head: string) {
+    const at = this.loc!;
+    const title = `Merge ${head} into ${base}`;
+    this.busy = true;
+    this.error = "";
+    try {
+      const m = await api.createMerge(at.owner, at.name, {
+        title,
+        source_branch: head,
+        target_branch: base,
+      });
+      go(`/${at.owner}/${at.name}/merges/${m.number}`);
+    } catch (e) {
+      this.error = (e as Error).message;
+    } finally {
+      this.busy = false;
+    }
+  }
+
+  /// A copyable command block.
+  ///
+  /// Every one of these exists to be pasted into a terminal, so every one gets
+  /// a copy button — selecting three lines of shell by hand is exactly the
+  /// friction this panel is supposed to remove.
+  private codeBlock(id: string, label: string, text: string) {
+    const done = this.copiedKey === id;
+    return (
+      <div class="setup-block">
+        <div class="setup-label">
+          <span>{label}</span>
+          <button class="bare" onClick={() => void this.copyText(id, text)}>
+            <loom-icon name={done ? "check" : "copy"} size={11}></loom-icon>
+            {done ? "copied" : "copy"}
+          </button>
+        </div>
+        <pre class="cmd-block">{text}</pre>
+      </div>
+    );
+  }
+
+  private async copyText(id: string, text: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      this.copiedKey = id;
+      setTimeout(() => {
+        if (this.copiedKey === id) this.copiedKey = "";
+      }, 1400);
+    } catch {
+      this.error = "could not copy — the browser refused clipboard access";
+    }
+  }
+
+  /// What actually gets someone from nothing to a pushed repository.
+  ///
+  /// The previous version showed `fkit remote … && fkit push`, which assumed a
+  /// repository that already existed, already had a commit, and already had a
+  /// token — every step except the one it printed.
+  private renderSetup(r: Repo) {
+    const url = syncUrl(r.owner, r.name);
+    // Only offer push instructions to someone who could actually push. An
+    // anonymous visitor being told to run `fkit push` is noise at best and a
+    // confusing dead end at worst.
+    const canPush = r.access === "write" || r.access === "admin";
+    const signedIn = this.session.isAuthed;
+
+    return (
+      <div class="setup">
+        <div class="setup-block">
+          <div class="setup-label">
+            <span>remote</span>
+            <button class="bare" onClick={() => void this.copyText("url", url)}>
+              <loom-icon name={this.copiedKey === "url" ? "check" : "copy"} size={11}></loom-icon>
+              {this.copiedKey === "url" ? "copied" : "copy"}
+            </button>
+          </div>
+          <pre class="cmd-block url">{url}</pre>
+        </div>
+
+        {canPush
+          ? this.codeBlock(
+              "existing",
+              "push an existing project",
+              `cd my-project\nfkit remote ${url}\nfkit push`,
+            )
+          : null}
+
+        {canPush
+          ? this.codeBlock(
+              "new",
+              "or start a new one",
+              `fkit init my-project && cd my-project\n` +
+                `fkit config --global author.name "Your Name"\n` +
+                `fkit config --global author.email you@example.com\n` +
+                `fkit commit -m "first commit"\n` +
+                `fkit remote ${url}\nfkit push`,
+            )
+          : null}
+
+        {this.codeBlock("clone", "clone it", `fkit clone ${url}`)}
+
+        <div class="setup-note">
+          <loom-icon name={canPush ? "key" : "lock"} size={12}></loom-icon>
+          <span>
+            {canPush ? (
+              <>
+                Pushing needs <code>FKIT_TOKEN</code>.{" "}
+                <a href="/settings/tokens" onClick={linkHandler("/settings/tokens")}>
+                  Create one
+                </a>
+                {r.visibility === "private" ? " — cloning too, it's private." : "."}
+              </>
+            ) : signedIn ? (
+              <>Read access only. Ask {r.owner} for write.</>
+            ) : (
+              <>
+                <a href="/login" onClick={linkHandler("/login")}>Sign in</a> to push.
+              </>
+            )}
+          </span>
+        </div>
+      </div>
+    );
+  }
+
+  private renderSettings() {
+    const r = this.repo!;
+    const at = this.loc!;
+    const section = (at.view as Extract<View, { kind: "settings" }>).section;
+
+    if (r.access !== "admin") {
+      return (
+        <div class="panel">
+          <div class="empty">
+            <h2>not available</h2>
+            <p class="prose">Repository settings need admin access.</p>
+          </div>
+        </div>
+      );
+    }
+
+    const tabs: [string, string, string][] = [
+      ["general", "general", "settings"],
+      ["access", "access", "lock"],
+      ["setup", "push & clone", "link"],
+      ["danger", "danger zone", "alert"],
+    ];
+
+    return (
+      <div class="cols">
+        <div class="rail">
+          <h2>{r.name}</h2>
+          {tabs.map(([id, label, ic]) => {
+            const href = `/${at.owner}/${at.name}/settings/${id}`;
+            return (
+              <a class={section === id ? "on" : ""} href={href} onClick={linkHandler(href)}>
+                <loom-icon name={ic} size={12}></loom-icon>
+                {label}
+              </a>
+            );
+          })}
+        </div>
+
+        <div class="sec">
+          {section === "general" ? this.settingsGeneral(r, at) : null}
+          {section === "access" ? this.settingsAccess(r, at) : null}
+          {section === "setup" ? (
+            <div>
+              <h1>push &amp; clone</h1>
+              <div class="panel" style="margin-top:12px">
+                <div class="panel-body">{this.renderSetup(r)}</div>
+              </div>
+            </div>
+          ) : null}
+          {section === "danger" ? this.settingsDanger(r, at) : null}
+        </div>
+      </div>
+    );
+  }
+
+  private settingsGeneral(r: Repo, at: { owner: string; name: string }) {
+    return (
+      <div>
+        <h1>general</h1>
+        <p class="lead">Everything here is visible to anyone who can see the repository.</p>
+
+        <div class="panel">
+          <div class="panel-body">
+            <form
+              class="stack"
+              onSubmit={(e: Event) => {
+                e.preventDefault();
+                const input = (e.target as HTMLFormElement).elements.namedItem(
+                  "description",
+                ) as HTMLInputElement;
+                void this.act(async () => {
+                  this.repo = await api.updateRepo(at.owner, at.name, {
+                    description: input.value,
+                  });
+                }, "saved");
+              }}
+            >
+              <div class="field">
+                <label>name</label>
+                <input value={r.name} disabled />
+                <div class="fd">
+                  Renaming is not supported yet — the name is part of every clone URL.
+                </div>
+              </div>
+              <div class="field">
+                <label>description</label>
+                <input
+                  name="description"
+                  value={r.description ?? ""}
+                  placeholder="one line about what this is"
+                />
+                <div class="fd">Shown beside the name in listings and at the top of the page.</div>
+              </div>
+              <div class="row">
+                <button class="primary" type="submit" disabled={this.busy}>save</button>
+                {this.notice ? <span class="ok">{this.notice}</span> : null}
+              </div>
+            </form>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head"><span>default branch</span></div>
+          <div class="panel-body">
+            <div class="row">
+              <fkit-select
+                value={r.default_branch}
+                options={this.refs.map((b) => ({ value: b.name, label: b.name, hint: b.short }))}
+                onPick={(e: Event) => {
+                  const v = (e as CustomEvent<string>).detail;
+                  void this.act(async () => {
+                    this.repo = await api.updateRepo(at.owner, at.name, { default_branch: v });
+                  }, "saved");
+                }}
+              ></fkit-select>
+              <span class="fd" style="margin:0">
+                Opened when a URL names no branch. {this.refs.length} branch(es) available.
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  private settingsAccess(r: Repo, at: { owner: string; name: string }) {
+    return (
+      <div>
+        <h1>access</h1>
+        <p class="lead">Who can read this repository, and who can push to it.</p>
+        <div class="panel">
+          <div class="panel-head"><span>who can see this</span></div>
+          <fkit-choice
+            value={r.visibility}
+            disabled={this.busy}
+            options={[
+              {
+                value: "private",
+                label: "private",
+                icon: "lock",
+                hint: "Only you and the collaborators below. Cloning requires a token.",
+              },
+              {
+                value: "public",
+                label: "public",
+                icon: "repo",
+                hint: "Anyone can read and clone it, with or without an account. Pushing still requires write access.",
+              },
+            ]}
+            onPick={(e: Event) => {
+              const v = (e as CustomEvent<string>).detail;
+              void this.act(async () => {
+                this.repo = await api.updateRepo(at.owner, at.name, { visibility: v });
+              });
+            }}
+          ></fkit-choice>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <span>collaborators</span>
+            <span class="val faint">{this.collaborators?.length ?? ""}</span>
+          </div>
+          <div class="panel-body">
+            <form
+              class="collab-add"
+              onSubmit={(e: Event) => {
+                e.preventDefault();
+                const user = (e.target as HTMLFormElement).elements.namedItem(
+                  "username",
+                ) as HTMLInputElement;
+                void this.act(async () => {
+                  await api.addCollaborator(at.owner, at.name, user.value.trim(), this.newRole);
+                  this.collaborators = await api.collaborators(at.owner, at.name);
+                  user.value = "";
+                });
+              }}
+            >
+              <input name="username" placeholder="username" required />
+              <fkit-select
+                value={this.newRole}
+                options={[
+                  { value: "read", label: "read", hint: "Clone only." },
+                  { value: "write", label: "write", hint: "Clone and push." },
+                  { value: "admin", label: "admin", hint: "Also settings." },
+                ]}
+                onPick={(e: Event) => (this.newRole = (e as CustomEvent<string>).detail)}
+              ></fkit-select>
+              <button class="primary" type="submit" disabled={this.busy}>
+                <loom-icon name="plus" size={12}></loom-icon> add
+              </button>
+            </form>
+            <div class="collab-note">Read can clone; write can push. No self-service join.</div>
+          </div>
+
+          {this.collaborators === null ? (
+            <div class="collab-empty">loading</div>
+          ) : this.collaborators.length === 0 ? (
+            <div class="collab-empty">Only {r.owner} has access.</div>
+          ) : (
+            this.collaborators.map((c) => (
+              <div class="collab">
+                <span class="cu">{c.username}</span>
+                <span class="tag">{c.role}</span>
+                <span class="faint" style="font-size:11px">
+                  since {relativeTime(c.granted_at)}
+                </span>
+                <button
+                  class="danger bare"
+                  disabled={this.busy}
+                  onClick={async () => {
+                    const ok = await confirmAction({
+                      title: `Remove ${c.username}?`,
+                      body: `They lose access to ${r.full_name} immediately. Anything already cloned stays on their machine.`,
+                      confirm: "remove",
+                      danger: true,
+                    });
+                    if (!ok) return;
+                    await this.act(async () => {
+                      await api.removeCollaborator(at.owner, at.name, c.username);
+                      this.collaborators = await api.collaborators(at.owner, at.name);
+                    });
+                  }}
+                >
+                  remove
+                </button>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  private settingsDanger(r: Repo, at: { owner: string; name: string }) {
+    return (
+      <div>
+        <h1>danger zone</h1>
+        <div class="panel danger" style="margin-top:12px">
+          <div class="panel-head"><span>delete this repository</span></div>
+          <div class="panel-body">
+            <p class="muted prose" style="font-size:12px;margin:0 0 11px">
+              Removes the repository, every branch, and all objects stored for it. Clones on
+              other machines keep working; this server keeps nothing.
+            </p>
+            <button
+              class="danger"
+              disabled={this.busy}
+              onClick={async () => {
+                const ok = await confirmAction({
+                  title: `Delete ${r.full_name}?`,
+                  body: "This cannot be undone. Type the repository name to confirm.",
+                  confirm: "delete repository",
+                  danger: true,
+                  typeToConfirm: r.name,
+                });
+                if (!ok) return;
+                await this.act(async () => {
+                  await api.deleteRepo(at.owner, at.name);
+                  go("/");
+                });
+              }}
+            >
+              <loom-icon name="trash" size={12}></loom-icon> delete {r.full_name}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  update() {
+    if (this.notFound || !this.loc) {
+      return (
+        <div class="wrap">
+          <div class="panel">
+            <div class="empty">
+              <h2>not found</h2>
+              <p class="prose">There is no repository here, or you do not have access to it.</p>
+              <a class="btn" href="/" onClick={linkHandler("/")}>back to repositories</a>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    const at = this.loc;
+    const r = this.repo;
+
+    if (!r) {
+      return (
+        <div class="wrap">
+          <div class="head">
+            <div class="title">
+              <span class="sk" style="width:14px;height:14px"></span>
+              <span class="sk tall" style="width:200px"></span>
+              <span class="sk" style="width:48px"></span>
+            </div>
+            <div class="tabs" style="gap:14px;padding:5px 0 9px">
+              <span class="sk" style="width:36px"></span>
+              <span class="sk" style="width:48px"></span>
+            </div>
+          </div>
+          <div class="panel files">
+            {[0, 1, 2, 3, 4].map(() => (
+              <div class="r sk-row">
+                <span class="sk" style="width:13px;height:13px"></span>
+                <span class="sk" style="width:min(70%,150px)"></span>
+                <span class="sk" style="width:min(60%,190px)"></span>
+                <span class="sk" style="width:58px"></span>
+                <span class="sk" style="width:44px"></span>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    const v = at.view;
+    const ref = this.ref();
+    const tab =
+      v.kind === "commit" ? "commits" : v.kind === "merge" ? "merges" : v.kind;
+    const other = this.refs.find((b) => b.name !== r.default_branch)?.name ?? r.default_branch;
+    const tabs: [string, string, string, string][] = [
+      ["tree", "files", "file", `/${at.owner}/${at.name}/tree/${ref}`],
+      ["commits", "history", "history", `/${at.owner}/${at.name}/commits/${ref}`],
+      ["merges", "merges", "merge", `/${at.owner}/${at.name}/merges`],
+      [
+        "compare",
+        "compare",
+        "compare",
+        `/${at.owner}/${at.name}/compare/${r.default_branch}...${other}`,
+      ],
+    ];
+    if (r.access === "admin") {
+      tabs.push(["settings", "settings", "settings", `/${at.owner}/${at.name}/settings`]);
+    }
+
+    return (
+      <div class="wrap">
+        <div class="head">
+          <div class="title">
+            <span class="ic"><loom-icon name={r.visibility === "private" ? "lock" : "repo"} size={14}></loom-icon></span>
+            <span class="p">
+              <a class="own" href="/" onClick={linkHandler("/")}>{r.owner}</a>
+              <span class="own">/</span>
+              <a
+                href={`/${r.owner}/${r.name}`}
+                onClick={linkHandler(`/${r.owner}/${r.name}`)}
+                style="color:var(--text)"
+              >
+                {r.name}
+              </a>
+            </span>
+            <span class="tag">{r.visibility}</span>
+            {r.access !== "read" ? <span class="tag on">{r.access}</span> : null}
+          </div>
+          {r.description ? <div class="desc">{r.description}</div> : null}
+          <div class="tabs">
+            {tabs.map(([key, label, ic, href]) => (
+              <a class={tab === key ? "on" : ""} href={href} onClick={linkHandler(href)}>
+                <loom-icon name={ic} size={12}></loom-icon>
+                {label}
+              </a>
+            ))}
+          </div>
+        </div>
+
+        {this.error ? <div class="error">{this.error}</div> : null}
+
+        {this.refs.length === 0 && v.kind !== "settings" ? (
+          <div class="panel">
+            <div class="panel-head"><span>this repository is empty</span></div>
+            <div class="panel-body">{this.renderSetup(r)}</div>
+          </div>
+        ) : v.kind === "settings" ? (
+          this.renderSettings()
+        ) : v.kind === "compare" ? (
+          this.renderCompare()
+        ) : v.kind === "merges" ? (
+          this.renderMergeList()
+        ) : v.kind === "merge" ? (
+          this.renderMergeRequest()
+        ) : v.kind === "commit" ? (
+          this.detail ? (
+            this.renderCommitDetail()
+          ) : (
+            <div>
+              <div class="panel cmsg">
+                <div class="panel-body">
+                  <span class="sk tall" style="width:min(50%,380px)"></span>
+                  <div style="height:10px"></div>
+                  <span class="sk" style="width:min(70%,520px)"></span>
+                </div>
+              </div>
+              <div class="panel">
+                {[0, 1, 2, 3].map((i) => (
+                  <div class="ch sk-row">
+                    <span class="sk" style="width:10px"></span>
+                    <span class="sk" style={`width:${[46, 62, 34, 54][i]}%`}></span>
+                    <span class="sk" style="width:80px"></span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )
+        ) : (
+          <div>
+            <div class="toolbar">
+              {v.kind !== "commits" ? this.renderCrumbs(v.kind === "tree" || v.kind === "blob" ? v.path : "") : null}
+              <div style="flex:1"></div>
+              <branch-picker
+                refs={this.refs}
+                current={ref}
+                onPick={(e: Event) => this.switchRef((e as CustomEvent<string>).detail)}
+              ></branch-picker>
+              <a
+                class="btn"
+                href={`/${at.owner}/${at.name}/commits/${ref}`}
+                onClick={linkHandler(`/${at.owner}/${at.name}/commits/${ref}`)}
+              >
+                <loom-icon name="commit" size={12}></loom-icon> history
+              </a>
+              <clone-button
+                url={syncUrl(r.owner, r.name)}
+                visibility={r.visibility}
+              ></clone-button>
+            </div>
+
+            {v.kind === "tree" ? (
+              this.entries === null ? (
+                <div class="panel files">
+                  {[0, 1, 2, 3, 4, 5].map(() => (
+                    <div class="r sk-row">
+                      <span class="sk" style="width:13px;height:13px"></span>
+                      <span class="sk" style="width:min(70%,150px)"></span>
+                      <span class="sk" style="width:min(60%,190px)"></span>
+                      <span class="sk" style="width:58px"></span>
+                      <span class="sk" style="width:44px"></span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div>
+                  {this.renderTree(v.path)}
+                  {this.renderReadme()}
+                </div>
+              )
+            ) : v.kind === "blob" ? (
+              this.blob === null ? (
+                <div class="panel">
+                  <div class="panel-head"><span class="sk" style="width:120px"></span></div>
+                  <div style="padding:2px 0">
+                    {Array.from({ length: 14 }, (_, i) => (
+                      <div class="sk-row" style="display:flex;gap:14px;padding:3px 14px">
+                        <span class="sk" style="width:22px;flex:none"></span>
+                        <span
+                          class="sk"
+                          style={`width:${[62, 38, 74, 46, 84, 30, 58][i % 7]}%`}
+                        ></span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                this.renderBlob()
+              )
+            ) : v.kind === "commits" ? (
+              this.commits === null ? (
+                <div class="panel commits">
+                  {[0, 1, 2, 3, 4, 5, 6].map((i) => (
+                    <div class="c sk-row">
+                      <span class="sk tall" style={`width:${[58, 42, 70, 36, 64, 48, 54][i]}%`}></span>
+                      <span class="sk" style="width:120px"></span>
+                      <span class="sk" style="width:64px"></span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                this.renderCommits()
+              )
+            ) : (
+              <div class="panel"><div class="empty"><h2>unknown page</h2></div></div>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  }
+}
