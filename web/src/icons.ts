@@ -45,6 +45,10 @@ const PATHS = {
   blob: `<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M8 8h2v8H8zM14 8h2v8h-2z"/>`,
   db: `<ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/>`,
   tag: `<path d="M12.6 2.7a2 2 0 0 0-1.4-.6H4a2 2 0 0 0-2 2v7.2a2 2 0 0 0 .6 1.4l8.4 8.4a2 2 0 0 0 2.8 0l7.2-7.2a2 2 0 0 0 0-2.8Z"/><circle cx="6.5" cy="6.5" r="1.5"/>`,
+  /* A close mark, for removing one thing from a list of things. */
+  x: `<path d="M18 6 6 18M6 6l12 12"/>`,
+  /* One person, as against `people` — a named account rather than a group. */
+  user: `<path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>`,
   plus: `<path d="M12 5v14M5 12h14"/>`,
   key: `<circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6"/><path d="m15.5 7.5 3 3L22 7l-3-3"/>`,
   up: `<path d="M9 14 4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 6 6v5"/>`,

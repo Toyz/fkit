@@ -15,6 +15,8 @@ import "@toyz/loom/element/icon";
 import "@toyz/loom/element/virtual";
 import "./components/fkit-dialog";
 import "./components/fkit-toggle";
+import "./components/fkit-settings";
+import "./components/fkit-tags";
 import "./icons";
 
 import "./session";

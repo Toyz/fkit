@@ -42,6 +42,11 @@ const sheet = css`
   /* One line per account, columns that line up down the list. The previous
      row stacked a name and an email into a single inline span, so a username
      ran straight into its own address with nothing between them. */
+  .hint-after {
+    font-size: 11.5px; color: var(--muted); font-family: var(--sans);
+    margin: 10px 0 0; line-height: 1.45; max-width: 78ch;
+  }
+
   .urow {
     display: grid;
     /* Every column is fixed except the two text ones. An auto-width action
@@ -58,6 +63,8 @@ const sheet = css`
     text-transform: uppercase; letter-spacing: .07em;
   }
   .urow.head + .urow { border-top: 0; }
+  /* The list draws the box; the first row must not draw a line against it. */
+  fkit-list .urow:first-child { border-top: 0; }
   .urow > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .urow .un { font-size: 12.5px; display: flex; align-items: center; gap: 7px; }
   .urow .ue { color: var(--muted); font-size: 11.5px; }
@@ -275,131 +282,132 @@ export class PageAdmin extends LoomElement {
       : [];
 
     return (
-      <div class="sec">
-        <h1>overview</h1>
-        <div class="panel">
-          {s === null ? (
-            <div class="panel-body"><span class="sk" style="width:200px"></span></div>
-          ) : (
-            <div class="stat-grid">
-              {cells.map(([v, l]) => (
-                <div class="stat-cell">
-                  <b>{v}</b>
-                  <span>{l}</span>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-        <p class="lead">
-          Registration is currently{" "}
-          <strong>{this.settings?.open_registration ? "open" : "closed"}</strong>, and public
-          repositories are{" "}
-          <strong>{this.settings?.require_auth ? "hidden from signed-out visitors" : "readable by anyone"}</strong>.
-        </p>
-      </div>
+      <fkit-page heading="Overview" value={s ? humanSize(s.disk_bytes) + " on disk" : ""}>
+        <fkit-section>
+          <fkit-list>
+            {s === null ? (
+              <fkit-empty><span class="sk" style="width:200px"></span></fkit-empty>
+            ) : (
+              <div class="stat-grid">
+                {cells.map(([v, l]) => (
+                  <div class="stat-cell">
+                    <b>{v}</b>
+                    <span>{l}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </fkit-list>
+        </fkit-section>
+
+        <fkit-section heading="How this server is set up">
+          <fkit-list>
+            <fkit-setting-row
+              name="Registration"
+              why={
+                this.settings?.open_registration
+                  ? "Open — anyone can create an account."
+                  : "Closed — an invite is the only way in."
+              }
+            >
+              <span class={`tag ${this.settings?.open_registration ? "on" : ""}`}>
+                {this.settings?.open_registration ? "open" : "closed"}
+              </span>
+            </fkit-setting-row>
+            <fkit-setting-row
+              name="Public repositories"
+              why={
+                this.settings?.require_auth
+                  ? "Hidden from signed-out visitors, whatever a repository says about itself."
+                  : "Readable by anyone, with or without an account."
+              }
+            >
+              <span class={`tag ${this.settings?.require_auth ? "" : "on"}`}>
+                {this.settings?.require_auth ? "sign-in required" : "readable"}
+              </span>
+            </fkit-setting-row>
+          </fkit-list>
+        </fkit-section>
+      </fkit-page>
     );
   }
 
   private instance() {
     const s = this.settings;
-    if (!s) return <div class="panel"><div class="panel-body">loading</div></div>;
+    if (!s) return <fkit-page heading="Instance"><fkit-section><fkit-list><fkit-empty>loading</fkit-empty></fkit-list></fkit-section></fkit-page>;
 
     return (
-      <div class="sec">
-        <h1>instance</h1>
-        <p class="lead">
-          These take effect immediately, for every request — no restart, and they override
-          what the config file says.
-        </p>
-
-        <div class="panel">
-          <div class="field-row">
-            <div>
-              <div class="fl">open registration</div>
-              <div class="fd">
-                Anyone can create an account. Turn this off for a private server; the first
-                account is always allowed so a new server is never locked out.
-              </div>
-            </div>
-            <fkit-toggle
-              checked={s.open_registration}
-              label="open registration"
-              onToggle={(e: Event) =>
-                void this.patch({ open_registration: (e as CustomEvent<boolean>).detail })
-              }
-            ></fkit-toggle>
-          </div>
-
-          <div class="field-row">
-            <div>
-              <div class="fl">require sign-in for everything</div>
-              <div class="fd">
-                Even repositories marked public become invisible to signed-out visitors. Use
-                this for an instance that should not be readable from the internet at all.
-              </div>
-            </div>
-            <fkit-toggle
-              checked={s.require_auth}
-              label="require sign-in"
-              onToggle={(e: Event) =>
-                void this.patch({ require_auth: (e as CustomEvent<boolean>).detail })
-              }
-            ></fkit-toggle>
-          </div>
-
-        </div>
-
-        <div class="panel">
-          <div class="panel-head"><span>default repository visibility</span></div>
-          <fkit-choice
-            value={s.default_repo_visibility}
-            disabled={this.busy}
-            options={[
-              { value: "private", label: "private", icon: "lock",
-                hint: "New repositories start private unless asked otherwise." },
-              { value: "public", label: "public", icon: "repo",
-                hint: "New repositories are readable by anyone by default." },
-            ]}
-            onPick={(e: Event) =>
-              void this.patch({
-                default_repo_visibility: (e as CustomEvent<string>).detail as "public" | "private",
-              })
-            }
-          ></fkit-choice>
-        </div>
-
-        <div class="panel">
-          <div class="panel-head"><span>registration email domains</span></div>
-          <div class="panel-body">
-            <form
-              class="domains"
-              onSubmit={(e: Event) => {
-                e.preventDefault();
-                const v = (
-                  (e.target as HTMLFormElement).elements.namedItem("domains") as HTMLInputElement
-                ).value;
-                const list = v.split(",").map((d) => d.trim()).filter(Boolean);
-                void this.patch({ allowed_email_domains: list });
-              }}
+      <fkit-page heading="Instance">
+        <fkit-section blurb="These take effect immediately, for every request — no restart, and they override what the config file says.">
+          <fkit-list>
+            <fkit-setting-row
+              name="Open registration"
+              why="Anyone can create an account. Turn this off for a private server; the first account is always allowed so a new server is never locked out."
             >
-              <input
-                name="domains"
-                value={s.allowed_email_domains.join(", ")}
-                placeholder="example.com, corp.test — blank allows any"
-              />
-              <div class="fd">
-                Comma separated. Only these domains may register. Existing accounts are
-                unaffected.
-              </div>
-              <div class="row">
-                <button class="primary" type="submit" disabled={this.busy}>save</button>
-                {this.notice ? <span class="ok">{this.notice}</span> : null}
-              </div>
-            </form>
-          </div>
-        </div>
-      </div>
+              <fkit-toggle
+                checked={s.open_registration}
+                label="open registration"
+                onToggle={(e: Event) =>
+                  void this.patch({ open_registration: (e as CustomEvent<boolean>).detail })
+                }
+              ></fkit-toggle>
+            </fkit-setting-row>
+
+            <fkit-setting-row
+              name="Require sign-in for everything"
+              why="Even repositories marked public become invisible to signed-out visitors. Use this for an instance that should not be readable from the internet at all."
+            >
+              <fkit-toggle
+                checked={s.require_auth}
+                label="require sign-in"
+                onToggle={(e: Event) =>
+                  void this.patch({ require_auth: (e as CustomEvent<boolean>).detail })
+                }
+              ></fkit-toggle>
+            </fkit-setting-row>
+          </fkit-list>
+        </fkit-section>
+
+        <fkit-section
+          heading="Default repository visibility"
+          value={s.default_repo_visibility}
+          blurb="What a new repository starts as. It can always be changed afterwards."
+        >
+          <fkit-list>
+            <fkit-choice
+              value={s.default_repo_visibility}
+              disabled={this.busy}
+              options={[
+                { value: "private", label: "Private", icon: "lock",
+                  hint: "New repositories start private unless asked otherwise." },
+                { value: "public", label: "Public", icon: "repo",
+                  hint: "New repositories are readable by anyone by default." },
+              ]}
+              onPick={(e: Event) =>
+                void this.patch({
+                  default_repo_visibility: (e as CustomEvent<string>).detail as "public" | "private",
+                })
+              }
+            ></fkit-choice>
+          </fkit-list>
+        </fkit-section>
+
+        <fkit-section
+          heading="Registration email domains"
+          value={s.allowed_email_domains.length ? `${s.allowed_email_domains.length} allowed` : "any"}
+          blurb="Only these domains may register. Leave it empty to allow any. Existing accounts are unaffected."
+        >
+          <fkit-field size="wide">
+            <fkit-tags
+              value={s.allowed_email_domains}
+              placeholder="example.com, corp.test — blank allows any"
+              onChange={(e: Event) =>
+                void this.patch({ allowed_email_domains: (e as CustomEvent<string[]>).detail })
+              }
+            ></fkit-tags>
+          </fkit-field>
+        </fkit-section>
+      </fkit-page>
     );
   }
 
@@ -415,128 +423,112 @@ export class PageAdmin extends LoomElement {
 
   private emailSection() {
     const e = this.email;
+    const pinned = e?.key_from_env && e?.sender_from_env && e?.url_from_env;
     return (
-      <div class="sec">
-        <h1>email</h1>
-        <p class="lead">
-          Password resets are the only mail this server sends. Without a key configured
-          there is no reset flow at all, and the sign-in page says so rather than offering
-          one that cannot work.
-        </p>
-
-        <div class="panel">
-          <div class="panel-head">
-            <span>resend</span>
-            <span class={`tag ${e?.configured ? "on" : ""}`}>
-              {e?.configured ? "configured" : "not configured"}
-            </span>
-            {e?.key_from_env ? <span class="tag">from environment</span> : null}
-          </div>
-          <div class="panel-body">
-            <form
-              class="stack"
-              onSubmit={(e2: Event) => {
-                e2.preventDefault();
-                const f = e2.target as HTMLFormElement;
-                const at = (n: string) => f.elements.namedItem(n) as HTMLInputElement | null;
-                const key = at("key"), from = at("from"), url = at("url");
-                void this.act(async () => {
-                  this.email = await api.updateAdminEmail({
-                    // Absent leaves the stored key untouched; the field is
-                    // blank because the key is never readable back. A field the
-                    // environment pins is not rendered at all, and sending it
-                    // would be rejected.
-                    ...(key?.value.trim() ? { resend_api_key: key.value.trim() } : {}),
-                    ...(from ? { email_from: from.value } : {}),
-                    ...(url ? { public_url: url.value } : {}),
-                  });
-                  if (key) key.value = "";
-                }, "saved");
-              }}
+      <fkit-page
+        heading="Email"
+        value={e ? (e.configured ? "configured" : "not configured") : ""}
+      >
+        <fkit-section blurb="Password resets are the only mail this server sends. Without a key configured there is no reset flow at all, and the sign-in page says so rather than offering one that cannot work.">
+          <form
+            onSubmit={(e2: Event) => {
+              e2.preventDefault();
+              const f = e2.target as HTMLFormElement;
+              const at = (n: string) => f.elements.namedItem(n) as HTMLInputElement | null;
+              const key = at("key"), from = at("from"), url = at("url");
+              void this.act(async () => {
+                this.email = await api.updateAdminEmail({
+                  // Absent leaves the stored key untouched; the field is
+                  // blank because the key is never readable back. A field the
+                  // environment pins is not rendered at all, and sending it
+                  // would be rejected.
+                  ...(key?.value.trim() ? { resend_api_key: key.value.trim() } : {}),
+                  ...(from ? { email_from: from.value } : {}),
+                  ...(url ? { public_url: url.value } : {}),
+                });
+                if (key) key.value = "";
+              }, "Saved");
+            }}
+          >
+            <fkit-field
+              label="Resend API key"
+              help={
+                e?.key_from_env
+                  ? ""
+                  : "Stored write-only: it is never sent back to this page, so leaving this blank keeps the existing key. From resend.com/api-keys. Prefer RESEND_API_KEY in the environment if you have somewhere to put it."
+              }
             >
-              <div class="field">
-                <label>api key</label>
-                {e?.key_from_env ? (
-                  this.pinned(
-                    "••••••••",
-                    "RESEND_API_KEY",
-                    "Change it where the server gets its environment, then restart.",
-                  )
-                ) : (
-                  <>
-                    <input
-                      name="key"
-                      type="password"
-                      placeholder={e?.has_api_key ? "•••••••• (stored — type to replace)" : "re_..."}
-                      autocomplete="off"
-                    />
-                    <div class="fd">
-                      Stored write-only: it is never sent back to this page, so leaving this
-                      blank keeps the existing key. From{" "}
-                      <span class="mono">resend.com/api-keys</span>. Prefer{" "}
-                      <span class="mono">RESEND_API_KEY</span> in the environment if you have
-                      somewhere to put it.
-                    </div>
-                  </>
-                )}
-              </div>
+              {e?.key_from_env ? (
+                this.pinned(
+                  "••••••••",
+                  "RESEND_API_KEY",
+                  "Change it where the server gets its environment, then restart.",
+                )
+              ) : (
+                <input
+                  name="key"
+                  type="password"
+                  placeholder={e?.has_api_key ? "•••••••• (stored — type to replace)" : "re_..."}
+                  autocomplete="off"
+                />
+              )}
+            </fkit-field>
 
-              <div class="field">
-                <label>from address</label>
-                {e?.sender_from_env ? (
-                  this.pinned(e.email_from, "FKIT_EMAIL_FROM", "")
-                ) : (
-                  <>
-                    <input name="from" value={e?.email_from ?? ""} placeholder="hub@yourdomain.com" />
-                    <div class="fd">
-                      Must be on a domain you have verified with Resend, or every message is
-                      rejected.
-                    </div>
-                  </>
-                )}
-              </div>
+            <fkit-field
+              label="From address"
+              help={
+                e?.sender_from_env
+                  ? ""
+                  : "Must be on a domain you have verified with Resend, or every message is rejected."
+              }
+            >
+              {e?.sender_from_env ? (
+                this.pinned(e.email_from, "FKIT_EMAIL_FROM", "")
+              ) : (
+                <input name="from" value={e?.email_from ?? ""} placeholder="hub@yourdomain.com" />
+              )}
+            </fkit-field>
 
-              <div class="field">
-                <label>public url</label>
-                {e?.url_from_env ? (
-                  this.pinned(e.public_url, "FKIT_PUBLIC_URL", "Reset links are built from it.")
-                ) : (
-                  <>
-                    <input name="url" value={e?.public_url ?? ""} placeholder="https://hub.yourdomain.com" />
-                    <div class="fd">
-                      Reset links are built from this. Behind a proxy the request's own host is
-                      not reliable, so it is stated explicitly.
-                    </div>
-                  </>
-                )}
-              </div>
+            <fkit-field
+              label="Public URL"
+              help={
+                e?.url_from_env
+                  ? ""
+                  : "Reset links are built from this. Behind a proxy the request's own host is not reliable, so it is stated explicitly."
+              }
+            >
+              {e?.url_from_env ? (
+                this.pinned(e.public_url, "FKIT_PUBLIC_URL", "Reset links are built from it.")
+              ) : (
+                <input name="url" value={e?.public_url ?? ""} placeholder="https://hub.yourdomain.com" />
+              )}
+            </fkit-field>
 
-              <div class="row">
-                {e?.key_from_env && e?.sender_from_env && e?.url_from_env ? null : (
-                  <button class="primary" type="submit" disabled={this.busy}>save</button>
-                )}
-                <button
-                  type="button"
-                  disabled={this.busy || !e?.configured}
-                  onClick={() =>
-                    void this.act(async () => {
-                      const r = await api.testAdminEmail();
-                      this.notice = `test message sent to ${r.sent_to}`;
-                    })
-                  }
-                >
-                  send a test
-                </button>
-                {this.notice ? <span class="ok">{this.notice}</span> : null}
-              </div>
-              <div class="fd">
-                A test is worth sending: an unverified domain or a key scoped to the wrong
-                account both fail silently until someone actually needs a reset.
-              </div>
-            </form>
-          </div>
-        </div>
-      </div>
+            <fkit-actions>
+              {pinned ? null : (
+                <button class="primary" type="submit" disabled={this.busy}>Save</button>
+              )}
+              <button
+                type="button"
+                disabled={this.busy || !e?.configured}
+                onClick={() =>
+                  void this.act(async () => {
+                    const r = await api.testAdminEmail();
+                    this.notice = `Test message sent to ${r.sent_to}`;
+                  })
+                }
+              >
+                Send a test
+              </button>
+              {this.notice ? <span class="ok">{this.notice}</span> : null}
+            </fkit-actions>
+            <p class="hint-after">
+              A test is worth sending: an unverified domain or a key scoped to the wrong
+              account both fail silently until someone actually needs a reset.
+            </p>
+          </form>
+        </fkit-section>
+      </fkit-page>
     );
   }
 
@@ -550,56 +542,62 @@ export class PageAdmin extends LoomElement {
     const shown = this.showSpent ? list : [...live, ...dead];
 
     return (
-      <div class="sec">
-        <h1>invites</h1>
-        <p class="lead">
-          {open
-            ? "Anyone can sign up here, so an invite is a convenience: a link that skips the sign-up page and names who it was for."
-            : "Registration is closed, so an invite is the only way in. Each link admits exactly one account, then stops working."}
-        </p>
+      <fkit-page
+        heading="Invites"
+        value={this.invites ? `${live.length} outstanding` : ""}
+      >
+        <fkit-section
+          blurb={
+            open
+              ? "Anyone can sign up here, so an invite is a convenience: a link that skips the sign-up page and names who it was for."
+              : "Registration is closed, so an invite is the only way in. Each link admits exactly one account, then stops working."
+          }
+        >
+          {this.fresh ? this.freshLink(this.fresh) : null}
+        </fkit-section>
 
-        {this.fresh ? this.freshLink(this.fresh) : null}
+        <fkit-section
+          heading="Issue a link"
+          value={
+            this.email?.configured
+              ? `sent from ${this.email.email_from}`
+              : "this server cannot send mail — you deliver the link"
+          }
+        >
+          {this.composer()}
+        </fkit-section>
 
-        <div class="panel">
-          <div class="panel-head">
-            <span>issue a link</span>
-            <span class="fd">
-              {this.email?.configured
-                ? `sent from ${this.email.email_from}`
-                : "this server cannot send mail — you deliver the link"}
-            </span>
-          </div>
-          <div class="panel-body">{this.composer()}</div>
-        </div>
-
-        <div class="panel" style="margin-top:16px">
-          <div class="panel-head">
-            <span>
-              issued
-              {list.length ? (
-                <span class="fd" style="margin-left:9px">
-                  {live.length} outstanding · {spent.length} used
-                  {dead.length ? ` · ${dead.length} expired` : ""}
-                </span>
-              ) : null}
-            </span>
+        <fkit-section
+          heading="Issued"
+          value={
+            list.length
+              ? `${live.length} outstanding · ${spent.length} used${dead.length ? ` · ${dead.length} expired` : ""}`
+              : ""
+          }
+        >
+          <fkit-list>
             {spent.length ? (
-              <button type="button" class="link-btn" onClick={() => (this.showSpent = !this.showSpent)}>
+              <button
+                slot="action"
+                type="button"
+                class="link-btn"
+                onClick={() => (this.showSpent = !this.showSpent)}
+              >
                 {this.showSpent ? "hide used" : "show used"}
               </button>
             ) : null}
-          </div>
-          {this.invites === null ? (
-            <div class="panel-body"><span class="sk" style="width:200px"></span></div>
-          ) : shown.length === 0 ? (
-            <div class="empty">
-              {list.length ? "Every invite here has been used." : "No invites yet."}
-            </div>
-          ) : (
-            shown.map((i) => this.inviteRow(i))
-          )}
-        </div>
-      </div>
+            {this.invites === null ? (
+              <fkit-empty><span class="sk" style="width:200px"></span></fkit-empty>
+            ) : shown.length === 0 ? (
+              <fkit-empty>
+                {list.length ? "Every invite here has been used." : "No invites yet."}
+              </fkit-empty>
+            ) : (
+              shown.map((i) => this.inviteRow(i))
+            )}
+          </fkit-list>
+        </fkit-section>
+      </fkit-page>
     );
   }
 
@@ -763,50 +761,42 @@ export class PageAdmin extends LoomElement {
     const rows = this.users ?? [];
     const admins = rows.filter((u) => u.is_admin && u.is_active).length;
     return (
-      <div class="sec">
-        <h1>users</h1>
-        <p class="lead">
-          The last active administrator cannot be demoted, disabled or deleted — a server
-          with no administrator cannot be recovered from the web.
-        </p>
+      <fkit-page
+        heading="Users"
+        value={
+          this.users
+            ? `${rows.length} total · ${admins} administrator${admins === 1 ? "" : "s"}`
+            : ""
+        }
+      >
+        <fkit-section blurb="The last active administrator cannot be demoted, disabled or deleted — a server with no administrator cannot be recovered from the web.">
+          <fkit-list>
+            {/* A header row, so the toggle column does not need the word
+                "admin" repeated on every line to say what it is. */}
+            <div class="urow head">
+              <span>user</span>
+              <span>email</span>
+              <span class="num">repos</span>
+              <span>joined</span>
+              <span class="mid">admin</span>
+              <span></span>
+            </div>
 
-        <div class="panel">
-          <div class="panel-head">
-            <span>
-              accounts
-              {this.users ? (
-                <span class="fd" style="margin-left:9px">
-                  {rows.length} total · {admins} administrator{admins === 1 ? "" : "s"}
-                </span>
-              ) : null}
-            </span>
-          </div>
-
-          {/* A header row, so the toggle column does not need the word "admin"
-              repeated on every line to say what it is. */}
-          <div class="urow head">
-            <span>user</span>
-            <span>email</span>
-            <span class="num">repos</span>
-            <span>joined</span>
-            <span class="mid">admin</span>
-            <span></span>
-          </div>
-
-          {this.users === null
-            ? [0, 1, 2].map(() => (
-                <div class="urow sk-row">
-                  <span><span class="sk tall" style="width:70px"></span></span>
-                  <span><span class="sk" style="width:130px"></span></span>
-                  <span class="num"><span class="sk" style="width:18px"></span></span>
-                  <span><span class="sk" style="width:74px"></span></span>
-                  <span class="mid"><span class="sk" style="width:30px"></span></span>
-                  <span></span>
-                </div>
-              ))
-            : rows.map((u) => this.userRow(u, u.id === me?.id))}
-        </div>
-      </div>
+            {this.users === null
+              ? [0, 1, 2].map(() => (
+                  <div class="urow sk-row">
+                    <span><span class="sk tall" style="width:70px"></span></span>
+                    <span><span class="sk" style="width:130px"></span></span>
+                    <span class="num"><span class="sk" style="width:18px"></span></span>
+                    <span><span class="sk" style="width:74px"></span></span>
+                    <span class="mid"><span class="sk" style="width:30px"></span></span>
+                    <span></span>
+                  </div>
+                ))
+              : rows.map((u) => this.userRow(u, u.id === me?.id))}
+          </fkit-list>
+        </fkit-section>
+      </fkit-page>
     );
   }
 

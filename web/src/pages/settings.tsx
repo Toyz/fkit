@@ -175,317 +175,287 @@ export class PageSettings extends SettingsBase {
   private profile() {
     const u = this.me;
     return (
-      <div class="sec">
-        <h1>profile</h1>
-        <div class="panel">
-          <div class="panel-body">
-            <form
-              class="stack"
-              onSubmit={(e: Event) => {
-                e.preventDefault();
-                const f = e.target as HTMLFormElement;
-                const display_name = (f.elements.namedItem("display_name") as HTMLInputElement).value;
-                const email = (f.elements.namedItem("email") as HTMLInputElement).value;
-                void this.act(async () => {
-                  const next = await api.updateProfile({ display_name, email });
-                  this.me = next;
-                  await this.session.load();
-                }, "saved");
-              }}
+      <fkit-page heading="Profile" value={this.me?.username ?? ""}>
+        <fkit-section
+          blurb="Your username and display name appear beside your commits and on any repository you own."
+        >
+          <form
+            onSubmit={(e: Event) => {
+              e.preventDefault();
+              const f = e.target as HTMLFormElement;
+              const display_name = (f.elements.namedItem("display_name") as HTMLInputElement).value;
+              const email = (f.elements.namedItem("email") as HTMLInputElement).value;
+              void this.act(async () => {
+                const next = await api.updateProfile({ display_name, email });
+                this.me = next;
+                await this.session.load();
+              }, "Profile updated");
+            }}
+          >
+            <fkit-field
+              label="Username"
+              help="Permanent. It is part of every repository URL you own, so changing it would break every clone anyone has taken."
             >
-              <div class="field">
-                <label>username</label>
-                <input value={u?.username ?? ""} disabled />
-                <div class="fd">Usernames are permanent — they appear in every repository URL.</div>
-              </div>
-              <div class="field">
-                <label>display name</label>
-                <input name="display_name" value={u?.display_name ?? ""} placeholder="Your Name" />
-              </div>
-              <div class="field">
-                <label>email</label>
-                <input name="email" type="email" value={u?.email ?? ""} required />
-              </div>
-              <div class="row">
-                <button class="primary" type="submit" disabled={this.busy}>save</button>
-                {this.notice ? <span class="ok">{this.notice}</span> : null}
-              </div>
-            </form>
-          </div>
-        </div>
-      </div>
+              <input value={u?.username ?? ""} disabled />
+            </fkit-field>
+
+            <fkit-field
+              label="Display name"
+              help="Shown beside your commits. Leave empty to use your username."
+            >
+              <input name="display_name" value={u?.display_name ?? ""} placeholder="Your name" />
+            </fkit-field>
+
+            <fkit-field
+              label="Email"
+              help="Used for password resets. Never shown on a public page."
+            >
+              <input name="email" type="email" value={u?.email ?? ""} required />
+            </fkit-field>
+
+            <fkit-actions>
+              <button class="primary" type="submit" disabled={this.busy}>Save profile</button>
+              {this.notice ? <span class="ok">{this.notice}</span> : null}
+            </fkit-actions>
+          </form>
+        </fkit-section>
+      </fkit-page>
     );
   }
 
   private password() {
     return (
-      <div class="sec">
-        <h1>password</h1>
-        <p class="lead">
-          Changing it signs out every other session, so a stolen one stops working immediately.
-        </p>
-        <div class="panel">
-          <div class="panel-body">
-            <form
-              class="stack"
-              onSubmit={(e: Event) => {
-                e.preventDefault();
-                const f = e.target as HTMLFormElement;
-                const cur = (f.elements.namedItem("current") as HTMLInputElement);
-                const next = (f.elements.namedItem("next") as HTMLInputElement);
-                const again = (f.elements.namedItem("again") as HTMLInputElement);
-                if (next.value !== again.value) {
-                  this.error = "the two new passwords do not match";
-                  return;
-                }
-                void this.act(async () => {
-                  await api.changePassword(cur.value, next.value);
-                  cur.value = "";
-                  next.value = "";
-                  again.value = "";
-                }, "password changed; other sessions signed out");
-              }}
+      <fkit-page heading="Password">
+        <fkit-section
+          blurb="Changing your password signs out every other session, so a stolen one stops working immediately."
+        >
+          <form
+            onSubmit={(e: Event) => {
+              e.preventDefault();
+              const f = e.target as HTMLFormElement;
+              const at = (n: string) => (f.elements.namedItem(n) as HTMLInputElement).value;
+              if (at("next") !== at("again")) {
+                this.error = "The new passwords do not match.";
+                return;
+              }
+              void this.act(async () => {
+                await api.changePassword(at("current"), at("next"));
+                f.reset();
+              }, "Password changed");
+            }}
+          >
+            <fkit-field label="Current password">
+              <input name="current" type="password" autocomplete="current-password" required />
+            </fkit-field>
+
+            <fkit-field
+              label="New password"
+              help="At least 10 characters. Length beats punctuation."
             >
-              <div class="field">
-                <label>current password</label>
-                <input name="current" type="password" autocomplete="current-password" required />
-              </div>
-              <div class="field">
-                <label>new password</label>
-                <input name="next" type="password" autocomplete="new-password" required />
-                <div class="fd">At least 10 characters. Length beats punctuation.</div>
-              </div>
-              <div class="field">
-                <label>confirm</label>
-                <input name="again" type="password" autocomplete="new-password" required />
-              </div>
-              <div class="row">
-                <button class="primary" type="submit" disabled={this.busy}>change password</button>
-                {this.notice ? <span class="ok">{this.notice}</span> : null}
-              </div>
-            </form>
-          </div>
-        </div>
-      </div>
+              <input name="next" type="password" autocomplete="new-password" required />
+            </fkit-field>
+
+            <fkit-field label="Confirm new password">
+              <input name="again" type="password" autocomplete="new-password" required />
+            </fkit-field>
+
+            <fkit-actions>
+              <button class="primary" type="submit" disabled={this.busy}>Change password</button>
+              {this.notice ? <span class="ok">{this.notice}</span> : null}
+            </fkit-actions>
+          </form>
+        </fkit-section>
+      </fkit-page>
     );
   }
 
   private tokensSection() {
+    const list = this.tokens;
     return (
-      <div class="sec">
-        <h1>access tokens</h1>
-        <p class="lead">
-          Used by the <code>fkit</code> CLI. A token can only narrow what you may do — a
-          read-only one cannot push, even to your own repositories.
-        </p>
-
+      <fkit-page heading="Access tokens" value={this.tokens ? `${this.tokens.length} active` : ""}>
         {this.fresh ? (
-          <div class="panel fresh">
-            <div class="panel-head"><span>copy this now — it is not shown again</span></div>
-            <div class="panel-body">
-              <div class="secret">
-                <code>{this.fresh.secret}</code>
-                <button
-                  onClick={async () => {
-                    await navigator.clipboard.writeText(this.fresh!.secret).catch(() => {});
-                    this.copied = true;
-                    this.clearCopied();
-                  }}
-                >
-                  <loom-icon name={this.copied ? "check" : "copy"} size={12}></loom-icon>
-                  {this.copied ? "copied" : "copy"}
-                </button>
-              </div>
-              <div class="fd" style="margin-top:8px">
-                Use it as <code>FKIT_TOKEN</code>, or{" "}
-                <code>fkit config --global token &lt;value&gt;</code>.
-              </div>
+          <fkit-section heading="Your new token">
+            <p class="blurb-warn">Copy it now — it is not shown again.</p>
+            <div class="secret">
+              <code>{this.fresh.secret}</code>
+              <button
+                onClick={async () => {
+                  await navigator.clipboard.writeText(this.fresh!.secret).catch(() => {});
+                  this.copied = true;
+                  setTimeout(() => (this.copied = false), 1400);
+                }}
+              >
+                <loom-icon name={this.copied ? "check" : "copy"} size={12}></loom-icon>
+                {this.copied ? "Copied" : "Copy"}
+              </button>
             </div>
-          </div>
+          </fkit-section>
         ) : null}
 
-        <div class="panel">
-          <div class="panel-body">
-            <form
-              class="new-token"
-              onSubmit={(e: Event) => {
-                e.preventDefault();
-                const input = (e.target as HTMLFormElement).elements.namedItem(
-                  "name",
-                ) as HTMLInputElement;
-                void this.act(async () => {
-                  this.fresh = await api.createToken({
-                    name: input.value.trim(),
-                    can_write: this.canWrite,
-                  });
-                  input.value = "";
-                  this.copied = false;
-                  this.tokens = await api.tokens();
-                });
-              }}
-            >
-              <div class="field">
-                <label>new token</label>
+        <fkit-section
+          blurb="Used by the fkit CLI to clone and push. A token can only narrow what you may do — a read-only one cannot push, even to your own repositories."
+        >
+          <form
+            onSubmit={(e: Event) => {
+              e.preventDefault();
+              const f = e.target as HTMLFormElement;
+              const input = f.elements.namedItem("name") as HTMLInputElement;
+              const name = input.value.trim();
+              if (!name) return;
+              void this.act(async () => {
+                this.fresh = await api.createToken({ name, can_write: this.canWrite });
+                this.copied = false;
+                this.tokens = await api.tokens();
+                input.value = "";
+              });
+            }}
+          >
+            <fkit-add>
+              <fkit-field label="Token name">
                 <input name="name" placeholder="laptop" required />
-              </div>
-              <span class="check" style="margin-bottom:7px">
+              </fkit-field>
+              <span class="check">
                 <fkit-toggle
                   checked={this.canWrite}
                   label="allow push"
                   onToggle={(e: Event) => (this.canWrite = (e as CustomEvent<boolean>).detail)}
                 ></fkit-toggle>
-                allow push
+                Allow push
               </span>
-              <button class="primary" type="submit" disabled={this.busy} style="margin-bottom:1px">
-                <loom-icon name="key" size={12}></loom-icon> generate
-              </button>
-            </form>
-          </div>
+              <button class="primary" type="submit" disabled={this.busy}>Generate</button>
+            </fkit-add>
+          </form>
 
-          {this.tokens === null ? (
-            <div class="row-item"><span class="sk" style="width:200px"></span></div>
-          ) : this.tokens.length === 0 ? (
-            <div class="row-item"><span class="muted">no tokens yet</span></div>
-          ) : (
-            this.tokens.map((t) => (
-              <div class="row-item" loom-key={t.id}>
-                <span>
-                  <span class="rt">{t.name}</span>
-                  <span class="rs">
-                    fkit_pat_{t.prefix}… · {t.last_used_at ? `used ${relativeTime(t.last_used_at)}` : "never used"}
-                  </span>
-                </span>
-                <span class={`tag ${t.can_write ? "on" : ""}`}>
-                  {t.can_write ? "read+write" : "read"}
-                </span>
-                <button
-                  class="danger bare"
-                  disabled={this.busy}
-                  onClick={async () => {
-                    const ok = await confirmAction({
-                      title: `Revoke "${t.name}"?`,
-                      body: "Anything using this token stops working immediately. This cannot be undone — you would need to create a new one.",
-                      confirm: "revoke token",
-                      danger: true,
-                    });
-                    if (!ok) return;
-                    await this.act(async () => {
-                      await api.revokeToken(t.id);
-                      this.tokens = await api.tokens();
-                    });
-                  }}
+          <fkit-list heading="Tokens">
+            {list === null ? (
+              <fkit-empty><span class="sk" style="width:200px"></span></fkit-empty>
+            ) : list.length === 0 ? (
+              <fkit-empty>No tokens yet. Generate one to clone or push from the CLI.</fkit-empty>
+            ) : (
+              list.map((t) => (
+                <fkit-row
+                  loom-key={t.id}
+                  icon="key"
+                  name={t.name}
+                  meta={`fkit_pat_${t.prefix}… · ${t.last_used_at ? `last used ${relativeTime(t.last_used_at)}` : "never used"}`}
                 >
-                  revoke
-                </button>
-              </div>
-            ))
-          )}
-        </div>
-      </div>
+                  <span class={`tag ${t.can_write ? "on" : ""}`}>
+                    {t.can_write ? "read + write" : "read"}
+                  </span>
+                  <button
+                    class="danger bare"
+                    disabled={this.busy}
+                    onClick={async () => {
+                      const ok = await confirmAction({
+                        title: `Revoke "${t.name}"?`,
+                        body: "Anything using this token stops working immediately. This cannot be undone — you would need to create a new one.",
+                        confirm: "Revoke token",
+                        danger: true,
+                      });
+                      if (!ok) return;
+                      void this.act(async () => {
+                        await api.revokeToken(t.id);
+                        this.tokens = await api.tokens();
+                      });
+                    }}
+                  >
+                    Revoke
+                  </button>
+                </fkit-row>
+              ))
+            )}
+          </fkit-list>
+        </fkit-section>
+      </fkit-page>
     );
   }
 
   private sessionsSection() {
     const list = this.sessions;
-    const others = (list ?? []).filter((s) => !s.current).length;
-
+    const others = (list ?? []).filter((x) => !x.current).length;
     return (
-      <div class="sec">
-        <h1>sessions</h1>
-        <p class="lead">
-          Browsers signed in to this account. Access tokens are listed separately.
-        </p>
-
-        <div class="panel">
-          <div class="panel-head">
-            <span>active</span>
-            <span class="val faint">{list ? String(list.length) : ""}</span>
-          </div>
-
-          {list === null ? (
-            <div class="row-item"><span class="sk" style="width:220px"></span></div>
-          ) : list.length === 0 ? (
-            <div class="row-item"><span class="muted">no active sessions</span></div>
-          ) : (
-            list.map((s) => (
-              <div class={`sess ${s.current ? "cur" : ""}`}>
-                <span class="si">
-                  <loom-icon name={s.current ? "check" : "history"} size={14}></loom-icon>
-                </span>
-                <span>
-                  <span class="rt">
-                    {shortAgent(s.user_agent)}
-                    {s.current ? <span class="tag on" style="margin-left:8px">this browser</span> : null}
-                  </span>
-                  <span class="rs">
-                    signed in {relativeTime(s.created_at)} · expires {relativeTime(s.expires_at)}
-                  </span>
-                </span>
-                <button
-                  class="danger bare"
-                  disabled={this.busy}
-                  onClick={async () => {
-                    const ok = await confirmAction({
-                      title: s.current ? "Sign out of this browser?" : "Revoke this session?",
-                      body: s.current
-                        ? "You will be signed out here and returned to the sign-in page."
-                        : `${shortAgent(s.user_agent)} will be signed out immediately.`,
-                      confirm: s.current ? "sign out" : "revoke",
-                      danger: true,
-                    });
-                    if (!ok) return;
-                    await this.act(async () => {
-                      await api.revokeSession(s.id);
-                      if (s.current) {
-                        await this.session.logout().catch(() => {});
-                        go("/login");
-                        return;
-                      }
-                      this.sessions = await api.sessions();
-                    });
-                  }}
+      <fkit-page heading="Sessions" value={this.sessions ? `${this.sessions.length} active` : ""}>
+        <fkit-section
+          blurb="Browsers signed in to this account. Access tokens are listed separately."
+        >
+          <fkit-list heading="Active sessions">
+            {list === null ? (
+              <fkit-empty><span class="sk" style="width:200px"></span></fkit-empty>
+            ) : list.length === 0 ? (
+              <fkit-empty>No active sessions.</fkit-empty>
+            ) : (
+              list.map((sess) => (
+                <fkit-row
+                  loom-key={sess.id}
+                  icon={sess.current ? "check" : "history"}
+                  current={sess.current}
+                  name={shortAgent(sess.user_agent)}
+                  meta={`Signed in ${relativeTime(sess.created_at)} · expires ${relativeTime(sess.expires_at)}`}
                 >
-                  {s.current ? "sign out" : "revoke"}
-                </button>
-              </div>
-            ))
-          )}
-        </div>
+                  {sess.current ? <span class="tag on">This browser</span> : null}
+                  <button
+                    class="danger bare"
+                    disabled={this.busy}
+                    onClick={async () => {
+                      const ok = await confirmAction({
+                        title: sess.current ? "Sign out of this browser?" : "Revoke this session?",
+                        body: sess.current
+                          ? "You will be signed out here and returned to the sign-in page."
+                          : `${shortAgent(sess.user_agent)} will be signed out immediately.`,
+                        confirm: sess.current ? "Sign out" : "Revoke",
+                        danger: true,
+                      });
+                      if (!ok) return;
+                      void this.act(async () => {
+                        await api.revokeSession(sess.id);
+                        if (sess.current) {
+                          await this.session.logout();
+                          go("/login");
+                          return;
+                        }
+                        this.sessions = await api.sessions();
+                      });
+                    }}
+                  >
+                    {sess.current ? "Sign out" : "Revoke"}
+                  </button>
+                </fkit-row>
+              ))
+            )}
+          </fkit-list>
+        </fkit-section>
 
         {others > 0 ? (
-          <div class="panel">
-            <div class="panel-body">
-              <div class="row">
-                <button
-                  class="danger"
-                  disabled={this.busy}
-                  onClick={async () => {
-                    const ok = await confirmAction({
-                      title: "Sign out everywhere else?",
-                      body: `${others} other session(s) will be signed out. This browser stays signed in.`,
-                      confirm: "sign out others",
-                      danger: true,
-                    });
-                    if (!ok) return;
-                    await this.act(async () => {
-                      const r = await api.revokeOtherSessions();
-                      this.sessions = await api.sessions();
-                      this.notice = `${r.revoked} session(s) signed out`;
-                    });
-                  }}
-                >
-                  sign out everywhere else
-                </button>
-                {this.notice ? <span class="ok">{this.notice}</span> : null}
-              </div>
-              <div class="fd">
-                Use this if you think someone else is signed in. Changing your password does
-                the same thing automatically.
-              </div>
-            </div>
-          </div>
+          <fkit-section
+            heading="Sign out everywhere else"
+            blurb={`Ends ${others} other ${others === 1 ? "session" : "sessions"} and leaves this one alone. Changing your password does the same thing.`}
+          >
+            <fkit-actions>
+              <button
+                class="danger"
+                disabled={this.busy}
+                onClick={async () => {
+                  const ok = await confirmAction({
+                    title: "Sign out everywhere else?",
+                    body: `${others} other ${others === 1 ? "session" : "sessions"} will be signed out. This browser stays signed in.`,
+                    confirm: "Sign out everywhere else",
+                    danger: true,
+                  });
+                  if (!ok) return;
+                  await this.act(async () => {
+                    const r = await api.revokeOtherSessions();
+                    this.sessions = await api.sessions();
+                    this.notice = `${r.revoked} session(s) signed out`;
+                  });
+                }}
+              >
+                Sign out everywhere else
+              </button>
+              {this.notice ? <span class="ok">{this.notice}</span> : null}
+            </fkit-actions>
+          </fkit-section>
         ) : null}
-      </div>
+      </fkit-page>
     );
   }
 

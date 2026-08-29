@@ -549,7 +549,7 @@ const sheet = css`
   /* ---- setup instructions ---- */
   /* A centred column: the panel is full width but the instructions are a
      reading measure, and left-anchoring them left a dead half-screen. */
-  .setup { display: flex; flex-direction: column; gap: 15px; max-width: 620px; margin: 0 auto; }
+  .setup { display: flex; flex-direction: column; gap: 14px; }
   .setup-block { display: flex; flex-direction: column; gap: 5px; }
   /* Label and copy button share a baseline above the block, so the button is
      where the eye already is rather than floating over the code. */
@@ -558,6 +558,7 @@ const sheet = css`
     font-size: 11px; text-transform: uppercase; letter-spacing: .07em; color: var(--muted);
   }
   .setup-label button { font-size: 11px; text-transform: none; letter-spacing: 0; }
+  fkit-list .cmd-block { border: 0; border-radius: 0; padding: 11px 14px; background: transparent; }
   .cmd-block {
     margin: 0; padding: 9px 12px; overflow-x: auto;
     background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
@@ -898,6 +899,11 @@ export class PageRepo extends LoomElement {
   @reactive accessor copied = false;
   /// Which setup block was most recently copied.
   @reactive accessor copiedKey = "";
+
+  /// Topics being edited, or null while they are still whatever the server
+  /// last said. Distinguishing the two is what lets "remove every topic" save
+  /// as an empty list rather than reading as "no edit".
+  @reactive accessor topicDraft: string[] | null = null;
   /**
    * The line diff, which can be real work on a large commit. It is its own
    * query so the summary is not waiting behind it — and being keyed by the
@@ -1062,6 +1068,7 @@ export class PageRepo extends LoomElement {
 
     this.copied = false;
     this.copiedKey = "";
+    this.topicDraft = null;
     this.notice = "";
     this.busy = false;
     this.collapsed = {};
@@ -2298,16 +2305,13 @@ fkit push</pre>
   private codeBlock(id: string, label: string, text: string) {
     const done = this.copiedKey === id;
     return (
-      <div class="setup-block">
-        <div class="setup-label">
-          <span>{label}</span>
-          <button class="bare" onClick={() => void this.copyText(id, text)}>
-            <loom-icon name={done ? "check" : "copy"} size={11}></loom-icon>
-            {done ? "copied" : "copy"}
-          </button>
-        </div>
+      <fkit-list heading={label}>
+        <button slot="action" class="bare" onClick={() => void this.copyText(id, text)}>
+          <loom-icon name={done ? "check" : "copy"} size={11}></loom-icon>
+          {done ? "copied" : "copy"}
+        </button>
         <pre class="cmd-block">{text}</pre>
-      </div>
+      </fkit-list>
     );
   }
 
@@ -2338,16 +2342,7 @@ fkit push</pre>
 
     return (
       <div class="setup">
-        <div class="setup-block">
-          <div class="setup-label">
-            <span>remote</span>
-            <button class="bare" onClick={() => void this.copyText("url", url)}>
-              <loom-icon name={this.copiedKey === "url" ? "check" : "copy"} size={11}></loom-icon>
-              {this.copiedKey === "url" ? "copied" : "copy"}
-            </button>
-          </div>
-          <pre class="cmd-block url">{url}</pre>
-        </div>
+        {this.codeBlock("url", "remote", url)}
 
         {canPush
           ? this.codeBlock(
@@ -2437,12 +2432,11 @@ fkit push</pre>
           {section === "general" ? this.settingsGeneral(r, at) : null}
           {section === "access" ? this.settingsAccess(r, at) : null}
           {section === "setup" ? (
-            <div>
-              <h1>push &amp; clone</h1>
-              <div class="panel" style="margin-top:12px">
-                <div class="panel-body">{this.renderSetup(r)}</div>
-              </div>
-            </div>
+            <fkit-page heading="Push & clone" value={syncUrl(r.owner, r.name)}>
+              <fkit-section blurb="Every command below is copyable. Pushing needs a token with write access; cloning a public repository needs nothing.">
+                {this.renderSetup(r)}
+              </fkit-section>
+            </fkit-page>
           ) : null}
           {section === "danger" ? this.settingsDanger(r, at) : null}
         </div>
@@ -2451,248 +2445,247 @@ fkit push</pre>
   }
 
   private settingsGeneral(r: Repo, at: { owner: string; name: string }) {
+    const branches = this.branches();
     return (
-      <div>
-        <h1>general</h1>
-        <p class="lead">Everything here is visible to anyone who can see the repository.</p>
-
-        <div class="panel">
-          <div class="panel-body">
-            <form
-              class="stack"
-              onSubmit={(e: Event) => {
-                e.preventDefault();
-                const f = e.target as HTMLFormElement;
-                const at2 = (n: string) =>
-                  (f.elements.namedItem(n) as HTMLInputElement).value;
-                void this.act(async () => {
-                  await api.updateRepo(at.owner, at.name, {
-                    description: at2("description"),
-                    homepage: at2("homepage"),
-                    // Comma or space separated; the server normalises and
-                    // de-duplicates, so this only has to split.
-                    topics: at2("topics").split(/[,\s]+/).filter(Boolean),
-                  });
-                }, "saved");
-              }}
+      <fkit-page heading="General" value={r.full_name}>
+        <fkit-section blurb="Everything here is visible to anyone who can see the repository.">
+          <form
+            onSubmit={(e: Event) => {
+              e.preventDefault();
+              const f = e.target as HTMLFormElement;
+              const at2 = (n: string) => (f.elements.namedItem(n) as HTMLInputElement).value;
+              void this.act(async () => {
+                await api.updateRepo(at.owner, at.name, {
+                  description: at2("description"),
+                  homepage: at2("homepage"),
+                  // Comma or space separated; the server normalises and
+                  // de-duplicates, so this only has to split.
+                  topics: this.topicDraft ?? r.topics ?? [],
+                });
+              }, "Repository updated");
+            }}
+          >
+            <fkit-field
+              label="Repository name"
+              help="Permanent. The name is part of every clone URL anyone has taken."
             >
-              <div class="field">
-                <label>name</label>
-                <input value={r.name} disabled />
-                <div class="fd">
-                  Renaming is not supported yet — the name is part of every clone URL.
-                </div>
-              </div>
-              <div class="field">
-                <label>description</label>
-                <input
-                  name="description"
-                  value={r.description ?? ""}
-                  placeholder="one line about what this is"
-                />
-                <div class="fd">Shown beside the name in listings and at the top of the page.</div>
-              </div>
-              <div class="field">
-                <label>website</label>
-                <input
-                  name="homepage"
-                  value={r.homepage ?? ""}
-                  placeholder="https://fkit.work"
-                />
-                <div class="fd">
-                  Linked from the About panel. Must start with http:// or https:// —
-                  anything else would be a link that runs in a visitor's session rather
-                  than taking them somewhere.
-                </div>
-              </div>
-              <div class="field">
-                <label>topics</label>
-                <input
-                  name="topics"
-                  value={(r.topics ?? []).join(", ")}
-                  placeholder="rust, version-control, merkle"
-                />
-                <div class="fd">
-                  Comma separated. Letters, digits, hyphen and dot; up to 20.
-                </div>
-              </div>
-              <div class="row">
-                <button class="primary" type="submit" disabled={this.busy}>save</button>
-                {this.notice ? <span class="ok">{this.notice}</span> : null}
-              </div>
-            </form>
-          </div>
-        </div>
+              <input value={r.name} disabled />
+            </fkit-field>
 
-        <div class="panel">
-          <div class="panel-head"><span>default branch</span></div>
-          <div class="panel-body">
-            <div class="row">
-              <fkit-select
-                value={r.default_branch}
-                options={this.branches().map((b) => ({ value: b.name, label: b.name, hint: b.short }))}
-                onPick={(e: Event) => {
-                  const v = (e as CustomEvent<string>).detail;
-                  void this.act(async () => {
-                    await api.updateRepo(at.owner, at.name, { default_branch: v });
-                    await this.repoQuery.refetch();
-                  }, "saved");
-                }}
-              ></fkit-select>
-              <span class="fd" style="margin:0">
-                Opened when a URL names no branch. {this.branches().length} branch(es) available.
-              </span>
-            </div>
-          </div>
-        </div>
-      </div>
+            <fkit-field
+              label="Description"
+              help="Shown beside the name in listings and at the top of the page."
+              size="wide"
+            >
+              <input
+                name="description"
+                value={r.description ?? ""}
+                placeholder="One line about what this is"
+              />
+            </fkit-field>
+
+            <fkit-field
+              label="Website"
+              help="Linked from the About panel. Must start with http:// or https:// — anything else would run in a visitor's session instead of taking them somewhere."
+              size="wide"
+            >
+              <input name="homepage" value={r.homepage ?? ""} placeholder="https://fkit.work" />
+            </fkit-field>
+
+            <fkit-field
+              label="Topics"
+              help="Enter, comma or space adds one. Backspace takes the last one back. Letters, digits, hyphen and dot; up to 20."
+              size="wide"
+            >
+              <fkit-tags
+                value={this.topicDraft ?? r.topics ?? []}
+                placeholder="rust, version-control, merkle"
+                onChange={(e: Event) => (this.topicDraft = (e as CustomEvent<string[]>).detail)}
+              ></fkit-tags>
+            </fkit-field>
+
+            <fkit-actions>
+              <button class="primary" type="submit" disabled={this.busy}>Save changes</button>
+              {this.notice ? <span class="ok">{this.notice}</span> : null}
+            </fkit-actions>
+          </form>
+        </fkit-section>
+
+        <fkit-section
+          heading="Default branch"
+          value={r.default_branch}
+          blurb={`Opened when a URL names no branch. ${branches.length} ${branches.length === 1 ? "branch" : "branches"} available.`}
+        >
+          <fkit-field size="narrow">
+            <fkit-select
+              value={r.default_branch}
+              options={branches.map((b) => ({ value: b.name, label: b.name, hint: b.short }))}
+              onPick={(e: Event) => {
+                const v = (e as CustomEvent<string>).detail;
+                void this.act(async () => {
+                  await api.updateRepo(at.owner, at.name, { default_branch: v });
+                  await this.repoQuery.refetch();
+                }, "Default branch updated");
+              }}
+            ></fkit-select>
+          </fkit-field>
+        </fkit-section>
+      </fkit-page>
     );
   }
 
   private settingsAccess(r: Repo, at: { owner: string; name: string }) {
+    const people = this.collaborators;
     return (
-      <div>
-        <h1>access</h1>
-        <p class="lead">Who can read this repository, and who can push to it.</p>
-        <div class="panel">
-          <div class="panel-head"><span>who can see this</span></div>
-          <fkit-choice
-            value={r.visibility}
-            disabled={this.busy}
-            options={[
-              {
-                value: "private",
-                label: "private",
-                icon: "lock",
-                hint: "Only you and the collaborators below. Cloning requires a token.",
-              },
-              {
-                value: "public",
-                label: "public",
-                icon: "repo",
-                hint: "Anyone can read and clone it, with or without an account. Pushing still requires write access.",
-              },
-            ]}
-            onPick={(e: Event) => {
-              const v = (e as CustomEvent<string>).detail;
-              void this.act(async () => {
-                await api.updateRepo(at.owner, at.name, { visibility: v });
-                await this.repoQuery.refetch();
-              });
-            }}
-          ></fkit-choice>
-        </div>
-
-        <div class="panel">
-          <div class="panel-head">
-            <span>collaborators</span>
-            <span class="val faint">{this.collaborators?.length ?? ""}</span>
-          </div>
-          <div class="panel-body">
-            <form
-              class="collab-add"
-              onSubmit={(e: Event) => {
-                e.preventDefault();
-                const user = (e.target as HTMLFormElement).elements.namedItem(
-                  "username",
-                ) as HTMLInputElement;
+      <fkit-page>
+        <fkit-section
+          heading="Visibility"
+          value={r.visibility}
+          blurb="Who can read this repository and clone it."
+        >
+          <fkit-list>
+            <fkit-choice
+              value={r.visibility}
+              disabled={this.busy}
+              options={[
+                {
+                  value: "private",
+                  label: "Private",
+                  icon: "lock",
+                  hint: "Only you and the collaborators below. Cloning requires a token.",
+                },
+                {
+                  value: "public",
+                  label: "Public",
+                  icon: "repo",
+                  hint: "Anyone can read and clone it, with or without an account. Pushing still requires write access.",
+                },
+              ]}
+              onPick={(e: Event) => {
+                const v = (e as CustomEvent<string>).detail;
                 void this.act(async () => {
-                  await api.addCollaborator(at.owner, at.name, user.value.trim(), this.newRole);
-                  await this.collaboratorsQuery.refetch();
-                  user.value = "";
-                });
+                  await api.updateRepo(at.owner, at.name, { visibility: v });
+                  await this.repoQuery.refetch();
+                }, "Visibility updated");
               }}
-            >
-              <input name="username" placeholder="username" required />
-              <fkit-select
-                value={this.newRole}
-                options={[
-                  { value: "read", label: "read", hint: "Clone only." },
-                  { value: "write", label: "write", hint: "Clone and push." },
-                  { value: "admin", label: "admin", hint: "Also settings." },
-                ]}
-                onPick={(e: Event) => (this.newRole = (e as CustomEvent<string>).detail)}
-              ></fkit-select>
-              <button class="primary" type="submit" disabled={this.busy}>
-                <loom-icon name="plus" size={12}></loom-icon> add
-              </button>
-            </form>
-            <div class="collab-note">Read can clone; write can push. No self-service join.</div>
-          </div>
+            ></fkit-choice>
+          </fkit-list>
+        </fkit-section>
 
-          {this.collaborators === null ? (
-            <div class="collab-empty">loading</div>
-          ) : this.collaborators.length === 0 ? (
-            <div class="collab-empty">Only {r.owner} has access.</div>
-          ) : (
-            this.collaborators.map((c) => (
-              <div class="collab" loom-key={c.username}>
-                <span class="cu">{c.username}</span>
-                <span class="tag">{c.role}</span>
-                <span class="faint" style="font-size:11px">
-                  since {relativeTime(c.granted_at)}
-                </span>
-                <button
-                  class="danger bare"
-                  disabled={this.busy}
-                  onClick={async () => {
-                    const ok = await confirmAction({
-                      title: `Remove ${c.username}?`,
-                      body: `They lose access to ${r.full_name} immediately. Anything already cloned stays on their machine.`,
-                      confirm: "remove",
-                      danger: true,
-                    });
-                    if (!ok) return;
-                    await this.act(async () => {
-                      await api.removeCollaborator(at.owner, at.name, c.username);
-                      await this.collaboratorsQuery.refetch();
-                    });
-                  }}
+        <fkit-section
+          heading="Collaborators"
+          value={people ? `${people.length + 1} with access` : ""}
+          blurb="Read can clone; write can also push; admin can also change these settings. There is no self-service join — you add people here."
+        >
+          <form
+            onSubmit={(e: Event) => {
+              e.preventDefault();
+              const f = e.target as HTMLFormElement;
+              const user = f.elements.namedItem("username") as HTMLInputElement;
+              void this.act(async () => {
+                await api.addCollaborator(at.owner, at.name, user.value.trim(), this.newRole);
+                await this.collaboratorsQuery.refetch();
+                user.value = "";
+              }, "Collaborator added");
+            }}
+          >
+            <fkit-add>
+              <fkit-field label="Username" size="mid">
+                <input name="username" placeholder="username" required />
+              </fkit-field>
+              <fkit-field label="Role" size="narrow">
+                <fkit-select
+                  value={this.newRole}
+                  options={[
+                    { value: "read", label: "read", hint: "Clone only." },
+                    { value: "write", label: "write", hint: "Clone and push." },
+                    { value: "admin", label: "admin", hint: "Also settings." },
+                  ]}
+                  onPick={(e: Event) => (this.newRole = (e as CustomEvent<string>).detail)}
+                ></fkit-select>
+              </fkit-field>
+              <button class="primary" type="submit" disabled={this.busy}>
+                <loom-icon name="plus" size={12}></loom-icon> Add
+              </button>
+            </fkit-add>
+          </form>
+
+          <fkit-list>
+            <fkit-row icon="check" current name={r.owner} meta="Owner — created this repository">
+              <span class="tag on">owner</span>
+            </fkit-row>
+            {people === null ? (
+              <fkit-empty><span class="sk" style="width:200px"></span></fkit-empty>
+            ) : (
+              people.map((c) => (
+                <fkit-row
+                  loom-key={c.username}
+                  icon="user"
+                  name={c.username}
+                  meta={`Added ${relativeTime(c.granted_at)}`}
                 >
-                  remove
-                </button>
-              </div>
-            ))
-          )}
-        </div>
-      </div>
+                  <span class="tag">{c.role}</span>
+                  <button
+                    class="danger bare"
+                    disabled={this.busy}
+                    onClick={async () => {
+                      const ok = await confirmAction({
+                        title: `Remove ${c.username}?`,
+                        body: `They lose access to ${r.full_name} immediately. Anything already cloned stays on their machine.`,
+                        confirm: "Remove",
+                        danger: true,
+                      });
+                      if (!ok) return;
+                      await this.act(async () => {
+                        await api.removeCollaborator(at.owner, at.name, c.username);
+                        await this.collaboratorsQuery.refetch();
+                      }, "Collaborator removed");
+                    }}
+                  >
+                    Remove
+                  </button>
+                </fkit-row>
+              ))
+            )}
+          </fkit-list>
+        </fkit-section>
+      </fkit-page>
     );
   }
 
   private settingsDanger(r: Repo, at: { owner: string; name: string }) {
     return (
-      <div>
-        <h1>danger zone</h1>
-        <div class="panel danger" style="margin-top:12px">
-          <div class="panel-head"><span>delete this repository</span></div>
-          <div class="panel-body">
-            <p class="muted prose" style="font-size:12px;margin:0 0 11px">
-              Removes the repository, every branch, and all objects stored for it. Clones on
-              other machines keep working; this server keeps nothing.
-            </p>
-            <button
-              class="danger"
-              disabled={this.busy}
-              onClick={async () => {
-                const ok = await confirmAction({
-                  title: `Delete ${r.full_name}?`,
-                  body: "This cannot be undone. Type the repository name to confirm.",
-                  confirm: "delete repository",
-                  danger: true,
-                  typeToConfirm: r.name,
-                });
-                if (!ok) return;
-                await this.act(async () => {
-                  await api.deleteRepo(at.owner, at.name);
-                  go("/");
-                });
-              }}
+      <fkit-page heading="Danger zone" value={r.full_name}>
+        <fkit-section blurb="Nothing here can be undone from this page.">
+          <fkit-danger>
+            <fkit-danger-row
+              name="Delete this repository"
+              why="Removes the repository, every branch, and all objects stored for it. Clones on other machines keep working; this server keeps nothing."
             >
-              <loom-icon name="trash" size={12}></loom-icon> delete {r.full_name}
-            </button>
-          </div>
-        </div>
-      </div>
+              <button
+                class="danger"
+                disabled={this.busy}
+                onClick={async () => {
+                  const ok = await confirmAction({
+                    title: `Delete ${r.full_name}?`,
+                    body: "This cannot be undone. Type the repository name to confirm.",
+                    confirm: "Delete repository",
+                    danger: true,
+                    typeToConfirm: r.name,
+                  });
+                  if (!ok) return;
+                  await this.act(async () => {
+                    await api.deleteRepo(at.owner, at.name);
+                    go("/");
+                  });
+                }}
+              >
+                <loom-icon name="trash" size={12}></loom-icon> Delete
+              </button>
+            </fkit-danger-row>
+          </fkit-danger>
+        </fkit-section>
+      </fkit-page>
     );
   }
 
