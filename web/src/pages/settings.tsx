@@ -6,7 +6,7 @@
  * four copies of that.
  */
 import { LoomElement, component, css, styles, reactive, mount, on, inject } from "@toyz/loom";
-import { debounce } from "@toyz/loom/element";
+import { debounce, clipboard } from "@toyz/loom/element";
 import { route } from "@toyz/loom/router";
 import { base } from "../ui";
 import { settingsLayout } from "../ui-settings";
@@ -55,11 +55,41 @@ function tokenMeta(t: Token): string {
 const sheet = css`
   .panel-body { padding: 14px; }
   form.stack { display: flex; flex-direction: column; gap: 12px; }
-  .secret {
-    display: flex; gap: 8px; align-items: center; margin-top: 4px;
+  /* Making a token: one row, one baseline. */
+  .mint {
+    display: flex; align-items: center; gap: 10px;
+    margin-bottom: 14px; flex-wrap: wrap;
   }
+  .mint-name { flex: 1; min-width: 220px; }
+  .mint-push {
+    display: flex; align-items: center; gap: 7px; flex: none;
+    /* The base sheet styles a label as an upper-case caption, which is right
+       above a field and wrong beside a switch. */
+    text-transform: none; letter-spacing: 0; font-weight: 400;
+    font-size: 12px; color: var(--muted); cursor: pointer; user-select: none;
+  }
+
+  /* The token that was just made. Accented because it is the one thing on
+     this page that cannot be recovered by reloading. */
+  .minted {
+    border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+    background: color-mix(in srgb, var(--accent) 7%, transparent);
+    border-radius: var(--radius);
+    padding: 10px 12px 12px; margin-bottom: 16px;
+  }
+  .minted-top {
+    display: flex; align-items: center; gap: 8px; margin-bottom: 8px;
+    font-size: 12px; color: var(--muted);
+  }
+  .minted-top b { color: var(--text); font-weight: 500; }
+  .minted-top loom-icon { color: var(--accent); }
+  .minted-top .grow { flex: 1; }
+  .minted-top .once { color: var(--accent); font-size: 11.5px; }
+
+  .secret { display: flex; gap: 8px; align-items: center; }
   .secret code {
     flex: 1; font-size: 11.5px; word-break: break-all;
+    font-family: var(--mono);
     background: var(--bg); border: 1px solid var(--border);
     border-radius: var(--radius); padding: 8px 10px;
   }
@@ -390,30 +420,14 @@ export class PageSettings extends SettingsBase {
   private tokensSection() {
     const list = this.tokens;
     return (
-      <fkit-page heading="Access tokens" value={this.tokens ? `${this.tokens.length} active` : ""}>
-        {this.fresh ? (
-          <fkit-section heading="Your new token">
-            <p class="blurb-warn">Copy it now — it is not shown again.</p>
-            <div class="secret">
-              <code>{this.fresh.secret}</code>
-              <button
-                onClick={async () => {
-                  await navigator.clipboard.writeText(this.fresh!.secret).catch(() => {});
-                  this.copied = true;
-                  setTimeout(() => (this.copied = false), 1400);
-                }}
-              >
-                <loom-icon name={this.copied ? "check" : "copy"} size={12}></loom-icon>
-                {this.copied ? "Copied" : "Copy"}
-              </button>
-            </div>
-          </fkit-section>
-        ) : null}
-
-        <fkit-section
-          blurb="Used by the fkit CLI to clone and push. A token can only narrow what you may do — a read-only one cannot push, even to your own repositories."
-        >
+      <fkit-page heading="Access tokens" value={list ? `${list.length} active` : ""}>
+        <fkit-section blurb="Used by the fkit CLI to clone and push. A token can only narrow what you may do — a read-only one cannot push, even to your own repositories.">
+          {/* One row, one baseline. This was a labelled field beside a toggle
+              beside a button: the label made the field taller than its
+              neighbours, so the three sat at three different heights. The
+              input says what it wants in its placeholder instead. */}
           <form
+            class="mint"
             onSubmit={(e: Event) => {
               e.preventDefault();
               const f = e.target as HTMLFormElement;
@@ -428,35 +442,64 @@ export class PageSettings extends SettingsBase {
               });
             }}
           >
-            <fkit-add>
-              <fkit-field label="Token name">
-                <input name="name" placeholder="laptop" required />
-              </fkit-field>
-              <span class="check">
-                <fkit-toggle
-                  checked={this.canWrite}
-                  label="allow push"
-                  onToggle={(e: Event) => (this.canWrite = (e as CustomEvent<boolean>).detail)}
-                ></fkit-toggle>
-                Allow push
-              </span>
-              <button class="primary" type="submit" disabled={this.busy}>Generate</button>
-            </fkit-add>
+            <input
+              name="name"
+              class="mint-name"
+              placeholder="what is it for — laptop, CI, that server"
+              aria-label="Token name"
+              required
+            />
+            <label class="mint-push">
+              <fkit-toggle
+                checked={this.canWrite}
+                label="allow push"
+                onToggle={(e: Event) => (this.canWrite = (e as CustomEvent<boolean>).detail)}
+              ></fkit-toggle>
+              allow push
+            </label>
+            <button class="primary" type="submit" disabled={this.busy}>
+              Generate
+            </button>
           </form>
 
-          <fkit-list heading="Tokens">
+          {/* The token belongs directly under the thing that made it, not in a
+              section above it. It is the form's output. */}
+          {this.fresh ? (
+            <div class="minted">
+              <div class="minted-top">
+                <loom-icon name="key" size={13}></loom-icon>
+                <b>{this.fresh.name}</b>
+                <span class={`tag ${this.fresh.can_write ? "on" : ""}`}>
+                  {this.fresh.can_write ? "read + write" : "read"}
+                </span>
+                <span class="grow"></span>
+                <span class="once">copy it now — it is not shown again</span>
+              </div>
+              <div class="secret">
+                <code>{this.fresh.secret}</code>
+                <button
+                  class="bare"
+                  onClick={() => {
+                    this.copySecret(this.fresh!.secret);
+                    this.copied = true;
+                    setTimeout(() => (this.copied = false), 1400);
+                  }}
+                >
+                  <loom-icon name={this.copied ? "check" : "copy"} size={12}></loom-icon>
+                  {this.copied ? "copied" : "copy"}
+                </button>
+              </div>
+            </div>
+          ) : null}
+
+          <fkit-list heading="Tokens" count={list ? String(list.length) : ""}>
             {list === null ? (
               <fkit-empty><span class="sk" style="width:200px"></span></fkit-empty>
             ) : list.length === 0 ? (
               <fkit-empty>No tokens yet. Generate one to clone or push from the CLI.</fkit-empty>
             ) : (
               list.map((t) => (
-                <fkit-row
-                  loom-key={t.id}
-                  icon="key"
-                  name={t.name}
-                  meta={tokenMeta(t)}
-                >
+                <fkit-row loom-key={t.id} icon="key" name={t.name} meta={tokenMeta(t)}>
                   <span class={`tag ${t.can_write ? "on" : ""}`}>
                     {t.can_write ? "read + write" : "read"}
                   </span>
@@ -486,6 +529,13 @@ export class PageSettings extends SettingsBase {
         </fkit-section>
       </fkit-page>
     );
+  }
+
+  /// Loom's clipboard, which carries a fallback for where the async API is
+  /// unavailable — a token you cannot copy is a token you cannot use.
+  @clipboard("write")
+  private copySecret(secret: string) {
+    return secret;
   }
 
   private sessionsSection() {
