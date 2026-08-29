@@ -44,6 +44,8 @@ export interface Repo {
   /** Open counts, so a tab can carry a number without fetching a list. */
   open_issues: number;
   open_merges: number;
+  /** `owner/name` this was forked from, when it was. */
+  forked_from: string | null;
 }
 
 export interface Label {
@@ -386,6 +388,8 @@ export interface MergeRequest {
   title: string;
   description: string | null;
   source_branch: string;
+  /** `owner/name` when the source branch is in another fork. */
+  source_repo: string | null;
   target_branch: string;
   state: "open" | "merged" | "closed";
   author: string | null;
@@ -648,6 +652,13 @@ export const api = {
   deleteComment: (owner: string, name: string, id: string) =>
     request<{ ok: boolean }>(`/repos/${owner}/${name}/comments/${id}`, { method: "DELETE" }),
 
+  fork: (owner: string, name: string, as?: string) =>
+    request<Repo>(`/repos/${owner}/${name}/fork`, {
+      method: "POST",
+      body: body(as ? { name: as } : {}),
+    }),
+  forks: (owner: string, name: string) => request<Repo[]>(`/repos/${owner}/${name}/forks`),
+
   refs: (owner: string, name: string) => request<Ref[]>(`/repos/${owner}/${name}/refs`),
 
   /**
@@ -715,7 +726,14 @@ export const api = {
   createMerge: (
     owner: string,
     name: string,
-    input: { title: string; description?: string; source_branch: string; target_branch: string },
+    input: {
+      title: string;
+      description?: string;
+      source_branch: string;
+      /** `owner/name` when proposing from a fork. */
+      source_repo?: string;
+      target_branch: string;
+    },
   ) => request<MergeRequest>(`/repos/${owner}/${name}/merges`, { method: "POST", body: body(input) }),
   performMerge: (owner: string, name: string, number: number, message?: string) =>
     request<MergeRequest>(`/repos/${owner}/${name}/merges/${number}/merge`, {

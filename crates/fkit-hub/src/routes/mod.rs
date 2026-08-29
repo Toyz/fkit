@@ -66,6 +66,8 @@ pub fn repo_view(repo: &RepoRow, owner: &str, access: Access) -> RepoView {
         tags: 0,
         open_issues: 0,
         open_merges: 0,
+        forked_from: None,
+        network_id: repo.network_id,
     }
 }
 
@@ -101,6 +103,23 @@ pub async fn attach_heads(state: &AppState, views: &mut [RepoView]) {
     // Two more bulk counts rather than two queries per repository. A listing
     // is worth showing without them, so a failure here is logged and dropped
     // the same way the refs are.
+    // What each of these was forked from, as `owner/name`.
+    let mut parents: HashMap<uuid::Uuid, String> = HashMap::new();
+    let forked: Result<Vec<(uuid::Uuid, String, String)>, _> = sqlx::query_as(
+        "SELECT c.id, u.username, p.name
+           FROM repos c JOIN repos p ON p.id = c.forked_from
+           JOIN users u ON u.id = p.owner_id
+          WHERE c.id = ANY($1)",
+    )
+    .bind(&ids)
+    .fetch_all(&state.db)
+    .await;
+    if let Ok(rows) = forked {
+        for (id, owner, name) in rows {
+            parents.insert(id, format!("{owner}/{name}"));
+        }
+    }
+
     let mut open: HashMap<uuid::Uuid, (i64, i64)> = HashMap::new();
     let counts: Result<Vec<(uuid::Uuid, i64, i64)>, _> = sqlx::query_as(
         "SELECT r.id,
@@ -132,6 +151,9 @@ pub async fn attach_heads(state: &AppState, views: &mut [RepoView]) {
             v.open_issues = issues;
             v.open_merges = merges;
         }
+        if let Some(p) = parents.remove(&v.id) {
+            v.forked_from = Some(p);
+        }
         let Some(refs) = tips.get(&v.id) else { continue };
         // Counted separately: `refs` is every ref, and tags live in the same
         // namespace. Counting the lot reported a repository with one branch
@@ -143,7 +165,7 @@ pub async fn attach_heads(state: &AppState, views: &mut [RepoView]) {
         let Ok(bytes) = <[u8; 32]>::try_from(target.as_slice()) else { continue };
         let hash = fkit_core::Hash(bytes);
 
-        let Ok(store) = state.store_for(v.id) else { continue };
+        let Ok(store) = state.store_for_network(v.network_id) else { continue };
         let Ok(fkit_core::Object::Commit(c)) = store.get(hash) else { continue };
 
         let hex = hash.to_hex();

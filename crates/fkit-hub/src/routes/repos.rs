@@ -3,7 +3,8 @@
 use crate::auth::Viewer;
 use crate::error::{AppError, AppResult};
 use crate::models::*;
-use crate::perms::{require_admin, require_write, resolve};
+use crate::perms::{require_admin, require_read, require_write, resolve};
+use crate::perms::Access;
 use crate::state::AppState;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -24,6 +25,8 @@ pub fn routes() -> Router<AppState> {
         .route("/repos/{owner}/{name}/refs", get(list_refs).delete(delete_ref))
         .route("/repos/{owner}/{name}/stats", get(repo_stats))
         .route("/repos/{owner}/{name}/gc", post(collect_garbage))
+        .route("/repos/{owner}/{name}/fork", post(fork_repo))
+        .route("/repos/{owner}/{name}/forks", get(list_forks))
         .route(
             "/repos/{owner}/{name}/collaborators",
             get(list_collaborators).post(add_collaborator),
@@ -100,9 +103,17 @@ async fn repo_stats(
     axum::extract::Path((owner, name)): axum::extract::Path<(String, String)>,
 ) -> AppResult<Json<RepoStats>> {
     let (repo, _, _) = super::load_repo(&state, &viewer, &owner, &name).await?;
-    let store = state.store_for(repo.id).map_err(AppError::Internal)?;
+    let store = state.store_for_network(repo.network_id).map_err(AppError::Internal)?;
 
-    let dir = state.data_dir.join("repos").join(repo.id.to_string()).join("objects");
+    // The store lives under the fork network, so a fork asking its own id
+    // measured a directory that does not exist and reported zero bytes. What
+    // it reports now is what the network holds, which is the truth: a fork
+    // adds nothing on disk until it is pushed to.
+    let dir = state
+        .data_dir
+        .join("repos")
+        .join(repo.network_id.to_string())
+        .join("objects");
     let bytes = dir_size(&dir);
     let objects = store.iter_ids().map(|v| v.len()).unwrap_or(0);
 
@@ -444,7 +455,20 @@ async fn delete_repo(
         .bind(repo.id)
         .execute(&state.db)
         .await?;
-    let _ = std::fs::remove_dir_all(state.repo_path(repo.id));
+
+    // The objects belong to the fork network, not to this repository. Deleting
+    // a parent that has forks must not take their commits with it — so the
+    // directory goes only once nothing else in the network is left. Counted
+    // after the delete above, so this repository is not counting itself.
+    let (remaining,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM repos WHERE network_id = $1")
+        .bind(repo.network_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or((1,));
+
+    if remaining == 0 {
+        let _ = std::fs::remove_dir_all(state.repo_path(repo.network_id));
+    }
 
     super::audit(&state, viewer.id(), None, "repo.delete",
         serde_json::json!({ "name": format!("{owner}/{name}") })).await;
@@ -500,7 +524,9 @@ async fn collect_garbage(
     // advisory lock is released by the connection that took it — handing that
     // connection back mid-collection would leak the lock.
     let mut conn = state.db.acquire().await.map_err(anyhow::Error::from)?;
-    let key = i64::from_be_bytes(repo.id.as_bytes()[..8].try_into().unwrap());
+    // Keyed by the network, because that is what the store is keyed by: two
+    // forks collecting the same store at once is the race this prevents.
+    let key = i64::from_be_bytes(repo.network_id.as_bytes()[..8].try_into().unwrap());
     let (locked,): (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
         .bind(key)
         .fetch_one(&mut *conn)
@@ -512,16 +538,23 @@ async fn collect_garbage(
     }
 
     let result = async {
-        let roots: Vec<(Vec<u8>,)> = sqlx::query_as("SELECT target FROM refs WHERE repo_id = $1")
-            .bind(repo.id)
-            .fetch_all(&state.db)
-            .await?;
+        // Every repository sharing this store, not just this one. A fork's
+        // branches point at objects in the same store; collecting against one
+        // repository's refs alone would delete another's history.
+        let roots: Vec<(Vec<u8>,)> = sqlx::query_as(
+            "SELECT rf.target FROM refs rf
+               JOIN repos r ON r.id = rf.repo_id
+              WHERE r.network_id = $1",
+        )
+        .bind(repo.network_id)
+        .fetch_all(&state.db)
+        .await?;
         let roots: Vec<Hash> = roots
             .into_iter()
             .filter_map(|(b,)| Some(Hash(b.try_into().ok()?)))
             .collect();
 
-        let store = state.store_for(repo.id).map_err(AppError::Internal)?;
+        let store = state.store_for_network(repo.network_id).map_err(AppError::Internal)?;
         // A graph walk plus file IO: minutes on a large repository, and none
         // of it async. Off the runtime thread it goes.
         let opts = fkit_core::gc::Options { dry_run, ..Default::default() };
@@ -565,6 +598,132 @@ async fn collect_garbage(
         segments_compacted: r.segments_compacted,
         bytes_reclaimed: r.bytes_reclaimed,
     }))
+}
+
+#[derive(Deserialize, Default)]
+struct ForkIn {
+    /// A different name, when one is already taken in your account.
+    name: Option<String>,
+}
+
+/// Fork a repository into the signed-in account.
+///
+/// The objects are not copied. A fork joins its parent's *network* and reads
+/// the same store, which is safe because an object's name is a digest of its
+/// bytes — two repositories cannot disagree about what a hash means. So this
+/// is O(1) on disk however large the repository, and a merge request between
+/// two forks needs no transfer at all: both sides already resolve.
+///
+/// What is copied is the refs, because those are the fork's own to move.
+async fn fork_repo(
+    State(state): State<AppState>,
+    viewer: Viewer,
+    Path((owner, name)): Path<(String, String)>,
+    body: Option<Json<ForkIn>>,
+) -> AppResult<impl IntoResponse> {
+    let (repo, access, _) = super::load_repo(&state, &viewer, &owner, &name).await?;
+    require_read(access, &owner, &name)?;
+    let u = viewer.require()?;
+    if !u.can_write {
+        return Err(AppError::Forbidden("this token is read-only".into()));
+    }
+
+    let wanted = body
+        .and_then(|Json(b)| b.name)
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| repo.name.clone());
+
+    if repo.owner_id == u.id && wanted == repo.name {
+        return Err(AppError::conflict(
+            "this is already yours — fork it under a different name if you want a second copy",
+        ));
+    }
+
+    let id = Uuid::new_v4();
+    let res = sqlx::query(
+        "INSERT INTO repos
+            (id, owner_id, name, description, visibility, default_branch,
+             homepage, topics, forked_from, network_id)
+         SELECT $1, $2, $3, r.description, $4, r.default_branch,
+                r.homepage, r.topics, r.id, r.network_id
+           FROM repos r WHERE r.id = $5",
+    )
+    .bind(id)
+    .bind(u.id)
+    .bind(&wanted)
+    // A fork of a public repository starts private: the person forking has
+    // not said they want to publish anything, and making it public by default
+    // decides that for them.
+    .bind("private")
+    .bind(repo.id)
+    .execute(&state.db)
+    .await;
+
+    if let Err(sqlx::Error::Database(e)) = &res
+        && e.is_unique_violation()
+    {
+        return Err(AppError::conflict(format!("you already have a repository called {wanted}")));
+    }
+    res?;
+
+    // The refs are the fork's own from here: it can move them without moving
+    // anything in the parent.
+    sqlx::query(
+        "INSERT INTO refs (repo_id, name, target, updated_by)
+         SELECT $1, name, target, updated_by FROM refs WHERE repo_id = $2",
+    )
+    .bind(id)
+    .bind(repo.id)
+    .execute(&state.db)
+    .await?;
+
+    super::audit(&state, Some(u.id), Some(id), "repo.fork",
+        serde_json::json!({ "from": format!("{owner}/{name}"), "name": wanted })).await;
+
+    let row: RepoWithOwner = sqlx::query_as(
+        "SELECT r.*, u.username FROM repos r JOIN users u ON u.id = r.owner_id WHERE r.id = $1",
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await?;
+    let view = super::repo_view(&row.repo, &row.username, Access::Admin);
+    Ok((StatusCode::CREATED, Json(view)))
+}
+
+/// Everything forked from this repository, directly.
+async fn list_forks(
+    State(state): State<AppState>,
+    viewer: Viewer,
+    Path((owner, name)): Path<(String, String)>,
+) -> AppResult<Json<Vec<RepoView>>> {
+    let (repo, access, _) = super::load_repo(&state, &viewer, &owner, &name).await?;
+    require_read(access, &owner, &name)?;
+
+    let rows: Vec<RepoWithOwner> = sqlx::query_as(
+        "SELECT r.*, u.username FROM repos r JOIN users u ON u.id = r.owner_id
+          WHERE r.forked_from = $1 ORDER BY r.created_at DESC LIMIT 200",
+    )
+    .bind(repo.id)
+    .fetch_all(&state.db)
+    .await?;
+
+    let (uid, admin, can_write) = match &viewer.user {
+        Some(u) => (Some(u.id), u.is_admin, u.can_write),
+        None => (None, false, false),
+    };
+
+    // A private fork of a public repository must not be listed to someone who
+    // cannot read it — the fork's visibility is its own, not its parent's.
+    let mut out = Vec::new();
+    for row in rows {
+        let a = resolve(&state.db, &row.repo, uid, admin, can_write, state.policy().require_auth)
+            .await?;
+        if a.can_read() {
+            out.push(super::repo_view(&row.repo, &row.username, a));
+        }
+    }
+    Ok(Json(out))
 }
 
 /// Which ref to remove.
@@ -701,7 +860,7 @@ pub async fn refs_of(state: &AppState, repo: &RepoRow) -> AppResult<Vec<RefView>
     .fetch_all(&state.db)
     .await?;
 
-    let store = state.store_for(repo.id).ok();
+    let store = state.store_for_network(repo.network_id).ok();
 
     Ok(rows
         .into_iter()

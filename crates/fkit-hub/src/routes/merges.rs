@@ -85,6 +85,11 @@ pub fn closes_issues(text: &str) -> Vec<i32> {
 #[derive(Debug, sqlx::FromRow)]
 struct MrRow {
     id: Uuid,
+    /// Set when the source branch lives in another repository of the network.
+    source_repo: Option<String>,
+    /// Which repository to read `source_branch` from. Equal to `repo_id` for
+    /// an ordinary request.
+    source_repo_id: Option<Uuid>,
     number: i32,
     title: String,
     description: Option<String>,
@@ -104,6 +109,9 @@ pub struct MrView {
     pub title: String,
     pub description: Option<String>,
     pub source_branch: String,
+    /// `owner/name` when the source branch is in another fork; absent when it
+    /// is in this repository, which is the ordinary case.
+    pub source_repo: Option<String>,
     pub target_branch: String,
     pub state: String,
     pub author: Option<String>,
@@ -130,6 +138,7 @@ impl From<MrRow> for MrView {
             title: r.title,
             description: r.description,
             source_branch: r.source_branch,
+            source_repo: r.source_repo,
             target_branch: r.target_branch,
             state: r.state,
             author: r.author,
@@ -154,15 +163,25 @@ impl From<MrRow> for MrView {
 const SELECT_BY_ID: &str = "\
     SELECT m.id, m.number, m.title, m.description, m.source_branch, m.target_branch,
            m.state, m.merge_commit, m.merged_at, m.created_at, m.updated_at,
-           u.username AS author
-      FROM merge_requests m LEFT JOIN users u ON u.id = m.author_id
+           u.username AS author, m.source_repo_id,
+           CASE WHEN m.source_repo_id IS NULL OR m.source_repo_id = m.repo_id
+                THEN NULL ELSE su.username || '/' || sr.name END AS source_repo
+      FROM merge_requests m
+      LEFT JOIN users u ON u.id = m.author_id
+      LEFT JOIN repos sr ON sr.id = m.source_repo_id
+      LEFT JOIN users su ON su.id = sr.owner_id
      WHERE m.id = $1";
 
 const SELECT_BY_NUMBER: &str = "\
     SELECT m.id, m.number, m.title, m.description, m.source_branch, m.target_branch,
            m.state, m.merge_commit, m.merged_at, m.created_at, m.updated_at,
-           u.username AS author
-      FROM merge_requests m LEFT JOIN users u ON u.id = m.author_id
+           u.username AS author, m.source_repo_id,
+           CASE WHEN m.source_repo_id IS NULL OR m.source_repo_id = m.repo_id
+                THEN NULL ELSE su.username || '/' || sr.name END AS source_repo
+      FROM merge_requests m
+      LEFT JOIN users u ON u.id = m.author_id
+      LEFT JOIN repos sr ON sr.id = m.source_repo_id
+      LEFT JOIN users su ON su.id = sr.owner_id
      WHERE m.repo_id = $1 AND m.number = $2";
 
 /// `$2 = 'all'` selects every state; anything else filters to it. One literal
@@ -170,8 +189,13 @@ const SELECT_BY_NUMBER: &str = "\
 const SELECT_LIST: &str = "\
     SELECT m.id, m.number, m.title, m.description, m.source_branch, m.target_branch,
            m.state, m.merge_commit, m.merged_at, m.created_at, m.updated_at,
-           u.username AS author
-      FROM merge_requests m LEFT JOIN users u ON u.id = m.author_id
+           u.username AS author, m.source_repo_id,
+           CASE WHEN m.source_repo_id IS NULL OR m.source_repo_id = m.repo_id
+                THEN NULL ELSE su.username || '/' || sr.name END AS source_repo
+      FROM merge_requests m
+      LEFT JOIN users u ON u.id = m.author_id
+      LEFT JOIN repos sr ON sr.id = m.source_repo_id
+      LEFT JOIN users su ON su.id = sr.owner_id
      WHERE m.repo_id = $1 AND ($2::text = 'all' OR m.state = $2::text)
      ORDER BY m.number DESC
      LIMIT 200";
@@ -240,6 +264,10 @@ struct CreateReq {
     #[serde(default)]
     description: Option<String>,
     source_branch: String,
+    /// `owner/name` of the fork the source branch is in. Absent means this
+    /// repository, which is the ordinary case.
+    #[serde(default)]
+    source_repo: Option<String>,
     target_branch: String,
 }
 
@@ -252,20 +280,21 @@ async fn create(
     let (repo, access, _) = super::load_repo(&state, &viewer, &owner, &name).await?;
     // Opening a request is a write to the repository's state, so it needs write
     // access. Read-only collaborators can view requests but not create them.
-    require_write(access)?;
+    // Proposing a change from a fork is not writing to the repository being
+    // proposed to — it is the reason forks exist. So write access is required
+    // only to move a branch that is already here; a request from elsewhere in
+    // the network needs read on the target and read on the source, both of
+    // which are checked below.
+    if body.source_repo.is_none() {
+        require_write(access)?;
+    } else {
+        crate::perms::require_read(access, &owner, &name)?;
+    }
     let u = viewer.require()?;
 
     let title = body.title.trim();
     if title.is_empty() || title.len() > 200 {
         return Err(AppError::bad("title must be 1-200 characters"));
-    }
-    if body.source_branch == body.target_branch {
-        return Err(AppError::bad("a branch cannot be merged into itself"));
-    }
-    for b in [&body.source_branch, &body.target_branch] {
-        if read_ref(&state, repo.id, b).await?.is_none() {
-            return Err(AppError::not_found(format!("no such branch: {b}")));
-        }
     }
 
     // Sequential per repository, allocated under a lock so two concurrent
@@ -274,6 +303,50 @@ async fn create(
     // The lock is taken on the *repo* row: Postgres refuses `FOR UPDATE`
     // alongside an aggregate, and locking the parent row is what actually
     // serialises numbering for this repository anyway.
+    // Where the source branch lives. A fork may propose its own branch into
+    // its parent, which is the whole point of forking — and it works without
+    // transferring anything, because both repositories read one store.
+    let source_repo_id = match body.source_repo.as_deref() {
+        None => repo.id,
+        Some(spec) => {
+            let (o, n) = spec
+                .split_once('/')
+                .ok_or_else(|| AppError::BadRequest("source_repo is owner/name".into()))?;
+            let (src, src_access, _) = super::load_repo(&state, &viewer, o, n).await?;
+            crate::perms::require_read(src_access, o, n)?;
+
+            // Same network only. Two repositories that never shared a history
+            // have no common ancestor and, more to the point, do not share a
+            // store — the objects on one side would simply not be there.
+            if src.network_id != repo.network_id {
+                return Err(AppError::BadRequest(
+                    "that repository is not a fork of this one".into(),
+                ));
+            }
+            src.id
+        }
+    };
+
+    // The source may be in another fork; the target is always here.
+    if read_ref(&state, source_repo_id, &body.source_branch).await?.is_none() {
+        return Err(AppError::not_found(format!(
+            "no such branch: {}",
+            body.source_branch
+        )));
+    }
+    if read_ref(&state, repo.id, &body.target_branch).await?.is_none() {
+        return Err(AppError::not_found(format!(
+            "no such branch: {}",
+            body.target_branch
+        )));
+    }
+    // Merging a branch into itself is only a no-op when it is the same branch
+    // of the same repository; a fork's `main` into its parent's `main` is a
+    // perfectly ordinary request.
+    if source_repo_id == repo.id && body.source_branch == body.target_branch {
+        return Err(AppError::bad("a branch cannot be merged into itself"));
+    }
+
     let mut tx = state.db.begin().await?;
     sqlx::query("SELECT id FROM repos WHERE id = $1 FOR UPDATE")
         .bind(repo.id)
@@ -284,8 +357,9 @@ async fn create(
     let id = Uuid::new_v4();
     let res = sqlx::query(
         "INSERT INTO merge_requests
-            (id, repo_id, number, title, description, author_id, source_branch, target_branch)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            (id, repo_id, number, title, description, author_id, source_branch,
+             target_branch, source_repo_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     )
     .bind(id)
     .bind(repo.id)
@@ -295,6 +369,7 @@ async fn create(
     .bind(u.id)
     .bind(&body.source_branch)
     .bind(&body.target_branch)
+    .bind(source_repo_id)
     .execute(&mut *tx)
     .await;
 
@@ -335,13 +410,17 @@ async fn detail(
 ) -> AppResult<Json<MrDetail>> {
     let (repo, access, _) = super::load_repo(&state, &viewer, &owner, &name).await?;
     let row = load(&state, repo.id, number).await?;
-    let store = state.store_for(repo.id).map_err(AppError::Internal)?;
+    let store = state.store_for_network(repo.network_id).map_err(AppError::Internal)?;
 
     // A merged or closed request may reference branches that are gone; that is
     // not an error, the comparison is simply unavailable.
+    // The source branch is read from the repository it lives in, which for a
+    // request from a fork is not this one. Both resolve in the same store, so
+    // the comparison itself needs nothing special.
+    let src_id = row.source_repo_id.unwrap_or(repo.id);
     let comparison = match (
         read_ref(&state, repo.id, &row.target_branch).await?,
-        read_ref(&state, repo.id, &row.source_branch).await?,
+        read_ref(&state, src_id, &row.source_branch).await?,
     ) {
         (Some(base), Some(head)) => Some(content::compare(
             &store,
@@ -431,11 +510,11 @@ async fn do_merge(
     let target = read_ref(&state, repo.id, &row.target_branch)
         .await?
         .ok_or_else(|| AppError::conflict(format!("branch {} is gone", row.target_branch)))?;
-    let source = read_ref(&state, repo.id, &row.source_branch)
+    let source = read_ref(&state, row.source_repo_id.unwrap_or(repo.id), &row.source_branch)
         .await?
         .ok_or_else(|| AppError::conflict(format!("branch {} is gone", row.source_branch)))?;
 
-    let store = state.store_for(repo.id).map_err(AppError::Internal)?;
+    let store = state.store_for_network(repo.network_id).map_err(AppError::Internal)?;
 
     // Already contained: nothing to do but record it.
     if fkit_core::proto::is_ancestor(&store, source, target).map_err(AppError::Internal)? {

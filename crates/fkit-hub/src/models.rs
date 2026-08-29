@@ -61,6 +61,13 @@ pub struct RepoRow {
     pub topics: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// The repository this was forked from, if any. Read through the view's
+    /// `owner/name` rather than here, but decoded so the row matches the table.
+    #[allow(dead_code)]
+    pub forked_from: Option<Uuid>,
+    /// The root of this fork tree, and the directory the objects live in.
+    /// Its own id for a repository that was never forked from anything.
+    pub network_id: Uuid,
 }
 
 /// A repo row joined to its owner's username.
@@ -104,6 +111,12 @@ pub struct RepoView {
     /// without each of them fetching its own list to count it.
     pub open_issues: i64,
     pub open_merges: i64,
+    /// `owner/name` of what this was forked from, when it was.
+    pub forked_from: Option<String>,
+    /// Not serialised: the listing needs it to find the objects, the client
+    /// has no use for it, and it is an internal identifier.
+    #[serde(skip)]
+    pub network_id: Uuid,
 }
 
 /// A one-line summary of a commit, for a listing that should say what the

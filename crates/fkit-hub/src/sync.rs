@@ -296,7 +296,7 @@ async fn authorise(
         return Err(hidden());
     }
 
-    let store = state.store_for(repo.id).map_err(|_| "internal error".to_string())?;
+    let store = state.store_for_network(repo.network_id).map_err(|_| "internal error".to_string())?;
 
     Ok(PgHost {
         label: format!("{owner}/{name}"),

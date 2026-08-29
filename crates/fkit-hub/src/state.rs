@@ -46,8 +46,32 @@ impl AppState {
     /// could no longer be a directory removal. Per-repo isolation is the
     /// conservative default; a shared pool is a later optimisation with a
     /// reference-counting design behind it.
+    /// Open the object store a repository reads and writes.
+    ///
+    /// Keyed by the fork *network*, not the repository: forks share one store.
+    /// An object's name is a digest of its bytes, so two repositories in a
+    /// network cannot disagree about what a hash means, which makes sharing
+    /// safe by construction — and makes a fork free, and a merge request
+    /// between two forks need no transfer at all.
+    ///
+    /// Callers pass `repo.network_id`. The parameter is named for what it is
+    /// so that passing a plain repo id is a visible mistake rather than a
+    /// silent one.
+    pub fn store_for_network(&self, network_id: Uuid) -> Result<Store> {
+        Store::open(
+            self.data_dir
+                .join("repos")
+                .join(network_id.to_string())
+                .join("objects"),
+        )
+    }
+
+    /// The store for a repository that is its own network.
+    ///
+    /// Kept for the paths that create a repository, where the network is the
+    /// repository itself and there is nothing yet to look up.
     pub fn store_for(&self, repo_id: Uuid) -> Result<Store> {
-        Store::open(self.data_dir.join("repos").join(repo_id.to_string()).join("objects"))
+        self.store_for_network(repo_id)
     }
 
     pub fn repo_path(&self, repo_id: Uuid) -> PathBuf {

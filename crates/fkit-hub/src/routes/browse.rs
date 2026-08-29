@@ -147,7 +147,7 @@ async fn open_in_path(
 ) -> AppResult<(Store, Hash, Hash, String)> {
     let (repo, _, _) = super::load_repo(state, viewer, owner, name).await?;
     let (commit_id, rest) = resolve_ref_in_path(state, &repo, spec, path).await?;
-    let store = state.store_for(repo.id).map_err(AppError::Internal)?;
+    let store = state.store_for_network(repo.network_id).map_err(AppError::Internal)?;
     let commit = content::commit_of(&store, commit_id)?;
     Ok((store, commit_id, commit.tree, rest))
 }
@@ -162,7 +162,7 @@ async fn open(
 ) -> AppResult<(Store, Hash, Hash)> {
     let (repo, _, _) = super::load_repo(state, viewer, owner, name).await?;
     let commit_id = resolve_ref(state, &repo, spec).await?;
-    let store = state.store_for(repo.id).map_err(AppError::Internal)?;
+    let store = state.store_for_network(repo.network_id).map_err(AppError::Internal)?;
     let commit = content::commit_of(&store, commit_id)?;
     Ok((store, commit_id, commit.tree))
 }
@@ -279,7 +279,7 @@ async fn commit_detail(
     Path((owner, name, hash)): Path<(String, String, String)>,
 ) -> AppResult<Json<CommitDetail>> {
     let (repo, _, _) = super::load_repo(&state, &viewer, &owner, &name).await?;
-    let store = state.store_for(repo.id).map_err(AppError::Internal)?;
+    let store = state.store_for_network(repo.network_id).map_err(AppError::Internal)?;
     let id = Hash::from_hex(&hash).ok_or_else(|| AppError::bad("not a valid commit hash"))?;
     let c = content::commit_of(&store, id)?;
 
@@ -371,7 +371,7 @@ async fn patch(
     Path((owner, name, hash)): Path<(String, String, String)>,
 ) -> AppResult<Json<PatchResponse>> {
     let (repo, _, _) = super::load_repo(&state, &viewer, &owner, &name).await?;
-    let store = state.store_for(repo.id).map_err(AppError::Internal)?;
+    let store = state.store_for_network(repo.network_id).map_err(AppError::Internal)?;
     let id = Hash::from_hex(&hash).ok_or_else(|| AppError::bad("not a valid commit hash"))?;
     let (files, truncated) = content::commit_patch(&store, id)?;
     Ok(Json(PatchResponse { files, truncated }))
@@ -384,7 +384,7 @@ async fn compare(
     Path((owner, name, base, head)): Path<(String, String, String, String)>,
 ) -> AppResult<Json<content::Comparison>> {
     let (repo, _, _) = super::load_repo(&state, &viewer, &owner, &name).await?;
-    let store = state.store_for(repo.id).map_err(AppError::Internal)?;
+    let store = state.store_for_network(repo.network_id).map_err(AppError::Internal)?;
 
     let base_id = resolve_ref(&state, &repo, &base).await?;
     let head_id = resolve_ref(&state, &repo, &head).await?;
@@ -470,7 +470,7 @@ async fn archive(
 
     let (repo, _, _) = super::load_repo(&state, &viewer, &owner, &name).await?;
     let commit_id = resolve_ref(&state, &repo, r).await?;
-    let store = state.store_for(repo.id).map_err(AppError::Internal)?;
+    let store = state.store_for_network(repo.network_id).map_err(AppError::Internal)?;
     let tree = content::commit_of(&store, commit_id)?.tree;
 
     // The archive of a tree is a pure function of the tree and the format, and

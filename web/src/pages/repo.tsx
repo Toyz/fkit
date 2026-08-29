@@ -654,6 +654,8 @@ const sheet = css`
   .sby .who { color: var(--text); font-weight: 600; text-decoration: none; }
   .sby .who:hover { color: var(--accent); }
   .sby .ex { color: var(--faint); font-family: var(--mono); font-size: 11.5px; }
+  .sby .ex .exlink { color: var(--muted); text-decoration: none; }
+  .sby .ex .exlink:hover { color: var(--accent); }
 
   /* What links two numbered things together. Quiet: it is context, not the
      thing you came to read. */
@@ -728,6 +730,15 @@ const sheet = css`
   .iside .none { color: var(--faint); font-family: var(--sans); }
   .iside .facts { color: var(--muted); font-family: var(--sans); font-size: 11.5px; }
   .iside .facts .mono { font-family: var(--mono); color: var(--text); }
+  .brlink {
+    display: flex; align-items: center; gap: 6px; min-width: 0;
+    text-decoration: none; color: var(--text);
+  }
+  .brlink:hover { text-decoration: none; }
+  .brlink:hover .mono { color: var(--accent); }
+  .brlink loom-icon { flex: none; color: var(--faint); }
+  .brlink .mono { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .iside .into { color: var(--faint); font-size: 11px; }
 
   .xref {
     display: flex; align-items: center; gap: 6px;
@@ -751,6 +762,16 @@ const sheet = css`
     color: var(--faint); margin-right: 3px;
   }
   .tline { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; min-width: 0; }
+
+  /* Where a fork came from. Under the title, quiet: it is provenance, not
+     the name of the thing. */
+  .from {
+    font-size: 11.5px; color: var(--faint); font-family: var(--sans);
+    margin: -2px 0 2px;
+  }
+  .from a { color: var(--muted); }
+  .from a:hover { color: var(--accent); }
+  .title .grow { flex: 1; }
 
   /* ---- issues ---- */
   .seg { display: flex; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
@@ -3509,8 +3530,9 @@ fkit push</pre>
                     </span>
                     <span class="sub">
                       #{m.number} opened {relativeTime(m.created_at)}
-                      {m.author ? ` by ${m.author}` : ""} · {m.source_branch} into{" "}
-                      {m.target_branch}
+                      {m.author ? ` by ${m.author}` : ""} ·{" "}
+                      {m.source_repo ? `${m.source_repo}:` : ""}
+                      {m.source_branch} into {m.target_branch}
                       {m.state === "merged" && m.merged_at
                         ? ` · merged ${relativeTime(m.merged_at)}`
                         : ""}
@@ -3579,7 +3601,24 @@ fkit push</pre>
           created_at: m.created_at,
           extra: (
             <>
-              {m.source_branch} into {m.target_branch}
+              <a
+                class="exlink"
+                href={`/${m.source_repo ?? `${at.owner}/${at.name}`}/tree/${m.source_branch}`}
+                onClick={linkHandler(
+                  `/${m.source_repo ?? `${at.owner}/${at.name}`}/tree/${m.source_branch}`,
+                )}
+              >
+                {m.source_repo ? `${m.source_repo}:` : ""}
+                {m.source_branch}
+              </a>
+              {" into "}
+              <a
+                class="exlink"
+                href={`/${at.owner}/${at.name}/tree/${m.target_branch}`}
+                onClick={linkHandler(`/${at.owner}/${at.name}/tree/${m.target_branch}`)}
+              >
+                {m.target_branch}
+              </a>
               {m.merge_commit ? ` · merged as ${m.merge_commit.slice(0, 10)}` : ""}
             </>
           ),
@@ -3843,9 +3882,31 @@ fkit push</pre>
                   <div class="sec">
                     <div class="shead"><span>Branches</span></div>
                     <div class="sbody col facts">
-                      <span class="mono">{m.source_branch}</span>
-                      <span>into</span>
-                      <span class="mono">{m.target_branch}</span>
+                      {/* The source may live in another fork, so its link goes
+                          there rather than here — the branch does not exist in
+                          this repository at all. */}
+                      <a
+                        class="brlink"
+                        href={`/${m.source_repo ?? `${at.owner}/${at.name}`}/tree/${m.source_branch}`}
+                        onClick={linkHandler(
+                          `/${m.source_repo ?? `${at.owner}/${at.name}`}/tree/${m.source_branch}`,
+                        )}
+                      >
+                        <loom-icon name="branch" size={11}></loom-icon>
+                        <span class="mono">
+                          {m.source_repo ? `${m.source_repo}:` : ""}
+                          {m.source_branch}
+                        </span>
+                      </a>
+                      <span class="into">into</span>
+                      <a
+                        class="brlink"
+                        href={`/${at.owner}/${at.name}/tree/${m.target_branch}`}
+                        onClick={linkHandler(`/${at.owner}/${at.name}/tree/${m.target_branch}`)}
+                      >
+                        <loom-icon name="branch" size={11}></loom-icon>
+                        <span class="mono">{m.target_branch}</span>
+                      </a>
                       {c ? <span>{c.ahead} ahead, {c.behind} behind</span> : null}
                     </div>
                   </div>
@@ -4811,7 +4872,32 @@ fkit push</pre>
             </span>
             <span class="tag">{r.visibility}</span>
             {r.access !== "read" ? <span class="tag on">{r.access}</span> : null}
+            <span class="grow"></span>
+            {this.session.isAuthed ? (
+              <button
+                type="button"
+                class="bare"
+                disabled={this.busy}
+                title="Take your own copy of this repository"
+                onClick={() =>
+                  void this.act(async () => {
+                    const made = await api.fork(at.owner, at.name);
+                    go(`/${made.full_name}`);
+                  })
+                }
+              >
+                <loom-icon name="merge" size={12}></loom-icon> fork
+              </button>
+            ) : null}
           </div>
+          {r.forked_from ? (
+            <div class="from">
+              forked from{" "}
+              <a href={`/${r.forked_from}`} onClick={linkHandler(`/${r.forked_from}`)}>
+                {r.forked_from}
+              </a>
+            </div>
+          ) : null}
           {r.description ? <div class="desc">{r.description}</div> : null}
           <div class="tabs">
             {tabs.map(([key, label, ic, href, count]) => (
