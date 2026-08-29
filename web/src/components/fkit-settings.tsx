@@ -121,8 +121,8 @@ export class FkitSection extends LoomElement {
           <h2 class="h">
             <span class="t">{this.heading}</span>
             <span class="fill"></span>
-            <slot name="action"></slot>
             {this.value ? <span class="v">{this.value}</span> : null}
+            <slot name="action"></slot>
           </h2>
         ) : null}
         {this.blurb ? <p>{this.blurb}</p> : null}

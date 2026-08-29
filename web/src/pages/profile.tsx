@@ -38,70 +38,59 @@ function rankTopics(repos: Repo[], cap = 8): string[] {
 }
 
 const sheet = css`
-  /* An identity beside a body of work. The person is a column of facts that
-     stays put while the list scrolls, which is what makes this page worth
-     sharing: whoever opens the link can see who you are without scrolling
-     back up out of your repositories.
+  /* An identity band, not a sidebar.
+   *
+   * The column version left the avatar floating above a stack of unrelated
+   * blocks, aligned to nothing and sharing no line with the list beside it.
+   * Here the avatar anchors the text it belongs to, and the band closes with
+   * the same rule every heading in the app draws — so the page reads top to
+   * bottom like the rest of it instead of as two unrelated halves.
    */
-  .cols2 {
+  .band {
     display: grid;
-    grid-template-columns: 250px minmax(0, 1fr);
-    gap: 36px;
-    align-items: start;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 0 18px;
+    align-items: center;
+    margin-bottom: 30px;
   }
-  @media (max-width: 820px) {
-    .cols2 { grid-template-columns: 1fr; gap: 22px; }
-    .who { position: static; }
-  }
+  .band .who { min-width: 0; }
 
-  .who { position: sticky; top: 52px; }
-
-  /* The same component the profile form previews, so what you are shown
-     while editing is what a visitor actually gets. */
-  fkit-avatar { display: block; margin-bottom: 14px; }
-  .av {
-    width: 84px; height: 84px; border-radius: var(--radius);
-    background: var(--accent-weak); margin-bottom: 14px;
+  .nm {
+    display: flex; align-items: center; flex-wrap: wrap; gap: 9px;
   }
-  .who h1 {
-    font-size: 19px; font-weight: 500; letter-spacing: -0.01em;
+  .nm h1 {
+    font-size: 21px; font-weight: 500; letter-spacing: -0.015em;
     margin: 0; overflow-wrap: anywhere;
   }
-  .who .dn {
+  .dn {
     font-family: var(--sans); color: var(--muted);
     font-size: 13px; margin-top: 3px;
   }
-  .who .tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 10px; }
-  .who .btn { display: inline-flex; margin-top: 14px; }
 
-  /* The facts, in the same shape the repository aside states its own. */
+  /* The facts read as a sentence about the person, because that is what they
+     are — a stacked table of four rows was three more lines than they need. */
   .facts {
-    display: grid; grid-template-columns: auto minmax(0, 1fr);
-    gap: 5px 12px; margin: 16px 0 0;
-    padding-top: 14px; border-top: 1px solid var(--border);
-    font-size: 11.5px;
+    display: flex; flex-wrap: wrap; align-items: center; gap: 4px 9px;
+    margin-top: 9px; font-size: 11.5px; color: var(--faint);
   }
-  .facts dt { color: var(--faint); }
-  .facts dd { margin: 0; color: var(--text); text-align: right; }
-  .facts dd.mono { font-family: var(--mono); }
+  .facts .sep { opacity: .45; }
+  .facts b { font-weight: 400; color: var(--muted); }
+  .facts .at { font-family: var(--mono); color: var(--accent); }
 
-  /* What they actually work on, drawn from their own repositories rather than
-     from a bio nobody fills in. */
-  .works { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); }
+  /* What they work on, from their own repositories rather than from a bio
+     nobody fills in. */
+  .works { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; margin-top: 11px; }
   .works .lbl {
     font-size: 10px; text-transform: uppercase; letter-spacing: .09em;
-    color: var(--faint); margin-bottom: 8px;
+    color: var(--faint); margin-right: 3px;
   }
-  .works .chips { display: flex; flex-wrap: wrap; gap: 5px; }
   .works .chip {
     font-size: 11px; padding: 1px 8px; line-height: 18px;
     border: 1px solid var(--border-hi); border-radius: 999px;
     color: var(--muted); background: var(--raised);
   }
 
-  .filter {
-    max-width: 180px; font-size: 12px; height: 24px; padding: 0 8px;
-  }
+  .filter { max-width: 180px; font-size: 12px; height: 24px; padding: 0 8px; }
 
   .empty { padding: 34px 14px; text-align: center; }
   .empty h2 { color: var(--muted); }
@@ -110,6 +99,11 @@ const sheet = css`
     margin: 7px auto 0; max-width: 44ch; line-height: 1.5;
   }
   .empty .btn { margin-top: 14px; }
+
+  /* Both live on the Repositories heading, so they need to sit on its line
+     rather than on the text baseline a slot would otherwise give them. */
+  .head-acts { display: flex; align-items: center; gap: 9px; }
+  .head-acts .btn { font-size: 11.5px; }
 `;
 
 @route("/:owner")
@@ -178,8 +172,6 @@ export class PageProfile extends LoomElement {
 
     const pub = p?.repos.filter((r) => r.visibility === "public").length ?? 0;
     const priv = (p?.repos.length ?? 0) - pub;
-    // Their own topics, most used first — what they work on, taken from the
-    // repositories themselves rather than from a bio nobody fills in.
     const topics = p ? rankTopics(p.repos) : [];
     const latest = p?.repos.reduce<Repo | null>(
       (best, r) => (!best || r.updated_at > best.updated_at ? r : best),
@@ -188,135 +180,123 @@ export class PageProfile extends LoomElement {
 
     return (
       <div class="wrap">
-        <div class="cols2">
-          <div class="who">
-            {p ? (
-              <>
-                <fkit-avatar name={p.username} size={84}></fkit-avatar>
-                <h1>{p.username}</h1>
+        <div class="band">
+          {p ? (
+            <>
+              <fkit-avatar name={p.username} size={58}></fkit-avatar>
+              <div class="who">
+                <div class="nm">
+                  <h1>{p.username}</h1>
+                  {mine ? <span class="tag on">you</span> : null}
+                  {p.is_admin ? <span class="tag">administrator</span> : null}
+                </div>
                 {p.display_name ? <div class="dn">{p.display_name}</div> : null}
 
-                {p.is_admin || mine ? (
-                  <div class="tags">
-                    {mine ? <span class="tag on">you</span> : null}
-                    {p.is_admin ? <span class="tag">administrator</span> : null}
-                  </div>
-                ) : null}
-
-                {mine ? (
-                  <a class="btn" href="/new" onClick={linkHandler("/new")}>
-                    <loom-icon name="plus" size={12}></loom-icon> new repository
-                  </a>
-                ) : null}
-
-                <dl class="facts">
-                  <dt>joined</dt>
-                  <dd>{relativeTime(p.created_at)}</dd>
-                  <dt>repositories</dt>
-                  <dd>{p.repos.length}</dd>
-                  {priv > 0 ? (
-                    <>
-                      <dt>private</dt>
-                      <dd>{priv}</dd>
-                    </>
-                  ) : null}
+                {/* One line, because that is what these facts amount to. */}
+                <div class="facts">
+                  <span>joined <b>{relativeTime(p.created_at)}</b></span>
+                  <span class="sep">·</span>
+                  <span>
+                    <b>{p.repos.length}</b>{" "}
+                    {p.repos.length === 1 ? "repository" : "repositories"}
+                  </span>
                   {latest ? (
                     <>
-                      <dt>last push</dt>
-                      <dd>{relativeTime(latest.updated_at)}</dd>
+                      <span class="sep">·</span>
+                      <span>last push <b>{relativeTime(latest.updated_at)}</b></span>
                     </>
                   ) : null}
-                  {/* The tip of their most recent push. A hash is the only
-                      thing in this program that means exactly one state of
-                      exactly one tree, so it is the honest answer to "what
-                      are they on right now". */}
+                  {/* The tip of that push. A hash is the only thing here that
+                      means exactly one state of exactly one tree, so it is the
+                      honest answer to what someone is on right now. */}
                   {latest?.head ? (
                     <>
-                      <dt>at</dt>
-                      <dd class="mono">{latest.head.short}</dd>
+                      <span class="sep">·</span>
+                      <span class="at">{latest.head.short}</span>
                     </>
                   ) : null}
-                </dl>
+                </div>
 
                 {topics.length ? (
                   <div class="works">
-                    <div class="lbl">works on</div>
-                    <div class="chips">
-                      {topics.map((t) => (
-                        <span class="chip" loom-key={t}>{t}</span>
-                      ))}
-                    </div>
+                    <span class="lbl">works on</span>
+                    {topics.map((t) => (
+                      <span class="chip" loom-key={t}>{t}</span>
+                    ))}
                   </div>
                 ) : null}
-              </>
-            ) : (
-              <>
-                <div class="av"></div>
-                <span class="sk tall" style="width:130px"></span>
-                <dl class="facts">
-                  <dt>joined</dt>
-                  <dd><span class="sk" style="width:60px"></span></dd>
-                  <dt>repositories</dt>
-                  <dd><span class="sk" style="width:18px"></span></dd>
-                </dl>
-              </>
-            )}
-          </div>
+              </div>
+            </>
+          ) : (
+            <>
+              <fkit-avatar size={58}></fkit-avatar>
+              <div class="who">
+                <span class="sk tall" style="width:150px"></span>
+                <div class="facts"><span class="sk" style="width:230px"></span></div>
+              </div>
+            </>
+          )}
+        </div>
 
-          <div>
-            <fkit-section
-              heading="Repositories"
-              value={
-                p === null
-                  ? ""
-                  : mine || priv === 0
-                    ? `${pub} public${priv ? ` · ${priv} private` : ""}`
-                    : `${p.repos.length} you can see`
-              }
-            >
+        <fkit-section
+          heading="Repositories"
+          value={
+            p === null
+              ? ""
+              : mine || priv === 0
+                ? `${pub} public${priv ? ` · ${priv} private` : ""}`
+                : `${p.repos.length} you can see`
+          }
+        >
+          {filterable || mine ? (
+            <span slot="action" class="head-acts">
               {filterable ? (
                 <input
-                  slot="action"
                   class="filter"
                   placeholder="filter"
                   value={this.filter}
                   onInput={(e: Event) => (this.filter = (e.target as HTMLInputElement).value)}
                 />
               ) : null}
+              {mine ? (
+                <a class="btn" href="/new" onClick={linkHandler("/new")}>
+                  <loom-icon name="plus" size={11}></loom-icon> new repository
+                </a>
+              ) : null}
+            </span>
+          ) : null}
 
-              <fkit-list>
-                {p === null ? (
-                  [0, 1, 2].map(() => (
-                    <div class="r sk-row">
-                      <span class="sk" style="width:13px;height:13px"></span>
-                      <span class="name"><span class="sk tall" style="width:min(38%,200px)"></span></span>
-                      <span class="sk" style="width:46px"></span>
-                      <span class="sk" style="width:62px"></span>
-                    </div>
-                  ))
-                ) : shown.length === 0 ? (
-                  <div class="empty">
-                    <h2>{q ? "no matches" : mine ? "no repositories yet" : "nothing to show"}</h2>
-                    <p class="prose">
-                      {q
-                        ? "No repository of theirs matches that filter."
-                        : mine
-                          ? "Create one, then point the CLI at it: fkit remote, fkit push."
-                          : `${p.username} has no repositories you are allowed to see. Private ones are not listed, even by name.`}
-                    </p>
-                    {!q && mine ? (
-                      <a class="btn primary" href="/new" onClick={linkHandler("/new")}>
-                        <loom-icon name="plus" size={12}></loom-icon> new repository
-                      </a>
-                    ) : null}
-                  </div>
-                ) : (
-                  shown.map((r) => repoRow(r))
-                )}
-              </fkit-list>
-            </fkit-section>
-          </div>
-        </div>
+          <fkit-list>
+            {p === null ? (
+              [0, 1, 2].map(() => (
+                <div class="r sk-row">
+                  <span class="sk" style="width:13px;height:13px"></span>
+                  <span class="name"><span class="sk tall" style="width:min(38%,200px)"></span></span>
+                  <span class="sk" style="width:46px"></span>
+                  <span class="sk" style="width:62px"></span>
+                </div>
+              ))
+            ) : shown.length === 0 ? (
+              <div class="empty">
+                <h2>{q ? "no matches" : mine ? "no repositories yet" : "nothing to show"}</h2>
+                <p class="prose">
+                  {q
+                    ? "No repository of theirs matches that filter."
+                    : mine
+                      ? "Create one, then point the CLI at it: fkit remote, fkit push."
+                      : `${p.username} has no repositories you are allowed to see. Private ones are not listed, even by name.`}
+                </p>
+                {!q && mine ? (
+                  <a class="btn primary" href="/new" onClick={linkHandler("/new")}>
+                    <loom-icon name="plus" size={12}></loom-icon> new repository
+                  </a>
+                ) : null}
+              </div>
+            ) : (
+              shown.map((r) => repoRow(r))
+            )}
+          </fkit-list>
+        </fkit-section>
       </div>
     );
   }

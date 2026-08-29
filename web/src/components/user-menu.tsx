@@ -7,6 +7,7 @@
  */
 import { LoomElement, component, css, styles, reactive, prop, mount } from "@toyz/loom";
 import { linkHandler } from "../nav";
+import "./fkit-avatar";
 
 const sheet = css`
   *, *::before, *::after { box-sizing: border-box; }
@@ -20,14 +21,9 @@ const sheet = css`
   }
   .trigger:hover, .trigger.open { background: var(--raised); color: var(--text); }
 
-  /* Initials rather than an avatar service: no external request, no tracking,
-     and it works on a server with no internet access at all. */
-  .av {
-    width: 21px; height: 21px; border-radius: var(--radius);
-    background: var(--accent-weak); color: var(--accent);
-    display: grid; place-items: center;
-    font-size: 10px; font-weight: 600; text-transform: uppercase; flex: none;
-  }
+  /* The same component the profile page and its edit form use, so one person
+     is one face and one colour everywhere they appear. */
+  fkit-avatar { flex: none; }
   .chev { transition: transform .12s; }
   .trigger.open .chev { transform: rotate(180deg); }
 
@@ -106,7 +102,7 @@ export class UserMenu extends LoomElement {
           aria-haspopup="menu"
           aria-expanded={this.open ? "true" : "false"}
         >
-          <span class="av">{this.username.slice(0, 2)}</span>
+          <fkit-avatar name={this.username} size={21}></fkit-avatar>
           {this.username}
           <loom-icon class="chev" name="chevron" size={11}></loom-icon>
         </button>

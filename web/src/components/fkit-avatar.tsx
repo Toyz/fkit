@@ -14,17 +14,32 @@ import { LoomElement, component, css, styles, prop } from "@toyz/loom";
 
 const sheet = css`
   :host { display: inline-block; }
+
+  /* The colour is derived from the name, so two people are never the same
+     tile and nobody has to upload anything to stop being interchangeable.
+     Saturation stays low on purpose: these should read as tinted greys with
+     a character each, not as a box of crayons next to a single teal accent.
+   */
   .a {
     display: grid; place-items: center;
     width: var(--sz, 34px); height: var(--sz, 34px);
     border-radius: var(--radius);
-    background: var(--accent-weak); color: var(--accent);
+    background: hsl(var(--h, 174) 26% 13%);
+    color: hsl(var(--h, 174) 46% 62%);
+    box-shadow: inset 0 0 0 1px hsl(var(--h, 174) 24% 24%);
     font-family: var(--mono); font-weight: 600; text-transform: uppercase;
     letter-spacing: .02em;
-    /* Scales with the box, so one component covers 34px and 84px without a
+    /* Scales with the box, so one component covers 28px and 62px without a
        second prop for the type size. */
-    font-size: calc(var(--sz, 34px) * .36);
+    font-size: calc(var(--sz, 34px) * .38);
     user-select: none;
+  }
+  @media (prefers-color-scheme: light) {
+    .a {
+      background: hsl(var(--h, 174) 38% 92%);
+      color: hsl(var(--h, 174) 44% 30%);
+      box-shadow: inset 0 0 0 1px hsl(var(--h, 174) 28% 80%);
+    }
   }
 `;
 
@@ -47,9 +62,27 @@ export class FkitAvatar extends LoomElement {
     return words[0][0] + words[1][0];
   }
 
+  /**
+   * A hue for this name, stable across sessions and servers.
+   *
+   * FNV-1a, because the only requirements are that it spreads short strings
+   * and that it gives the same answer everywhere — the same reasons this
+   * program identifies everything else by a digest of its content.
+   */
+  private hue(): number {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < this.name.length; i++) {
+      h ^= this.name.charCodeAt(i);
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return h % 360;
+  }
+
   update() {
     return (
-      <span class="a" style={`--sz:${this.size}px`}>{this.initials()}</span>
+      <span class="a" style={`--sz:${this.size}px;--h:${this.hue()}`}>
+        {this.initials()}
+      </span>
     );
   }
 }
