@@ -62,7 +62,7 @@ type View =
   | { kind: "compare"; base: string; head: string }
   | { kind: "tags" }
   | { kind: "merges" }
-  | { kind: "merge"; number: number }
+  | { kind: "merge"; number: number; tab: "conversation" | "commits" | "files" }
   | { kind: "issues" }
   | { kind: "issue"; number: number }
   | { kind: "settings"; section: string }
@@ -76,6 +76,16 @@ type View =
  * is three chances for one to encode a segment differently from the others —
  * which would quietly give that query a cache key of its own.
  */
+/** Two comments on the same line of the same version of the same file. */
+function sameAnchor(a: Comment, b: Comment): boolean {
+  return (
+    a.blob === b.blob &&
+    a.side === b.side &&
+    a.line === b.line &&
+    a.file_path === b.file_path
+  );
+}
+
 function refAndPath(el: PageRepo): string {
   const v = el.loc!.view;
   const path = "path" in v ? v.path : "";
@@ -111,11 +121,13 @@ function parse(): { owner: string; name: string; view: View } | null {
   }
   if (kind === "merges") {
     const n = rest[0] ? Number(rest[0]) : NaN;
-    return {
-      owner,
-      name,
-      view: Number.isFinite(n) ? { kind: "merge", number: n } : { kind: "merges" },
-    };
+    if (!Number.isFinite(n)) return { owner, name, view: { kind: "merges" } };
+    // `/merges/4`, `/merges/4/commits`, `/merges/4/files` — the sub-view is
+    // in the URL so a link can point at the files rather than at the top of
+    // a conversation someone then has to scroll past.
+    const t = rest[1];
+    const tab = t === "commits" || t === "files" ? t : "conversation";
+    return { owner, name, view: { kind: "merge", number: n, tab } };
   }
   if (kind === "commit" && rest[0]) return { owner, name, view: { kind: "commit", hash: rest[0] } };
   // A commit list has no path after the ref, so the whole remainder is the
@@ -696,6 +708,57 @@ const sheet = css`
   }
   .more:hover { background: var(--surface); color: var(--text); border-color: var(--border); }
   .more loom-icon.closed { transform: rotate(180deg); }
+
+  /* The merge request's own tabs, under its header. Quieter than the
+     repository's tabs above them, because they are a level down. */
+  .mtabs {
+    display: flex; gap: 3px; margin: 4px 0 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  .mtabs a {
+    display: flex; align-items: center; gap: 6px;
+    padding: 7px 11px; font-size: 12px; color: var(--muted);
+    text-decoration: none; border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+  }
+  .mtabs a:hover { color: var(--text); text-decoration: none; }
+  .mtabs a.on { color: var(--text); border-bottom-color: var(--accent); }
+  .mtabs a .n {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 16px; height: 16px; padding: 0 5px;
+    border-radius: 999px; background: var(--raised); color: var(--muted);
+    font-size: 10.5px; font-variant-numeric: tabular-nums;
+  }
+  .mtabs a.on .n { background: var(--accent-weak); color: var(--accent); }
+
+  /* A line comment shown away from its diff: the code it is about, then the
+     comment. Without this a conversation is a list of line numbers. */
+  .snip {
+    border: 1px solid var(--border); border-radius: var(--radius);
+    overflow: hidden; background: var(--bg);
+  }
+  .snip-head {
+    display: flex; align-items: center; gap: 7px;
+    padding: 6px 11px; background: var(--raised);
+    border-bottom: 1px solid var(--border);
+    font-size: 11.5px; color: var(--muted); text-decoration: none;
+  }
+  .snip-head:hover { color: var(--text); text-decoration: none; }
+  .snip-head .p { color: var(--text); }
+  .snip-head .ln { margin-left: auto; color: var(--faint); }
+  .snip-head .stale { margin-left: auto; color: var(--modified); font-family: var(--sans); }
+  .snip.gone .snip-head { border-bottom: 0; }
+  .snip-body { padding: 4px 0; }
+  /* The commented line itself, marked so the eye lands on it rather than on
+     the context around it. */
+  .snip-body .dl.hit { background: color-mix(in srgb, var(--accent) 9%, transparent); }
+  .snip-body .dl .no { min-width: 44px; }
+
+  .talk-item { display: flex; flex-direction: column; gap: 7px; }
+  .resolved-note {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 11.5px; color: var(--added); font-family: var(--sans);
+  }
 
   /* ---- a comment pinned to a line ---- */
   .dl { position: relative; }
@@ -2047,6 +2110,104 @@ export class PageRepo extends LoomElement {
     );
   }
 
+  /// The three ways to look at a merge request.
+  ///
+  /// The counts are the point: how much was said, and how much changed, are
+  /// the two things that decide which one you open.
+  private mergeTabs(number: number, on: string, c: Comparison | null) {
+    const at = this.loc!;
+    const talk = (this.comments ?? []).length;
+    const files = c?.files.length ?? 0;
+    const base = `/${at.owner}/${at.name}/merges/${number}`;
+
+    const tabs: [string, string, string, number][] = [
+      ["conversation", "conversation", "merge", talk],
+      ["commits", "commits", "commit", c?.commits.length ?? 0],
+      ["files", "files changed", "file", files],
+    ];
+
+    return (
+      <div class="mtabs">
+        {tabs.map(([id, label, ic, n]) => {
+          const href = id === "conversation" ? base : `${base}/${id}`;
+          return (
+            <a
+              loom-key={id}
+              class={on === id ? "on" : ""}
+              href={href}
+              onClick={linkHandler(href)}
+            >
+              <loom-icon name={ic} size={12}></loom-icon>
+              {label}
+              {n ? <span class="n">{n}</span> : null}
+            </a>
+          );
+        })}
+      </div>
+    );
+  }
+
+  /// The few lines of code a comment was written about.
+  ///
+  /// A line comment is invisible in a conversation without one: "line 3 of
+  /// DOOMED-PAYLOAD.txt" is not something anyone can picture. The snippet is
+  /// cut from the diff already on the page, matched by the same content hash
+  /// the comment is anchored to — so if it cannot be found, the file has
+  /// changed and saying so is the honest answer rather than showing whatever
+  /// now sits at that line number.
+  private snippet(c: Comment, files: FileDiff[]) {
+    if (!c.blob || !c.line || !c.side) return null;
+
+    const f = files.find((x) => (c.side === "old" ? x.old_hash : x.new_hash) === c.blob);
+    if (!f) {
+      return (
+        <div class="snip gone">
+          <div class="snip-head">
+            <loom-icon name="file" size={11}></loom-icon>
+            <span class="p">{c.file_path}</span>
+            <span class="stale">outdated — this file has changed since</span>
+          </div>
+        </div>
+      );
+    }
+
+    // Three lines either side is enough to recognise where you are without
+    // reprinting the hunk.
+    const flat = f.hunks.flatMap((h) => h.lines);
+    const at = flat.findIndex((l) => (c.side === "old" ? l.old_no : l.new_no) === c.line);
+    if (at < 0) return null;
+    const lines = flat.slice(Math.max(0, at - 3), at + 1);
+    const lang = languageFor(f.path);
+    const href = `/${this.loc!.owner}/${this.loc!.name}/merges/${
+      this.loc!.view.kind === "merge" ? this.loc!.view.number : 0
+    }/files`;
+
+    return (
+      <div class="snip">
+        <a class="snip-head" href={href} onClick={linkHandler(href)}>
+          <loom-icon name="file" size={11}></loom-icon>
+          <span class="p">{c.file_path}</span>
+          <span class="ln">line {c.line}</span>
+        </a>
+        <div class="snip-body">
+          {lines.map((l, i) => {
+            const cls = l.op === "+" ? "ins" : l.op === "-" ? "del" : "eq";
+            const toks = highlight(l.text, lang)[0] ?? [];
+            return (
+              <div class={`dl ${cls} ${i === lines.length - 1 ? "hit" : ""}`}>
+                <span class="no">{(c.side === "old" ? l.old_no : l.new_no) ?? ""}</span>
+                <span class="mk">{l.op}</span>
+                <span class="dsrc">
+                  {toks.length === 0 ? " " : toks.map((t) => <span class={t.c}>{t.t}</span>)}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  }
+
   /// The header an issue and a merge request share.
   ///
   /// Both are "a numbered thing someone opened, which is in some state" — the
@@ -2995,6 +3156,7 @@ fkit push</pre>
 
     const c = m.comparison;
     const open = m.state === "open";
+    const tab = at.view.kind === "merge" ? at.view.tab : "conversation";
     // How many distinct line threads are still open. Counted by anchor,
     // because a thread is the comments sharing one, not a row of its own.
     const unresolved = new Set(
@@ -3128,8 +3290,13 @@ fkit push</pre>
               </div>
             ) : null}
 
-            {c.commits.length > 0 ? (
-              <div class="panel commits" style="margin-bottom:12px">
+            {this.mergeTabs(m.number, tab, c)}
+
+            {tab === "commits" ? (
+              c.commits.length === 0 ? (
+                <div class="panel"><div class="empty">No commits on this branch.</div></div>
+              ) : (
+              <div class="panel commits">
                 <div class="panel-head">
                   <span>commits</span>
                   <span class="val faint">{c.ahead}</span>
@@ -3147,9 +3314,13 @@ fkit push</pre>
                   );
                 })}
               </div>
+              )
             ) : null}
 
-            {c.files.length > 0 ? (
+            {tab === "files" ? (
+              c.files.length === 0 ? (
+                <div class="panel"><div class="empty">No files changed.</div></div>
+              ) : (
               <div class="review">
                 <fkit-file-tree
                   files={c.files.map((f) => ({
@@ -3171,9 +3342,10 @@ fkit push</pre>
                   ))}
                 </div>
               </div>
+              )
             ) : null}
 
-            {this.renderConversation(m.number)}
+            {tab === "conversation" ? this.renderConversation(m.number, c) : null}
           </div>
         )}
       </div>
@@ -3209,24 +3381,58 @@ fkit push</pre>
     );
   }
 
-  /// The comments that are about the change as a whole rather than a line.
-  private renderConversation(number: number) {
+  /// Everything said about the change, in the order it was said.
+  ///
+  /// Line comments appear here too, each above the code it was written about,
+  /// rather than only inside the diff. A review whose remarks are only visible
+  /// to someone who scrolls the right file to the right line is a review
+  /// nobody reads.
+  private renderConversation(number: number, c: Comparison | null) {
     const all = this.comments;
-    const talk = (all ?? []).filter((c) => !c.blob);
+    const files = c?.files ?? [];
+
+    // One list, oldest first: a conversation is a sequence, and splitting the
+    // line remarks out of it loses which answered which.
+    const ordered = [...(all ?? [])].sort((a, b) =>
+      a.created_at < b.created_at ? -1 : a.created_at > b.created_at ? 1 : 0,
+    );
+
+    // Threads are collapsed to one entry: the code, then everything said on
+    // it. Keyed by anchor, the same way the diff groups them.
+    const seen = new Set<string>();
+    const items: { key: string; lead: Comment; thread: Comment[] }[] = [];
+    for (const x of ordered) {
+      const key = x.blob ? `${x.file_path}:${x.side}:${x.line}:${x.blob}` : x.id;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      items.push({
+        key,
+        lead: x,
+        thread: x.blob ? ordered.filter((y) => y.blob && sameAnchor(y, x)) : [x],
+      });
+    }
 
     return (
       <div class="talk">
-        <div class="patch-bar">
-          <span>Conversation</span>
-          {all ? <span class="muted">{talk.length}</span> : null}
-        </div>
-
         {all === null ? (
-          <span class="sk" style="width:200px"></span>
-        ) : talk.length === 0 ? (
-          <div class="none">Nothing said yet about this change as a whole.</div>
+          <span class="sk" style="width:220px"></span>
+        ) : items.length === 0 ? (
+          <div class="none">Nothing said about this change yet.</div>
         ) : (
-          talk.map((c) => this.renderComment(c, () => this.commentsQuery.refetch()))
+          items.map((it) => (
+            <div class="talk-item" loom-key={it.key}>
+              {it.lead.blob ? this.snippet(it.lead, files) : null}
+              {it.thread.map((c) =>
+                this.renderComment(c, () => this.commentsQuery.refetch()),
+              )}
+              {it.lead.blob && it.thread.every((c) => c.resolved_at) ? (
+                <div class="resolved-note">
+                  <loom-icon name="check" size={11}></loom-icon>
+                  Resolved{it.lead.resolver ? ` by ${it.lead.resolver}` : ""}
+                </div>
+              ) : null}
+            </div>
+          ))
         )}
 
         {this.session.isAuthed ? (
