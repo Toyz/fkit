@@ -73,7 +73,7 @@ export class PageRepos extends LoomElement {
               value={this.filter}
               onInput={(e: Event) => (this.filter = (e.target as HTMLInputElement).value)}
             />
-            {this.session.isAuthed ? (
+            {this.session.canCreateRepo ? (
               <a class="btn" href="/new" onClick={linkHandler("/new")}>
                 <loom-icon name="plus" size={11}></loom-icon> new repository
               </a>
@@ -100,7 +100,7 @@ export class PageRepos extends LoomElement {
                       ? "Create a repository, then push to it from the fkit CLI."
                       : "Sign in to see private repositories you have access to."}
                 </p>
-                {!this.filter && this.session.isAuthed ? (
+                {!this.filter && this.session.canCreateRepo ? (
                   <a class="btn primary" href="/new" onClick={linkHandler("/new")}>
                     <loom-icon name="plus" size={12}></loom-icon> new repository
                   </a>

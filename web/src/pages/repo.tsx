@@ -6296,7 +6296,10 @@ fkit push</pre>
               {r.access === "admin" || r.access === "write" ? (
                 <span class="tag on">{r.access}</span>
               ) : null}
-              {this.session.isAuthed ? (
+              {/* A fork is a repository, so it needs the same role as making
+                  one. Offering the button to someone the server will refuse is
+                  worse than not offering it. */}
+              {this.session.canCreateRepo ? (
                 <button
                   type="button"
                   disabled={this.busy}

@@ -8,6 +8,73 @@ use crate::error::{AppError, AppResult};
 use crate::models::RepoRow;
 use uuid::Uuid;
 
+/// What someone may do to *the instance*, as opposed to a repository.
+///
+/// Deliberately three fixed roles rather than arbitrary grants. The question a
+/// public server actually needs to answer is "may this person create
+/// repositories here", and a capability system general enough to express
+/// anything is a system nobody can audit at a glance.
+///
+/// Every role can open issues and comment on what it can already read — that
+/// is the point of having an observer at all, and why participation is not a
+/// capability anything has to check.
+///
+/// Orthogonal to [`Access`]: a site role never grants access to someone else's
+/// repository, and an observer who is made a collaborator on a repository can
+/// write to it. The two answer different questions and are resolved
+/// separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SiteRole {
+    /// Read what is public, open issues, comment. What a new account gets.
+    Observer,
+    /// Create and own repositories. Everything an observer can do.
+    Member,
+    /// The instance: users, settings, and every repository.
+    Admin,
+}
+
+impl SiteRole {
+    pub fn parse(s: &str) -> Option<SiteRole> {
+        match s {
+            "observer" => Some(SiteRole::Observer),
+            "member" => Some(SiteRole::Member),
+            "admin" => Some(SiteRole::Admin),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SiteRole::Observer => "observer",
+            SiteRole::Member => "member",
+            SiteRole::Admin => "admin",
+        }
+    }
+
+    /// Create a repository, or fork one — a fork is a repository.
+    pub fn can_create_repo(self) -> bool {
+        self >= SiteRole::Member
+    }
+
+    /// Instance settings, other people's accounts, every repository.
+    pub fn can_administer_site(self) -> bool {
+        self == SiteRole::Admin
+    }
+
+}
+
+/// Refuse an action the site role does not carry.
+pub fn require_site(role: SiteRole, allowed: bool, what: &str) -> AppResult<()> {
+    if allowed {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden(format!(
+            "your account ({}) cannot {what}",
+            role.as_str()
+        )))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Access {
     /// Cannot see that this repository exists.
@@ -160,6 +227,38 @@ pub fn require_admin(access: Access) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_site_role_carries_exactly_what_it_says() {
+        assert!(SiteRole::Admin.can_administer_site());
+        assert!(!SiteRole::Member.can_administer_site());
+        assert!(!SiteRole::Observer.can_administer_site());
+
+        assert!(SiteRole::Admin.can_create_repo());
+        assert!(SiteRole::Member.can_create_repo());
+        // The whole reason the role exists.
+        assert!(!SiteRole::Observer.can_create_repo());
+
+    }
+
+    #[test]
+    fn a_site_role_round_trips_through_the_database_spelling() {
+        for r in [SiteRole::Observer, SiteRole::Member, SiteRole::Admin] {
+            assert_eq!(SiteRole::parse(r.as_str()), Some(r));
+        }
+        // An unknown value is not silently an admin.
+        assert_eq!(SiteRole::parse("root"), None);
+        assert_eq!(SiteRole::parse(""), None);
+    }
+
+    #[test]
+    fn a_site_role_grants_nothing_over_someone_elses_repository() {
+        // The two ladders are separate on purpose: being able to create your
+        // own repositories says nothing about anyone else's, and this is the
+        // assertion that stops the two being conflated later.
+        assert!(SiteRole::Member.can_create_repo());
+        assert!(!Access::None.can_read());
+    }
 
     #[test]
     fn access_is_ordered_so_comparisons_are_meaningful() {

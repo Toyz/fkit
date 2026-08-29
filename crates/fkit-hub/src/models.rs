@@ -17,6 +17,9 @@ pub struct UserRow {
     pub password_hash: String,
     pub display_name: Option<String>,
     pub is_admin: bool,
+    /// What this account may do to the instance. `is_admin` is a database
+    /// view of this and stays in step by construction.
+    pub site_role: String,
     pub created_at: DateTime<Utc>,
 }
 
@@ -26,6 +29,9 @@ pub struct UserView {
     pub username: String,
     pub display_name: Option<String>,
     pub is_admin: bool,
+    /// What this account may do to the instance. `is_admin` is a database
+    /// view of this and stays in step by construction.
+    pub site_role: String,
     pub created_at: DateTime<Utc>,
 }
 
@@ -36,6 +42,7 @@ impl From<&UserRow> for UserView {
             username: u.username.clone(),
             display_name: u.display_name.clone(),
             is_admin: u.is_admin,
+            site_role: u.site_role.clone(),
             created_at: u.created_at,
         }
     }

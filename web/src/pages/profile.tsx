@@ -257,7 +257,7 @@ export class PageProfile extends LoomElement {
                   onInput={(e: Event) => (this.filter = (e.target as HTMLInputElement).value)}
                 />
               ) : null}
-              {mine ? (
+              {mine && this.session.canCreateRepo ? (
                 <a class="btn" href="/new" onClick={linkHandler("/new")}>
                   <loom-icon name="plus" size={11}></loom-icon> new repository
                 </a>
@@ -285,7 +285,7 @@ export class PageProfile extends LoomElement {
                       ? "Create one, then point the CLI at it: fkit remote, fkit push."
                       : `${p.username} has no repositories you are allowed to see. Private ones are not listed, even by name.`}
                 </p>
-                {!q && mine ? (
+                {!q && mine && this.session.canCreateRepo ? (
                   <a class="btn primary" href="/new" onClick={linkHandler("/new")}>
                     <loom-icon name="plus" size={12}></loom-icon> new repository
                   </a>

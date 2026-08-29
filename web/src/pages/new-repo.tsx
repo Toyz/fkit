@@ -1,10 +1,11 @@
 /** Create a repository, then show exactly how to push to it. */
-import { LoomElement, component, css, styles, reactive } from "@toyz/loom";
+import { LoomElement, component, css, styles, reactive, inject, mount } from "@toyz/loom";
 import { route } from "@toyz/loom/router";
 import { notify } from "../components/fkit-notice";
 import { base } from "../ui";
 import { api, syncUrl, type Repo } from "../api";
 import { go, linkHandler } from "../nav";
+import { Session } from "../session";
 
 const sheet = css`
   .box { max-width: 520px; margin: 6vh auto 0; }
@@ -34,6 +35,23 @@ const sheet = css`
 @component("page-new-repo")
 @styles(base, sheet)
 export class PageNewRepo extends LoomElement {
+  @inject("session") accessor session!: Session;
+
+  /**
+   * Set once `/auth/me` has answered.
+   *
+   * This page has no query of its own, so nothing else would re-render it
+   * when the session arrives — the pages that appear to work without this
+   * only do so because a query resolving happens to render them again.
+   */
+  @reactive accessor sessionReady = false;
+
+  @mount
+  async waitForSession() {
+    await this.session.ready();
+    this.sessionReady = true;
+  }
+
   @reactive accessor visibility: "private" | "public" = "private";
   @reactive accessor error = "";
   @reactive accessor busy = false;
@@ -67,6 +85,30 @@ export class PageNewRepo extends LoomElement {
   }
 
   update() {
+    // Hiding the buttons is not a guard: /new is a URL anyone can type. The
+    // server refuses regardless, but arriving at a form that cannot submit is
+    // a worse way to find out than being told here.
+    if (this.sessionReady && this.session.current && !this.session.canCreateRepo) {
+      return (
+        <div class="wrap">
+          <div class="panel">
+            <div class="empty">
+              <h2>repositories are not yours to create here</h2>
+              <p class="prose">
+                This account can read, open issues and comment, but an
+                administrator has not granted it the ability to create
+                repositories on this server. Ask one to change that if you
+                need it.
+              </p>
+              <a class="btn" href="/" onClick={linkHandler("/")}>
+                back to repositories
+              </a>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
     if (this.created) {
       const r = this.created;
       const url = syncUrl(r.owner, r.name);

@@ -265,6 +265,13 @@ async fn create_repo(
     if !u.can_write {
         return Err(AppError::Forbidden("this token is read-only".into()));
     }
+    // The point of the observer role: take part in what is here without also
+    // being able to put new things on the server.
+    crate::perms::require_site(
+        u.site_role,
+        u.site_role.can_create_repo(),
+        "create repositories on this server",
+    )?;
 
     let name = body.name.trim().to_string();
     let valid = !name.is_empty()
@@ -673,6 +680,13 @@ async fn fork_repo(
     let (repo, access, _) = super::load_repo(&state, &viewer, &owner, &name).await?;
     require_read(access, &owner, &name)?;
     let u = viewer.require()?;
+    // A fork is a repository. Gating creation but not forking would be a hole
+    // with a different name on it.
+    crate::perms::require_site(
+        u.site_role,
+        u.site_role.can_create_repo(),
+        "create repositories on this server",
+    )?;
     if !u.can_write {
         return Err(AppError::Forbidden("this token is read-only".into()));
     }

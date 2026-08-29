@@ -10,6 +10,14 @@ export interface User {
   username: string;
   display_name: string | null;
   is_admin: boolean;
+  /**
+   * What this account may do to the instance.
+   *
+   * The UI hides what the role cannot reach, and the server refuses it
+   * regardless — the check here is so nobody is offered a button that will
+   * only tell them no, not so the rule is enforced in a browser.
+   */
+  site_role: SiteRole;
   created_at: string;
   email?: string;
 }
@@ -460,6 +468,14 @@ export interface CacheStats {
   fill: number;
 }
 
+/** admin: the instance. member: create repositories. observer: take part. */
+export type SiteRole = "admin" | "member" | "observer";
+
+/** Roles that may create repositories, forks included. */
+export function canCreateRepo(role: SiteRole | undefined): boolean {
+  return role === "admin" || role === "member";
+}
+
 export interface SessionInfo {
   id: string;
   user_agent: string | null;
@@ -474,6 +490,8 @@ export interface InstanceSettings {
   open_registration: boolean;
   require_auth: boolean;
   default_repo_visibility: "public" | "private";
+  /** The role every registration gets. */
+  default_site_role: SiteRole;
   allowed_email_domains: string[];
 }
 
@@ -531,6 +549,7 @@ export interface AdminUser {
   email: string;
   display_name: string | null;
   is_admin: boolean;
+  site_role: SiteRole;
   is_active: boolean;
   created_at: string;
   repo_count: number;
@@ -867,7 +886,7 @@ export const api = {
     request<{ valid: boolean; email: string | null }>(
       `/auth/invite?token=${encodeURIComponent(token)}`,
     ),
-  updateAdminUser: (id: string, input: { is_admin?: boolean; is_active?: boolean }) =>
+  updateAdminUser: (id: string, input: { site_role?: SiteRole; is_active?: boolean }) =>
     request<AdminUser>(`/admin/users/${id}`, { method: "PATCH", body: body(input) }),
   deleteAdminUser: (id: string) =>
     request<{ ok: boolean }>(`/admin/users/${id}`, { method: "DELETE" }),

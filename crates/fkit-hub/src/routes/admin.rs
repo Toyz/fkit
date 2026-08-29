@@ -12,6 +12,7 @@
 use crate::auth::{Viewer, ViewerUser};
 use crate::error::{AppError, AppResult};
 use crate::settings::Instance;
+use crate::perms::SiteRole;
 use crate::state::AppState;
 use axum::extract::{Path, State};
 use axum::routing::{delete, get, patch};
@@ -37,7 +38,9 @@ pub fn routes() -> Router<AppState> {
 /// Gate every route in this module.
 async fn require_admin(viewer: &Viewer) -> AppResult<&ViewerUser> {
     let u = viewer.require()?;
-    if !u.is_admin {
+    // Asked of the role rather than the derived flag: the role is the fact,
+    // and this is the place a capability check belongs.
+    if !u.site_role.can_administer_site() {
         // The admin area's existence is not a secret; only its contents are.
         return Err(AppError::Forbidden("administrator access required".into()));
     }
@@ -55,6 +58,8 @@ struct SettingsPatch {
     open_registration: Option<bool>,
     require_auth: Option<bool>,
     default_repo_visibility: Option<String>,
+    /// What a new account gets: "observer", "member" or "admin".
+    default_site_role: Option<String>,
     allowed_email_domains: Option<Vec<String>>,
 }
 
@@ -70,6 +75,11 @@ async fn patch_settings(
     {
         return Err(AppError::bad("visibility must be 'public' or 'private'"));
     }
+    if let Some(r) = &body.default_site_role
+        && SiteRole::parse(r).is_none()
+    {
+        return Err(AppError::bad("role must be admin, member or observer"));
+    }
     let domains: Option<Vec<String>> = body.allowed_email_domains.map(|list| {
         list.into_iter()
             .map(|d| d.trim().trim_start_matches('@').to_ascii_lowercase())
@@ -83,15 +93,17 @@ async fn patch_settings(
             open_registration       = COALESCE($2, open_registration),
             require_auth            = COALESCE($3, require_auth),
             default_repo_visibility = COALESCE($4, default_repo_visibility),
-            allowed_email_domains   = COALESCE($5, allowed_email_domains),
+            default_site_role       = COALESCE($5, default_site_role),
+            allowed_email_domains   = COALESCE($6, allowed_email_domains),
             updated_at              = now(),
-            updated_by              = $6
+            updated_by              = $7
          WHERE id = TRUE",
     )
     .bind(&body.site_name)
     .bind(body.open_registration)
     .bind(body.require_auth)
     .bind(&body.default_repo_visibility)
+    .bind(&body.default_site_role)
     .bind(&domains)
     .bind(u.id)
     .execute(&state.db)
@@ -220,6 +232,7 @@ struct AdminUser {
     username: String,
     email: String,
     display_name: Option<String>,
+    site_role: String,
     is_admin: bool,
     is_active: bool,
     created_at: DateTime<Utc>,
@@ -229,7 +242,7 @@ struct AdminUser {
 async fn list_users(State(state): State<AppState>, viewer: Viewer) -> AppResult<Json<Vec<AdminUser>>> {
     require_admin(&viewer).await?;
     let rows: Vec<AdminUser> = sqlx::query_as(
-        "SELECT u.id, u.username, u.email, u.display_name, u.is_admin, u.is_active,
+        "SELECT u.id, u.username, u.email, u.display_name, u.site_role, u.is_admin, u.is_active,
                 u.created_at,
                 (SELECT count(*) FROM repos r WHERE r.owner_id = u.id) AS repo_count
            FROM users u
@@ -242,7 +255,8 @@ async fn list_users(State(state): State<AppState>, viewer: Viewer) -> AppResult<
 
 #[derive(Deserialize)]
 struct UserPatch {
-    is_admin: Option<bool>,
+    /// "admin", "member" or "observer".
+    site_role: Option<String>,
     is_active: Option<bool>,
 }
 
@@ -268,34 +282,48 @@ async fn patch_user(
 ) -> AppResult<Json<AdminUser>> {
     let me = require_admin(&viewer).await?;
 
+    // Validated before anything is compared, so a typo cannot fall through to
+    // a role nobody has.
+    let asked = match body.site_role.as_deref() {
+        None => None,
+        Some(r) => Some(
+            SiteRole::parse(r)
+                .ok_or_else(|| AppError::bad("role must be admin, member or observer"))?,
+        ),
+    };
+
     // Self-demotion is almost always a mistake and is trivially recoverable
     // only if another admin exists — refuse it outright and make the operator
     // use a second account.
-    if id == me.id && (body.is_admin == Some(false) || body.is_active == Some(false)) {
+    let demoting_self = asked.is_some_and(|r| r != SiteRole::Admin);
+    if id == me.id && (demoting_self || body.is_active == Some(false)) {
         return Err(AppError::bad(
             "you cannot remove your own administrator rights or disable your own account",
         ));
     }
 
-    let current: (bool, bool) =
-        sqlx::query_as("SELECT is_admin, is_active FROM users WHERE id = $1")
+    let current: (String, bool) =
+        sqlx::query_as("SELECT site_role, is_active FROM users WHERE id = $1")
             .bind(id)
             .fetch_optional(&state.db)
             .await?
             .ok_or_else(|| AppError::not_found("no such user"))?;
 
-    let next_admin = body.is_admin.unwrap_or(current.0);
+    let next_role =
+        asked.or_else(|| SiteRole::parse(&current.0)).unwrap_or(SiteRole::Observer);
     let next_active = body.is_active.unwrap_or(current.1);
 
-    if would_orphan(&state, id, next_admin && next_active).await? {
+    if would_orphan(&state, id, next_role == SiteRole::Admin && next_active).await? {
         return Err(AppError::bad(
             "this is the last active administrator — promote someone else first",
         ));
     }
 
-    sqlx::query("UPDATE users SET is_admin = $2, is_active = $3 WHERE id = $1")
+    // `is_admin` is generated from this column, so there is only one thing to
+    // write and the two can never disagree.
+    sqlx::query("UPDATE users SET site_role = $2, is_active = $3 WHERE id = $1")
         .bind(id)
-        .bind(next_admin)
+        .bind(next_role.as_str())
         .bind(next_active)
         .execute(&state.db)
         .await?;
@@ -314,10 +342,14 @@ async fn patch_user(
     }
 
     super::audit(&state, Some(me.id), None, "user.update",
-        serde_json::json!({ "user": id, "is_admin": next_admin, "is_active": next_active })).await;
+        serde_json::json!({
+            "user": id,
+            "site_role": next_role.as_str(),
+            "is_active": next_active,
+        })).await;
 
     let row: AdminUser = sqlx::query_as(
-        "SELECT u.id, u.username, u.email, u.display_name, u.is_admin, u.is_active,
+        "SELECT u.id, u.username, u.email, u.display_name, u.site_role, u.is_admin, u.is_active,
                 u.created_at,
                 (SELECT count(*) FROM repos r WHERE r.owner_id = u.id) AS repo_count
            FROM users u WHERE u.id = $1",

@@ -8,7 +8,7 @@
 
 import { service } from "@toyz/loom";
 import { Reactive } from "@toyz/loom/store";
-import { api, type Meta, type User } from "./api";
+import { api, type Meta, type User, canCreateRepo, type SiteRole } from "./api";
 
 @service("session")
 export class Session {
@@ -31,6 +31,21 @@ export class Session {
    */
   get isAuthed(): boolean {
     return !!this.user.value;
+  }
+
+  /**
+   * Whether this account may create repositories, forks included.
+   *
+   * The server refuses regardless — this is so nobody is offered a button
+   * whose only outcome is being told no.
+   */
+  get canCreateRepo(): boolean {
+    return canCreateRepo(this.user.value?.site_role);
+  }
+
+  /** What this account may do to the instance, once it is known. */
+  get siteRole(): SiteRole | undefined {
+    return this.user.value?.site_role;
   }
 
   /** True once `/auth/me` has answered, whichever way it answered. */

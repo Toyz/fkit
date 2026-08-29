@@ -388,6 +388,9 @@ pub struct ViewerUser {
     pub id: Uuid,
     pub username: String,
     pub is_admin: bool,
+    /// What this account may do to the instance: create repositories,
+    /// administer it, or only take part in what already exists.
+    pub site_role: crate::perms::SiteRole,
     /// Set when the caller authenticated with a browser session.
     pub session_id: Option<Uuid>,
     /// False for a read-only personal access token, regardless of repo role.
@@ -440,6 +443,11 @@ impl FromRequestParts<AppState> for Viewer {
                     id: user.id,
                     username: user.username,
                     is_admin: user.is_admin,
+                    // An unrecognised value is the least privilege, never the
+                    // most: a row that somehow says "root" must not administer
+                    // anything.
+                    site_role: crate::perms::SiteRole::parse(&user.site_role)
+                        .unwrap_or(crate::perms::SiteRole::Observer),
                     session_id: None,
                     can_write,
                 }),
@@ -454,6 +462,8 @@ impl FromRequestParts<AppState> for Viewer {
                     id: user.id,
                     username: user.username,
                     is_admin: user.is_admin,
+                    site_role: crate::perms::SiteRole::parse(&user.site_role)
+                        .unwrap_or(crate::perms::SiteRole::Observer),
                     session_id: Some(session_id),
                     can_write: true,
                 }),

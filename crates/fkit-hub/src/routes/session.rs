@@ -156,19 +156,32 @@ async fn register(
         ));
     }
 
-    let is_admin = is_admin || invite.as_ref().is_some_and(|i| i.is_admin);
+    // What this account gets, most specific source first: the first account is
+    // always the administrator so a fresh server is not locked out of itself,
+    // then whatever the invitation named, then the instance default.
+    //
+    // The default is `observer` out of the box: a server that accepts sign-ups
+    // should not thereby accept repositories from whoever finds it.
+    let role = if is_admin {
+        crate::perms::SiteRole::Admin
+    } else if let Some(r) = invite.as_ref().and_then(|i| i.site_role) {
+        r
+    } else {
+        policy.default_site_role()
+    };
+
     let id = Uuid::new_v4();
     let hash = auth::hash_secret(&body.password)?;
 
     let inserted = sqlx::query(
-        "INSERT INTO users (id, username, email, password_hash, is_admin)
+        "INSERT INTO users (id, username, email, password_hash, site_role)
          VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(id)
     .bind(&username)
     .bind(&email)
     .bind(&hash)
-    .bind(is_admin)
+    .bind(role.as_str())
     .execute(&state.db)
     .await;
 
@@ -222,7 +235,10 @@ async fn register(
 
 struct ClaimedInvite {
     id: Uuid,
-    is_admin: bool,
+    /// The role this invitation grants, when it named one. "Join and help
+    /// triage" and "join and push code" are then different invitations rather
+    /// than the same one followed by a promotion nobody remembers to do.
+    site_role: Option<crate::perms::SiteRole>,
 }
 
 /// Look up an invite by its token and check it is still good for this address.
@@ -233,15 +249,16 @@ struct ClaimedInvite {
 async fn claim_invite(state: &AppState, token: &str, email: &str) -> AppResult<ClaimedInvite> {
     let bad = || AppError::Forbidden("that invitation is invalid, expired or already used".into());
 
-    let row: Option<(Uuid, Option<String>, bool)> = sqlx::query_as(
-        "SELECT id, email, is_admin FROM invites
+    let row: Option<(Uuid, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT id, email, site_role FROM invites
           WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now()",
     )
     .bind(auth::token_digest(token))
     .fetch_optional(&state.db)
     .await?;
 
-    let (id, bound, is_admin) = row.ok_or_else(bad)?;
+    let (id, bound, site_role): (Uuid, Option<String>, Option<String>) =
+        row.ok_or_else(bad)?;
 
     // An invite addressed to someone is not transferable: the whole point of
     // naming the address is that this link admits that person and no one else.
@@ -253,7 +270,10 @@ async fn claim_invite(state: &AppState, token: &str, email: &str) -> AppResult<C
         ));
     }
 
-    Ok(ClaimedInvite { id, is_admin })
+    Ok(ClaimedInvite {
+        id,
+        site_role: site_role.as_deref().and_then(crate::perms::SiteRole::parse),
+    })
 }
 
 /// Whether a `/register?invite=…` token is worth showing a form for.

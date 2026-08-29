@@ -21,6 +21,7 @@ import {
   humanSize,
   relativeTime,
   type AdminStats,
+  type SiteRole,
   type CacheStats,
   type AdminUser,
   type EmailStatus,
@@ -54,7 +55,7 @@ const sheet = css`
     /* Every column is fixed except the two text ones. An auto-width action
        column measured its own contents, so the empty header cell resolved
        narrower than the data cells and every heading sat right of its column. */
-    grid-template-columns: minmax(120px, 1.1fr) minmax(0, 1.6fr) 52px 96px 64px 120px;
+    grid-template-columns: minmax(120px, 1.1fr) minmax(0, 1.6fr) 52px 96px 104px 120px;
     gap: 12px; align-items: center;
     height: 34px; padding: 0 14px;
     border-top: 1px solid var(--border);
@@ -455,6 +456,30 @@ export class PageAdmin extends LoomElement {
                 }
               ></fkit-toggle>
             </fkit-setting-row>
+          </fkit-list>
+        </fkit-section>
+
+        <fkit-section
+          heading="What a new account can do"
+          value={s.default_site_role}
+          blurb="The role every registration gets. Someone can always be promoted afterwards, and an invitation can name a different one."
+        >
+          <fkit-list>
+            <fkit-choice
+              value={s.default_site_role}
+              disabled={this.busy}
+              options={[
+                { value: "observer", label: "Observer", icon: "user",
+                  hint: "Read what is public, open issues, comment. Cannot create repositories." },
+                { value: "member", label: "Member", icon: "repo",
+                  hint: "Everything an observer can do, and create and own repositories." },
+              ]}
+              onPick={(e: Event) =>
+                void this.patch({
+                  default_site_role: (e as CustomEvent<string>).detail as SiteRole,
+                })
+              }
+            ></fkit-choice>
           </fkit-list>
         </fkit-section>
 
@@ -868,7 +893,7 @@ export class PageAdmin extends LoomElement {
               <span>email</span>
               <span class="num">repos</span>
               <span>joined</span>
-              <span class="mid">admin</span>
+              <span class="mid">role</span>
               <span></span>
             </div>
 
@@ -885,6 +910,12 @@ export class PageAdmin extends LoomElement {
                 ))
               : rows.map((u) => this.userRow(u, u.id === me?.id))}
           </fkit-list>
+
+          <p class="rolekey">
+            <b>observer</b> reads what is public, opens issues and comments ·{" "}
+            <b>member</b> also creates and owns repositories ·{" "}
+            <b>admin</b> also administers this server
+          </p>
         </fkit-section>
       </fkit-page>
     );
@@ -902,19 +933,28 @@ export class PageAdmin extends LoomElement {
         <span class="num">{u.repo_count}</span>
         <span class="when">{relativeTime(u.created_at)}</span>
         <span class="mid">
-          <fkit-toggle
-            checked={u.is_admin}
+          {/* A toggle could only say administrator or not, and "not" meant
+              "can create repositories", which is a second decision it was
+              making silently. */}
+          <select
+            class="role"
             disabled={self || this.busy}
-            label={`administrator: ${u.username}`}
-            onToggle={(e: Event) =>
+            aria-label={`role: ${u.username}`}
+            onChange={(e: Event) =>
               void this.act(async () => {
                 await api.updateAdminUser(u.id, {
-                  is_admin: (e as CustomEvent<boolean>).detail,
+                  site_role: (e.target as HTMLSelectElement).value as SiteRole,
                 });
                 this.users = await api.adminUsers();
               })
             }
-          ></fkit-toggle>
+          >
+            {(["observer", "member", "admin"] as SiteRole[]).map((r) => (
+              <option value={r} selected={u.site_role === r}>
+                {r}
+              </option>
+            ))}
+          </select>
         </span>
         <span class="acts">
           <button

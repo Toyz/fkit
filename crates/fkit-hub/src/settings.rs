@@ -20,6 +20,9 @@ pub struct Instance {
     pub open_registration: bool,
     pub require_auth: bool,
     pub default_repo_visibility: String,
+    /// What a new account gets. `observer` out of the box: accepting sign-ups
+    /// should not mean accepting repositories from whoever finds the server.
+    pub default_site_role: String,
     pub allowed_email_domains: Vec<String>,
     /// Sender address. Must be on a domain verified with Resend.
     pub email_from: String,
@@ -44,6 +47,13 @@ pub struct Instance {
 }
 
 impl Instance {
+    /// The configured default, or the cautious answer if the column somehow
+    /// holds something unrecognised.
+    pub fn default_site_role(&self) -> crate::perms::SiteRole {
+        crate::perms::SiteRole::parse(&self.default_site_role)
+            .unwrap_or(crate::perms::SiteRole::Observer)
+    }
+
     /// Can this server send mail?
     pub fn email_configured(&self) -> bool {
         self.resend_api_key.as_deref().map(|k| !k.trim().is_empty()).unwrap_or(false)
@@ -58,6 +68,9 @@ impl Default for Instance {
             open_registration: true,
             require_auth: false,
             default_repo_visibility: "private".into(),
+            // Cautious by default: signing up is not the same as being handed
+            // a server to put repositories on.
+            default_site_role: "observer".into(),
             allowed_email_domains: vec![],
             email_from: String::new(),
             public_url: String::new(),
@@ -97,14 +110,15 @@ impl Settings {
         sqlx::query(
             "INSERT INTO instance_settings
                 (id, site_name, open_registration, require_auth, default_repo_visibility,
-                 email_from, public_url)
-             VALUES (TRUE, $1, $2, $3, $4, $5, $6)
+                 default_site_role, email_from, public_url)
+             VALUES (TRUE, $1, $2, $3, $4, $5, $6, $7)
              ON CONFLICT (id) DO NOTHING",
         )
         .bind(&seed.site_name)
         .bind(seed.open_registration)
         .bind(seed.require_auth)
         .bind(&seed.default_repo_visibility)
+        .bind(&seed.default_site_role)
         .bind(&seed.email_from)
         .bind(&seed.public_url)
         .execute(db)
@@ -160,7 +174,7 @@ impl EnvEmail {
 async fn fetch(db: &sqlx::PgPool) -> Result<Instance> {
     let row: Instance = sqlx::query_as(
         "SELECT site_name, open_registration, require_auth, default_repo_visibility,
-                allowed_email_domains, email_from, public_url, resend_api_key
+                default_site_role, allowed_email_domains, email_from, public_url, resend_api_key
            FROM instance_settings WHERE id = TRUE",
     )
     .fetch_one(db)
