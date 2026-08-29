@@ -76,27 +76,18 @@ struct PgHost {
 }
 
 impl PgHost {
-    /// Why a rewrite of `branch` is refused, if it is.
+    /// The rules that bind this pusher, or `None` if none do.
     ///
-    /// Fails closed: if the rules cannot be read, the answer is no. Letting a
-    /// force-push through because a query failed would make the protection
-    /// worth nothing exactly when the server is unhealthy.
-    async fn protection_denies(&self, branch: &str) -> anyhow::Result<Option<String>> {
-        if crate::rules::exempt(self.user_id, self.repo.owner_id) {
-            return Ok(None);
-        }
-        match crate::rules::for_repo(&self.state.db, self.repo.id).await {
-            Ok(rules) => Ok(crate::rules::deny_force(&rules, branch)),
-            Err(e) => {
-                tracing::error!("could not read branch rules for {}: {e}", self.label);
-                Ok(Some(
-                    "branch protection could not be checked, so this push is refused"
-                        .to_string(),
-                ))
-            }
-        }
-    }
-
+    /// Read before the transaction opens, deliberately. Taking a second pooled
+    /// connection while holding a row lock is a deadlock waiting for load: with
+    /// sixteen connections, sixteen concurrent force-pushes would each hold a
+    /// transaction while waiting for a seventeenth that never comes. Rules do
+    /// not change on the timescale of a single push, so reading them a moment
+    /// early costs nothing — and a push racing an administrator adding a rule
+    /// has no defined order anyway.
+    ///
+    /// Fails closed: if they cannot be read, everything is refused. Protection
+    /// that evaporates when the database is unhappy is not protection.
     /// Record which account delivered these commits.
     ///
     /// Walks back from the new tip and stops at the first commit already
@@ -178,6 +169,21 @@ impl PgHost {
             )
             .unwrap_or(false)
     }
+    fn rules_for(&self, branch: &str) -> Option<String> {
+        if crate::rules::exempt(self.user_id, self.repo.owner_id) {
+            return None;
+        }
+        let loaded = self
+            .rt
+            .block_on(crate::rules::for_repo(&self.state.db, self.repo.id));
+        match loaded {
+            Ok(rules) => crate::rules::deny_force(&rules, branch),
+            Err(e) => {
+                tracing::error!("could not read branch rules for {}: {e}", self.label);
+                Some("branch protection could not be checked, so this push is refused".into())
+            }
+        }
+    }
 }
 
 impl RepoHost for PgHost {
@@ -211,30 +217,74 @@ impl RepoHost for PgHost {
         self.access.can_write()
     }
 
-    /// The fast-forward check and the write share a transaction, with the ref
+    /// Move a ref, or refuse to.
+    ///
+    /// The fast-forward check and the write share a transaction with the ref
     /// row locked between them. Without that lock two simultaneous pushes can
-    /// both observe the old tip, both pass the check, and one silently discards
-    /// the other's commits. This is the concrete thing Postgres buys the hub
-    /// over the file-backed daemon.
+    /// both observe the old tip, both pass the check, and one silently
+    /// discards the other's commits. This is the concrete thing Postgres buys
+    /// the hub over the file-backed daemon.
+    ///
+    /// Creating a branch is the case that lock cannot cover: `FOR UPDATE`
+    /// locks the rows it selects, and selecting a branch that does not exist
+    /// yet selects none. Two pushes creating the same name therefore both saw
+    /// nothing, both skipped every check, and the second overwrote the first —
+    /// an acknowledged push whose commits were no longer on the branch. So a
+    /// creation is decided by the insert itself, which the unique index makes
+    /// exactly one of them win, and the loser retries against the row that now
+    /// exists and goes through the ordinary checks.
     fn advance_ref(&self, branch: &str, tip: Hash, force: bool) -> Result<RefUpdate> {
+        // Outside the transaction: see `rules_for`.
+        let denial = self.rules_for(branch);
+
         self.rt.block_on(async {
-            let mut tx = self.state.db.begin().await?;
+            // Bounded, because each turn either settles or loses a race it
+            // cannot lose twice for the same reason; an unbounded loop here
+            // would be a way to spin forever on a bug.
+            for _ in 0..8 {
+                let mut tx = self.state.db.begin().await?;
 
-            let existing: Option<(Vec<u8>,)> = sqlx::query_as(
-                "SELECT target FROM refs WHERE repo_id = $1 AND name = $2 FOR UPDATE",
-            )
-            .bind(self.repo.id)
-            .bind(branch)
-            .fetch_optional(&mut *tx)
-            .await?;
+                let existing: Option<(Vec<u8>,)> = sqlx::query_as(
+                    "SELECT target FROM refs WHERE repo_id = $1 AND name = $2 FOR UPDATE",
+                )
+                .bind(self.repo.id)
+                .bind(branch)
+                .fetch_optional(&mut *tx)
+                .await?;
 
-            if let Some((bytes,)) = &existing {
-                let old = Hash(
-                    bytes.clone().try_into().map_err(|_| anyhow!("corrupt ref target"))?,
-                );
+                let Some((bytes,)) = existing else {
+                    // Creating. Nothing is locked, so let the unique index
+                    // pick the winner rather than trusting what we just read.
+                    let done = sqlx::query(
+                        "INSERT INTO refs (repo_id, name, target, updated_by)
+                         VALUES ($1, $2, $3, $4)
+                         ON CONFLICT (repo_id, name) DO NOTHING",
+                    )
+                    .bind(self.repo.id)
+                    .bind(branch)
+                    .bind(tip.0.to_vec())
+                    .bind(self.user_id)
+                    .execute(&mut *tx)
+                    .await?;
+
+                    if done.rows_affected() == 1 {
+                        tx.commit().await?;
+                        return Ok(RefUpdate::Updated);
+                    }
+
+                    // Somebody created it between our read and our insert.
+                    // Start again: the row exists now, so the next turn takes
+                    // the lock and applies the checks it should have.
+                    tx.rollback().await?;
+                    continue;
+                };
+
+                let old =
+                    Hash(bytes.try_into().map_err(|_| anyhow!("corrupt ref target"))?);
                 if old == tip {
                     return Ok(RefUpdate::AlreadyCurrent);
                 }
+
                 // A tag has no history to fast-forward along. Moving one makes
                 // every checkout of that name silently mean something else, so
                 // it takes an explicit force rather than passing the ancestry
@@ -252,7 +302,7 @@ impl RepoHost for PgHost {
                         // Protection is about exactly this, so it is checked
                         // whether or not --force was passed — the flag says
                         // the pusher meant it, not that they may.
-                        if let Some(why) = self.protection_denies(branch).await? {
+                        if let Some(why) = denial {
                             return Ok(RefUpdate::Refused(why));
                         }
                         if !force {
@@ -260,42 +310,24 @@ impl RepoHost for PgHost {
                         }
                     }
                 }
-            }
 
-            sqlx::query(
-                "INSERT INTO refs (repo_id, name, target, updated_by)
-                 VALUES ($1, $2, $3, $4)
-                 ON CONFLICT (repo_id, name) DO UPDATE
-                   SET target = EXCLUDED.target,
-                       updated_at = now(),
-                       updated_by = EXCLUDED.updated_by",
-            )
-            .bind(self.repo.id)
-            .bind(branch)
-            .bind(tip.0.to_vec())
-            .bind(self.user_id)
-            .execute(&mut *tx)
-            .await?;
-
-            sqlx::query("UPDATE repos SET updated_at = now() WHERE id = $1")
+                // The row is locked, so a plain update is the whole story.
+                sqlx::query(
+                    "UPDATE refs SET target = $3, updated_at = now(), updated_by = $4
+                      WHERE repo_id = $1 AND name = $2",
+                )
                 .bind(self.repo.id)
+                .bind(branch)
+                .bind(tip.0.to_vec())
+                .bind(self.user_id)
                 .execute(&mut *tx)
                 .await?;
 
-            sqlx::query(
-                "INSERT INTO audit_log (actor_id, repo_id, action, detail)
-                 VALUES ($1, $2, 'ref.update', $3)",
-            )
-            .bind(self.user_id)
-            .bind(self.repo.id)
-            .bind(serde_json::json!({
-                "branch": branch, "target": tip.to_hex(), "force": force
-            }))
-            .execute(&mut *tx)
-            .await?;
+                tx.commit().await?;
+                return Ok(RefUpdate::Updated);
+            }
 
-            tx.commit().await?;
-            Ok(RefUpdate::Updated)
+            Err(anyhow!("{branch} is being pushed to to too heavily to settle"))
         })
     }
 

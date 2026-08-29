@@ -484,7 +484,11 @@ It **refuses to start** on a non-loopback address without a token unless you pas
 * A repository you cannot see returns **404, not 403**, everywhere including the
   sync endpoint, so error codes cannot be used to enumerate private repos.
 * Ref updates are fast-forward-only unless forced. In the hub the check and the
-  write share a transaction with the ref row locked; `fkitd` can only manage a
+  write share a transaction with the ref row locked. Creating a branch cannot
+  use that lock — `FOR UPDATE` locks the rows it selects, and a branch that
+  does not exist yet has none — so a creation is decided by the insert instead,
+  which the unique index lets exactly one pusher win; the loser retries against
+  the row that now exists and goes through the ordinary check. `fkitd` can only manage a
   per-process lock, which is the honest limit of file-backed refs.
 * Server administrators can read every repository. That is deliberate — it is
   what "administrator" means for operations — so it is disclosed in the UI on
