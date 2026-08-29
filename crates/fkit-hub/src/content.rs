@@ -178,6 +178,27 @@ pub fn image_mime(bytes: &[u8]) -> Option<&'static str> {
     None
 }
 
+/// Read a file node straight from the store, by hash.
+///
+/// The same limits and sniffing as [`read_blob`]; only the way in differs.
+pub fn read_object(store: &Store, id: Hash) -> AppResult<Blob> {
+    if !store.has(id) {
+        return Err(AppError::not_found("no such object"));
+    }
+    // The size is not known before reading here — there is no tree entry to
+    // ask — so the cap is applied after, on what came back.
+    let mut bytes = Vec::new();
+    read_file(store, id, &mut bytes).map_err(AppError::Internal)?;
+    let size = bytes.len() as u64;
+    let truncated = size > MAX_INLINE_BLOB;
+    if truncated {
+        bytes.clear();
+    }
+    let binary = bytes.iter().take(8192).any(|b| *b == 0);
+    let image = image_mime(&bytes);
+    Ok(Blob { size, hash: id, bytes, truncated, binary, image })
+}
+
 pub fn read_blob(store: &Store, tree: Hash, path: &str) -> AppResult<Blob> {
     let (dir, file) = match path.rsplit_once('/') {
         Some((d, f)) => (d, f),

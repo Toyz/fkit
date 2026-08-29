@@ -78,6 +78,8 @@ export interface Issue {
   updated_at: string;
   comments: number;
   labels: Label[];
+  /** Present when the issue was opened from a selection in a file. */
+  anchor?: CodeAnchor;
 }
 
 export interface CrossRef {
@@ -417,6 +419,21 @@ export interface MergeRequest {
   labels: Label[];
 }
 
+/**
+ * Where an issue came from: an exact range of an exact file's content.
+ *
+ * `blob` is the anchor and the reason this holds up — a hash names one byte
+ * sequence forever, so the lines can still be shown after the file has moved
+ * on. `file_path` and `ref_name` are where it was at the time, for display.
+ */
+export interface CodeAnchor {
+  file_path: string;
+  line_start: number;
+  line_end: number;
+  blob: string;
+  ref_name?: string;
+}
+
 export interface MergeRequestDetail extends MergeRequest {
   /** Recomputed live from the branches on every view. */
   comparison: Comparison | null;
@@ -601,7 +618,11 @@ export const api = {
     }),
   issue: (owner: string, name: string, number: number) =>
     request<Issue>(`/repos/${owner}/${name}/issues/${number}`),
-  createIssue: (owner: string, name: string, input: { title: string; body?: string }) =>
+  createIssue: (
+    owner: string,
+    name: string,
+    input: { title: string; body?: string; anchor?: CodeAnchor },
+  ) =>
     request<Issue>(`/repos/${owner}/${name}/issues`, { method: "POST", body: body(input) }),
   editIssue: (
     owner: string,
@@ -767,6 +788,15 @@ export const api = {
     request<MergeRequest>(`/repos/${owner}/${name}/merges/${number}/close`, { method: "POST" }),
   reopenMerge: (owner: string, name: string, number: number) =>
     request<MergeRequest>(`/repos/${owner}/${name}/merges/${number}/reopen`, { method: "POST" }),
+
+  /**
+   * A file's content by its own hash.
+   *
+   * How an anchored issue shows its code: the hash names those exact bytes, so
+   * this works regardless of what the branch has done since.
+   */
+  object: (owner: string, name: string, hash: string) =>
+    request<BlobResponse>(`/repos/${owner}/${name}/object/${hash}`),
 
   readme: (owner: string, name: string, ref: string, path = "") =>
     request<{ name: string; content: string } | null>(

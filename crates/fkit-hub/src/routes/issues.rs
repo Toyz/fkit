@@ -336,6 +336,11 @@ struct IssueRow {
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     comments: i64,
+    file_path: Option<String>,
+    line_start: Option<i32>,
+    line_end: Option<i32>,
+    blob: Option<Vec<u8>>,
+    ref_name: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -352,6 +357,24 @@ pub struct IssueView {
     pub comments: i64,
     /// Filled in bulk after the rows are fetched, for the same reason.
     pub labels: Vec<LabelView>,
+    /// The lines this issue was opened about, if it was opened from code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<CodeAnchor>,
+}
+
+/// Where an issue came from: an exact range of an exact file's content.
+#[derive(Serialize)]
+pub struct CodeAnchor {
+    /// Where the file was when the issue was opened. Display only — content
+    /// that moves keeps its hash, so the anchor survives a rename.
+    pub file_path: String,
+    pub line_start: i32,
+    pub line_end: i32,
+    /// The anchor proper. Names one byte sequence, forever.
+    pub blob: String,
+    /// What the author was reading. Display only; a branch moves.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ref_name: Option<String>,
 }
 
 impl From<IssueRow> for IssueView {
@@ -367,8 +390,26 @@ impl From<IssueRow> for IssueView {
             updated_at: r.updated_at,
             comments: r.comments,
             labels: Vec::new(),
+            // All four parts or none: the column constraint guarantees it, and
+            // zipping them here means a half-anchor can never reach a client.
+            anchor: match (r.file_path, r.line_start, r.line_end, r.blob) {
+                (Some(file_path), Some(line_start), Some(line_end), Some(blob)) => {
+                    Some(CodeAnchor {
+                        file_path,
+                        line_start,
+                        line_end,
+                        blob: hex(&blob),
+                        ref_name: r.ref_name,
+                    })
+                }
+                _ => None,
+            },
         }
     }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// One row of the bulk label join: which issue, and the label's own columns.
@@ -419,6 +460,7 @@ macro_rules! select_issue {
         concat!(
             "SELECT i.number, i.title, i.body, i.state, u.username AS author, ",
             "       i.closed_at, i.created_at, i.updated_at, ",
+            "       i.file_path, i.line_start, i.line_end, i.blob, i.ref_name, ",
             "       (SELECT COUNT(*) FROM comments c WHERE c.issue_id = i.id) AS comments ",
             "  FROM issues i ",
             "  LEFT JOIN users u ON u.id = i.author_id ",
@@ -507,6 +549,20 @@ async fn list(
 struct CreateIssue {
     title: String,
     body: Option<String>,
+    /// Opened from a selection while reading a file.
+    #[serde(default)]
+    anchor: Option<NewAnchor>,
+}
+
+#[derive(Deserialize)]
+struct NewAnchor {
+    file_path: String,
+    line_start: i32,
+    line_end: i32,
+    /// The blob the lines were read from, as hex.
+    blob: String,
+    #[serde(default)]
+    ref_name: Option<String>,
 }
 
 async fn create(
@@ -533,6 +589,43 @@ async fn create(
         return Err(AppError::BadRequest("that title is too long".into()));
     }
 
+    // Validated before anything is written, so a bad anchor cannot leave an
+    // issue that exists but cannot be rendered.
+    let anchor = match &input.anchor {
+        None => None,
+        Some(a) => {
+            let path = a.file_path.trim();
+            if path.is_empty() {
+                return Err(AppError::BadRequest("an anchor needs a file".into()));
+            }
+            if a.line_start < 1 || a.line_end < a.line_start {
+                return Err(AppError::BadRequest(
+                    "an anchor's lines must run forwards from one".into(),
+                ));
+            }
+            // The hash is the anchor, so it has to be one.
+            let blob = fkit_core::Hash::from_hex(a.blob.trim())
+                .ok_or_else(|| AppError::BadRequest("that is not a blob hash".into()))?;
+
+            // And it has to be content this repository actually holds —
+            // otherwise the issue points at bytes nobody can show.
+            let store =
+                state.store_for_network(repo.network_id).map_err(AppError::Internal)?;
+            if !store.has(blob) {
+                return Err(AppError::BadRequest(
+                    "that blob is not in this repository".into(),
+                ));
+            }
+            Some((
+                path.to_string(),
+                a.line_start,
+                a.line_end,
+                blob.0.to_vec(),
+                a.ref_name.as_deref().map(str::trim).filter(|r| !r.is_empty()).map(String::from),
+            ))
+        }
+    };
+
     let mut tx = state.db.begin().await?;
     sqlx::query("SELECT id FROM repos WHERE id = $1 FOR UPDATE")
         .bind(repo.id)
@@ -542,8 +635,10 @@ async fn create(
 
     let id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO issues (id, repo_id, number, title, body, author_id)
-         VALUES ($1, $2, $3, $4, $5, $6)",
+        "INSERT INTO issues
+             (id, repo_id, number, title, body, author_id,
+              file_path, line_start, line_end, blob, ref_name)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
     )
     .bind(id)
     .bind(repo.id)
@@ -551,6 +646,11 @@ async fn create(
     .bind(title)
     .bind(input.body.as_deref().map(str::trim).filter(|b| !b.is_empty()))
     .bind(u.id)
+    .bind(anchor.as_ref().map(|a| a.0.as_str()))
+    .bind(anchor.as_ref().map(|a| a.1))
+    .bind(anchor.as_ref().map(|a| a.2))
+    .bind(anchor.as_ref().map(|a| a.3.clone()))
+    .bind(anchor.as_ref().and_then(|a| a.4.clone()))
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;

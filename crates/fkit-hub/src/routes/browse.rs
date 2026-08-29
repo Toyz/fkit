@@ -22,6 +22,7 @@ pub fn routes() -> Router<AppState> {
         .route("/repos/{owner}/{name}/tree/{ref}", get(tree_root))
         .route("/repos/{owner}/{name}/tree/{ref}/{*path}", get(tree_path))
         .route("/repos/{owner}/{name}/blob/{ref}/{*path}", get(blob))
+        .route("/repos/{owner}/{name}/object/{hash}", get(object))
         .route("/repos/{owner}/{name}/commits/{ref}", get(commits))
         .route("/repos/{owner}/{name}/commit/{hash}", get(commit_detail))
         .route("/repos/{owner}/{name}/archive/{spec}", get(archive))
@@ -278,6 +279,50 @@ struct BlobResponse {
     /// can show the picture instead of "binary file". The raw endpoint serves
     /// this same type, so the `<img>` actually loads under `nosniff`.
     image: Option<&'static str>,
+}
+
+/// A file's content by its own hash, with no ref and no path involved.
+///
+/// The point of a content-addressed store, expressed as an endpoint: a hash
+/// names one byte sequence forever, so this answers the same thing today and
+/// in five years regardless of what any branch has done since. It is what lets
+/// an issue anchored to code still show the code it was about after the file
+/// has moved on.
+///
+/// Reachability is not checked, and does not need to be. A caller can only ask
+/// about a hash it already knows, and a hash is only learnable from content
+/// this repository served — so this discloses nothing that the ordinary blob
+/// endpoint would not. Permission on the repository is still required, and a
+/// hash from a *different* network's store is simply absent here.
+async fn object(
+    State(state): State<AppState>,
+    viewer: Viewer,
+    Path((owner, name, hash)): Path<(String, String, String)>,
+) -> AppResult<Json<BlobResponse>> {
+    let (repo, _, _) = super::load_repo(&state, &viewer, &owner, &name).await?;
+    let store = state.store_for_network(repo.network_id).map_err(AppError::Internal)?;
+
+    let id = Hash::from_hex(hash.trim())
+        .ok_or_else(|| AppError::bad("that is not a hash"))?;
+    let b = content::read_object(&store, id)?;
+
+    let text = if b.binary || b.truncated {
+        None
+    } else {
+        String::from_utf8(b.bytes.clone()).ok()
+    };
+
+    Ok(Json(BlobResponse {
+        // The hash knows nothing about names; whoever asked has the path.
+        path: String::new(),
+        hash: b.hash.to_hex(),
+        size: b.size,
+        binary: b.binary || text.is_none(),
+        truncated: b.truncated,
+        lines: text.as_deref().map(|t| t.lines().count()).unwrap_or(0),
+        content: text,
+        image: b.image,
+    }))
 }
 
 async fn blob(

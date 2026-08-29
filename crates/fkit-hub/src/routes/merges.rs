@@ -617,10 +617,10 @@ async fn do_merge(
     // it should not is one click to remove; a merge rolled back because the
     // branch would not delete is a much worse trade — the same reasoning that
     // puts issue-closing after the merge rather than inside it.
-    if drop_source {
-        if let Err(e) = drop_source_branch(&state, &viewer, &repo, &row).await {
-            tracing::warn!("merged #{} but could not delete {}: {e}", row.number, row.source_branch);
-        }
+    if drop_source
+        && let Err(e) = drop_source_branch(&state, &viewer, &repo, &row).await
+    {
+        tracing::warn!("merged #{} but could not delete {}: {e}", row.number, row.source_branch);
     }
 
     Ok(out)

@@ -203,6 +203,26 @@ const DEFS: Record<string, LangDef> = {
   },
 
   /**
+   * Ignore files. Line-oriented, and what matters is seeing the shape of a
+   * pattern at a glance: what is negated, what is anchored to the root, what
+   * is a directory, and which parts are wildcards rather than literal text.
+   */
+  ignore: {
+    files: ".fkitignore .gitignore .dockerignore .npmignore .eslintignore .prettierignore .fkthat",
+    patterns: [
+      [/#.*/, "cm"],
+      // A leading ! flips the rule, which is the easiest thing to miss.
+      [/^!/, "kw"],
+      // Anchored to the repository root, or matching a directory only.
+      [/^\//, "kw"],
+      [/\/$/, "kw"],
+      // The wildcards, so the literal part of a pattern reads as literal.
+      [/\*\*|[*?]/, "nu"],
+      [/\[[^\]]*\]/, "nu"],
+    ],
+  },
+
+  /**
    * The submodule manifest. Line-oriented, so it gets patterns rather than a
    * grammar: what matters is telling the three parts of a line apart — where
    * it is mounted, where it comes from, and which revision it is pinned at.

@@ -12,6 +12,7 @@
  *     flash the whole page.
  */
 import { LoomElement, component, css, styles, reactive, mount, on, inject, watch } from "@toyz/loom";
+import { clipboard } from "@toyz/loom/element";
 // Renamed: importing it as `fetch` would shadow the global in this module.
 import { fetch as query, type ApiState } from "@toyz/loom/query";
 import { route } from "@toyz/loom/router";
@@ -28,6 +29,7 @@ import {
   type Label,
   type GcReport,
   type BlobResponse,
+  type CodeAnchor,
   type TreeResponse,
   type Commit,
   type CommitDetail,
@@ -1266,6 +1268,115 @@ const sheet = css`
     text-transform: none; letter-spacing: 0; font-weight: 400;
   }
   .drop:hover { border-color: var(--accent); color: var(--text); }
+
+  /* ---- selecting lines to open an issue about ---------------------------
+     The gutter becomes a control, so it has to look like one: a pointer, no
+     text selection fighting the drag, and a clear mark on what is chosen. */
+  .code .ln, .vcode .ln { cursor: pointer; user-select: none; }
+  .code .ln:hover, .vcode .ln:hover { color: var(--accent); }
+  .cl.sel { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  .cl.sel .ln {
+    color: var(--accent);
+    box-shadow: inset 2px 0 0 var(--accent);
+  }
+
+  /* Floated rather than placed in the flow. Inserting a bar above the code
+     pushed every line down by its height the moment a selection began, which
+     moved the line out from under the cursor mid-drag — the selection then ran
+     away in the wrong direction. Nothing that appears during a drag may change
+     the layout. */
+  .selbar {
+    position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
+    z-index: 40;
+    display: flex; align-items: center; gap: 4px;
+    padding: 6px 6px 6px 12px;
+    border: 1px solid var(--border-hi); border-radius: 10px;
+    background: color-mix(in srgb, var(--raised) 92%, var(--bg));
+    backdrop-filter: blur(8px);
+    box-shadow: 0 10px 30px rgb(0 0 0 / .5), 0 0 0 1px rgb(0 0 0 / .25);
+    font-size: 12px; color: var(--muted);
+    white-space: nowrap; max-width: calc(100vw - 32px);
+  }
+  .selbar .lead { display: flex; color: var(--accent); margin-right: 4px; }
+  .selbar .what { display: flex; align-items: baseline; gap: 7px; }
+  .selbar .what b { color: var(--text); font-weight: 500; }
+  .selbar .what .of {
+    font-family: var(--mono); font-size: 11px; color: var(--muted);
+    overflow: hidden; text-overflow: ellipsis; max-width: 34ch;
+  }
+  /* The hash reads as a token, not as prose. */
+  .selbar .cas {
+    font-family: var(--mono); font-size: 10.5px; color: var(--faint);
+    padding: 2px 6px; margin-left: 4px;
+    border: 1px solid var(--border); border-radius: 5px;
+    background: var(--bg);
+  }
+  .selbar .sep {
+    width: 1px; align-self: stretch; margin: 2px 6px;
+    background: var(--border);
+  }
+  .selbar .act {
+    display: inline-flex; align-items: center; gap: 6px;
+    height: 26px; padding: 0 10px;
+    border: 1px solid transparent; border-radius: 7px;
+    background: transparent; color: var(--muted);
+    font: inherit; font-size: 11.5px; cursor: pointer;
+  }
+  .selbar .act:hover { background: var(--bg); color: var(--text); }
+  .selbar .act.go {
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+    border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+    color: var(--accent);
+  }
+  .selbar .act.go:hover {
+    background: color-mix(in srgb, var(--accent) 26%, transparent);
+    color: var(--accent);
+  }
+  .selbar .shut {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 26px; height: 26px; margin-left: 2px;
+    border: 0; border-radius: 7px;
+    background: transparent; color: var(--faint); cursor: pointer;
+  }
+  .selbar .shut:hover { background: var(--bg); color: var(--text); }
+  .selbar button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+  @media (prefers-reduced-motion: no-preference) {
+    .selbar { animation: selbar-in .14s ease-out; }
+  }
+  @keyframes selbar-in {
+    from { opacity: 0; transform: translate(-50%, 8px); }
+    to   { opacity: 1; transform: translate(-50%, 0); }
+  }
+  @media (max-width: 620px) {
+    .selbar .cas, .selbar .what .of { display: none; }
+  }
+
+  /* The code an issue was opened about. */
+  .anchor { margin-bottom: 14px; }
+  /* Every part of this head is a value — a path, a line range, a hash — and
+     none of it is a label, so the sheet's upper-casing is wrong here. A path
+     in particular means something different in capitals. */
+  .anchor .panel-head {
+    gap: 8px; justify-content: flex-start;
+    text-transform: none; letter-spacing: 0; font-size: 11.5px;
+  }
+  .anchor .panel-head .mono { font-family: var(--mono); text-decoration: none; color: var(--text); }
+  .anchor .panel-head .mono:hover { color: var(--accent); }
+  .anchor .grow { flex: 1; }
+  .code.snip { max-height: 320px; overflow: auto; }
+  .code.snip .ln { cursor: default; }
+  .code.snip .ln:hover { color: var(--faint); }
+
+  /* The reference carried into the new-issue dialog. */
+  .anchored {
+    display: flex; align-items: center; gap: 8px;
+    padding: 7px 10px; margin-bottom: 12px;
+    border: 1px solid var(--border); border-radius: var(--radius);
+    background: var(--raised); font-size: 11.5px; color: var(--muted);
+  }
+  .anchored .mono { font-family: var(--mono); color: var(--text); }
+  .anchored .grow { flex: 1; }
   .drop input { width: 12px; height: 12px; margin: 0; accent-color: var(--accent); }
   .drop:focus-within { outline: 2px solid var(--accent); outline-offset: 1px; }
   .howto {
@@ -1496,6 +1607,12 @@ export class PageRepo extends LoomElement {
 
   private get blob(): BlobResponse | null {
     return this.blobQuery.data ?? null;
+  }
+
+  /// A link into a file arrives before the file does; select once it is here.
+  @watch("blobQuery")
+  onBlob() {
+    if (this.blobQuery.ok) this.applyLineHash();
   }
   /**
    * `params` rather than a hand-built query string, so the key is derived from
@@ -1750,6 +1867,34 @@ export class PageRepo extends LoomElement {
   /** Whether merging should also remove the source branch. */
   @reactive accessor dropSource = true;
   /**
+   * The lines selected in the file being read, 1-based and inclusive.
+   *
+   * Click a line number to select it, shift-click another to reach to it. The
+   * selection is what an issue gets opened about.
+   */
+  @reactive accessor selFrom = 0;
+  @reactive accessor selTo = 0;
+  /** Carried into the new-issue dialog when one is opened from a selection. */
+  @reactive accessor issueAnchor: CodeAnchor | null = null;
+  /**
+   * Mid-drag across the line gutter.
+   *
+   * Deliberately not reactive: it changes on every mousedown and mouseup and
+   * nothing renders from it, so making it reactive would only cost renders.
+   */
+  private dragging = false;
+
+  /** Momentary "copied" on the selection bar's link button. */
+  @reactive accessor linkCopied = false;
+
+  /** Tokenized file, kept across renders; keyed by the blob it came from. */
+  private lit: Tok[][] = [];
+  private litHash = "";
+
+  /** The content an anchored issue points at, fetched by hash. */
+  @reactive accessor anchorBlob: BlobResponse | null = null;
+  @reactive accessor anchorMissing = false;
+  /**
    * Only an admin may read this. A 403 is a permissions answer rather than a
    * fault, so the render treats "no data" as "none to show" and nothing reads
    * the error.
@@ -1822,6 +1967,25 @@ export class PageRepo extends LoomElement {
     const v = this.loc?.view;
     if (v?.kind !== "issue" || !this.issueQuery.ok) return;
     const at = this.loc!;
+
+    // Fetch the anchored content by hash. Not a query: it is keyed by a hash
+    // rather than by the URL, and a hash cannot go stale — so it is fetched
+    // once per issue and never revalidated.
+    const a = this.issueQuery.data?.anchor;
+    if (!a) {
+      this.anchorBlob = null;
+      this.anchorMissing = false;
+    } else if (this.anchorBlob?.hash !== a.blob) {
+      this.anchorBlob = null;
+      this.anchorMissing = false;
+      void api
+        .object(at.owner, at.name, a.blob)
+        .then((b) => (this.anchorBlob = b))
+        // Content genuinely can be gone: garbage collection removes what no
+        // branch can reach, and an issue is not a root.
+        .catch(() => (this.anchorMissing = true));
+    }
+
     this.issueRefs = null;
     void api
       .issueRefs(at.owner, at.name, v.number)
@@ -2312,20 +2476,50 @@ export class PageRepo extends LoomElement {
       return <div class="panel">{head}<div class="empty">binary file not shown</div></div>;
     }
 
-    const lang = languageFor(b.path);
-    const lines = highlight(b.content ?? "", lang);
+    // Memoized on the blob's hash. The selection changes on every mouse move
+    // during a drag, and re-tokenizing forty thousand lines each time is the
+    // difference between a smooth drag and a slideshow. A hash names one byte
+    // sequence, so it is the whole cache key.
+    if (this.litHash !== b.hash) {
+      this.lit = highlight(b.content ?? "", languageFor(b.path));
+      this.litHash = b.hash;
+    }
+    const lines = this.lit;
     // The gutter is sized from the widest line number so the code column never
     // shifts as you scroll — the usual giveaway of a naively virtualized list.
     const gutter = `${String(lines.length).length}ch`;
 
-    const row = (toks: Tok[], i: number) => (
-      <div class="cl">
-        <span class="ln" style={`width:calc(${gutter} + 26px)`}>{i + 1}</span>
-        <span class="src">
-          {toks.length === 0 ? " " : toks.map((t) => <span class={t.c}>{t.t}</span>)}
-        </span>
-      </div>
-    );
+    const lo = Math.min(this.selFrom, this.selTo);
+    const hi = Math.max(this.selFrom, this.selTo);
+
+    const row = (toks: Tok[], i: number) => {
+      const n = i + 1;
+      const on = lo > 0 && n >= lo && n <= hi;
+      return (
+        <div class={`cl ${on ? "sel" : ""}`} data-line={n}>
+          <span
+            class="ln"
+            style={`width:calc(${gutter} + 26px)`}
+            title="click or drag to select whole lines"
+            onMouseDown={(e: MouseEvent) => {
+              // Dragging a number should select lines, not sweep a text
+              // selection across the file.
+              e.preventDefault();
+              this.pickLine(n, e.shiftKey);
+              this.dragging = true;
+            }}
+            onMouseEnter={() => {
+              if (this.dragging) this.selTo = n;
+            }}
+          >
+            {n}
+          </span>
+          <span class="src">
+            {toks.length === 0 ? " " : toks.map((t) => <span class={t.c}>{t.t}</span>)}
+          </span>
+        </div>
+      );
+    };
 
     // A 40 000-line file is 40 000 DOM nodes rendered eagerly. Past a few
     // hundred lines the virtual list keeps it to whatever fits on screen.
@@ -2340,20 +2534,207 @@ export class PageRepo extends LoomElement {
       // the property directly is what actually opens the file at the top.
       v.pinToBottom = false;
       adoptInto(v, codeSheet);
-      return <div class="panel">{head}{v}</div>;
+      return <div class="panel">{head}{this.renderSelBar(b)}{v}</div>;
     }
 
     return (
       <div class="panel">
         {head}
+        {this.renderSelBar(b)}
         <div class="code">{lines.map(row)}</div>
       </div>
     );
   }
 
+  // On the window, so releasing outside the gutter — or outside the page —
+  // still ends the drag rather than leaving it stuck on.
+  @on(window, "mouseup")
+  endDrag() {
+    this.dragging = false;
+  }
+
+  /**
+   * Track an ordinary text selection over the code and read the lines it
+   * covers.
+   *
+   * Selecting the text you are talking about is the gesture people already
+   * have; asking them to learn a modifier chord for the same thing is worse in
+   * every way. The gutter still works for picking whole lines exactly, but
+   * nobody has to know that to use this.
+   */
+  @on(document, "selectionchange")
+  onSelectText() {
+    if (this.dragging) return;
+    const root = this.shadowRoot;
+    if (!root) return;
+
+    // Chrome puts a selection inside a shadow tree on the root itself; other
+    // engines report it on the document. Ask both.
+    const sel =
+      (root as ShadowRoot & { getSelection?: () => Selection | null }).getSelection?.() ??
+      document.getSelection();
+    if (!sel || sel.isCollapsed || sel.rangeCount === 0) return;
+
+    const lineOf = (n: Node | null): number => {
+      let el = n instanceof Element ? n : (n?.parentElement ?? null);
+      while (el && !el.hasAttribute?.("data-line")) el = el.parentElement;
+      return el ? Number(el.getAttribute("data-line")) : 0;
+    };
+
+    const a = lineOf(sel.anchorNode);
+    const b = lineOf(sel.focusNode);
+    if (!a || !b) return;
+    this.selFrom = a;
+    this.selTo = b;
+  }
+
+  /**
+   * A link to the selected lines.
+   *
+   * `@clipboard("write")` copies whatever this returns, and falls back to the
+   * legacy path where the async API is unavailable — which is most of the
+   * reason to use it rather than calling `navigator.clipboard` and hoping.
+   */
+  @clipboard("write")
+  copySelectionLink() {
+    const at = this.loc!;
+    const b = this.blob;
+    if (!b) return "";
+    const lo = Math.min(this.selFrom, this.selTo);
+    const hi = Math.max(this.selFrom, this.selTo);
+    return (
+      `${location.origin}/${at.owner}/${at.name}/blob/${this.refName()}/${b.path}` +
+      `#L${lo}${hi === lo ? "" : `-L${hi}`}`
+    );
+  }
+
+  /**
+   * Follow a `#L12-L20` fragment to the lines it names.
+   *
+   * Without this the link copied above opens the file and does nothing, which
+   * is worse than not offering one.
+   */
+  private applyLineHash() {
+    const m = /^#L(\d+)(?:-L(\d+))?$/.exec(location.hash);
+    if (!m) return;
+    this.selFrom = Number(m[1]);
+    this.selTo = Number(m[2] ?? m[1]);
+    // After the render that the lines above cause, or there is nothing to
+    // scroll to yet.
+    requestAnimationFrame(() => {
+      const row = this.shadowRoot?.querySelector(`[data-line="${this.selFrom}"]`);
+      row?.scrollIntoView({ block: "center", behavior: "auto" });
+    });
+  }
+
+  @on(window, "hashchange")
+  onLineHash() {
+    this.applyLineHash();
+  }
+
+  /// Select a line, or reach from the current selection to it.
+  private pickLine(n: number, extend: boolean) {
+    if (extend && this.selFrom) {
+      this.selTo = n;
+      return;
+    }
+    // Clicking the only selected line clears it, so there is a way out that
+    // does not involve guessing.
+    if (this.selFrom === n && this.selTo === n) {
+      this.selFrom = 0;
+      this.selTo = 0;
+      return;
+    }
+    this.selFrom = n;
+    this.selTo = n;
+  }
+
+  /**
+   * What to do with a selection.
+   *
+   * The interesting one is opening an issue. GitHub can give you a permalink to
+   * paste; because the anchor here is the blob's own hash, the issue keeps
+   * showing the lines it was about even after the file has moved on.
+   */
+  private renderSelBar(b: BlobResponse) {
+    const lo = Math.min(this.selFrom, this.selTo);
+    const hi = Math.max(this.selFrom, this.selTo);
+    if (lo < 1) return null;
+
+    const range = lo === hi ? `line ${lo}` : `lines ${lo}\u2013${hi}`;
+    return (
+      <div class="selbar" role="status">
+        <span class="lead">
+          <loom-icon name="code" size={13}></loom-icon>
+        </span>
+
+        <span class="what">
+          <b>{range}</b>
+          <span class="of">{b.path.split("/").pop()}</span>
+        </span>
+
+        {/* The content the lines came from. Shown because it is the thing an
+            issue would actually be pinned to — not the branch, not the path. */}
+        <span class="cas" title={`content hash of this file\n${b.hash}`}>
+          {b.hash.slice(0, 10)}
+        </span>
+
+        <span class="sep"></span>
+
+        <button
+          class="act"
+          title="copy a link to these lines"
+          onClick={() => {
+            this.copySelectionLink();
+            this.linkCopied = true;
+            setTimeout(() => (this.linkCopied = false), 1400);
+          }}
+        >
+          <loom-icon name={this.linkCopied ? "check" : "link"} size={12}></loom-icon>
+          {this.linkCopied ? "copied" : "copy link"}
+        </button>
+
+        {this.session.isAuthed ? (
+          <button
+            class="act go"
+            title="open an issue about these lines"
+            onClick={() => {
+              this.issueAnchor = {
+                file_path: b.path,
+                line_start: lo,
+                line_end: hi,
+                blob: b.hash,
+                ref_name: this.refName(),
+              };
+              this.newIssue = true;
+            }}
+          >
+            <loom-icon name="alert" size={12}></loom-icon> open an issue
+          </button>
+        ) : null}
+
+        <button
+          class="shut"
+          title="clear the selection"
+          onClick={() => {
+            this.selFrom = 0;
+            this.selTo = 0;
+          }}
+        >
+          <loom-icon name="x" size={12}></loom-icon>
+        </button>
+      </div>
+    );
+  }
+
+  @clipboard("write")
+  private writeClipboard(text: string) {
+    return text;
+  }
+
   private async copyBlob(text: string) {
     try {
-      await navigator.clipboard.writeText(text);
+      this.writeClipboard(text);
       this.copied = true;
       setTimeout(() => (this.copied = false), 1400);
     } catch {
@@ -3625,66 +4006,6 @@ fkit push</pre>
             ) : null}
           </span>
 
-          <fkit-modal
-            open={this.newIssue}
-            heading="New issue"
-            width="680px"
-            onClose={() => (this.newIssue = false)}
-          >
-            <form
-              id="new-issue"
-              class="new-issue"
-              onSubmit={(e: Event) => {
-                e.preventDefault();
-                const f = e.target as HTMLFormElement;
-                const title = (f.elements.namedItem("title") as HTMLInputElement).value;
-                const md = f.querySelector("fkit-composer") as
-                  | (HTMLElement & { text: string })
-                  | null;
-                void this.act(async () => {
-                  const made = await api.createIssue(at.owner, at.name, {
-                    title,
-                    body: md?.text ?? "",
-                  });
-                  this.newIssue = false;
-                  go(`/${at.owner}/${at.name}/issues/${made.number}`);
-                });
-              }}
-            >
-              <fkit-field label="Title" size="full">
-                <input name="title" placeholder="What is wrong, or what should exist" required />
-              </fkit-field>
-              <fkit-field
-                label="Description"
-                help="Optional. What you did, what happened, and what you expected instead. Markdown works."
-                size="full"
-              >
-                {/* The composer rather than a bare textarea, so writing an
-                    issue and commenting on one are the same box. Its own send
-                    button is hidden here: the modal's footer owns the action. */}
-                <fkit-composer headless placeholder="Describe it"></fkit-composer>
-              </fkit-field>
-            </form>
-
-            <span slot="footer">
-              <button type="button" class="bare" onClick={() => (this.newIssue = false)}>
-                Cancel
-              </button>
-              <button
-                type="button"
-                class="primary"
-                disabled={this.busy}
-                onClick={() => {
-                  const f = this.shadowRoot?.querySelector("#new-issue") as HTMLFormElement | null;
-                  // requestSubmit rather than submit(), so `required` on the
-                  // title is actually enforced.
-                  f?.requestSubmit();
-                }}
-              >
-                Open issue
-              </button>
-            </span>
-          </fkit-modal>
 
           {(this.labelsQuery.data ?? []).length ? (
             <div class="lfilter">
@@ -3775,6 +4096,171 @@ fkit push</pre>
   /// metadata — labels, what references it — is a sidebar, because it is
   /// looked at rather than read, and threading it through the top of the
   /// thread pushed the actual content down the screen.
+  /**
+   * The code an issue was opened about.
+   *
+   * Fetched by the blob's own hash rather than by path and ref, which is the
+   * whole reason this holds up: the hash names those exact bytes, so the
+   * snippet is still the code the issue is about after the file has been
+   * renamed, rewritten, or deleted outright. A path-and-line reference would
+   * be quietly pointing at something else by then.
+   */
+  private renderAnchor(a: CodeAnchor) {
+    const at = this.loc!;
+    const body = this.anchorBlob;
+    const range =
+      a.line_start === a.line_end
+        ? `line ${a.line_start}`
+        : `lines ${a.line_start}\u2013${a.line_end}`;
+
+    // Reading it is what the ref was for; the anchor itself needs no ref.
+    const href =
+      `/${at.owner}/${at.name}/blob/${a.ref_name ?? "main"}/${a.file_path}` +
+      `#L${a.line_start}${a.line_end === a.line_start ? "" : `-L${a.line_end}`}`;
+
+    let rows: Tok[][] = [];
+    if (body?.hash === a.blob && body.content !== null) {
+      const all = highlight(body.content ?? "", languageFor(a.file_path));
+      rows = all.slice(a.line_start - 1, a.line_end);
+    }
+
+    return (
+      <div class="panel anchor">
+        <div class="panel-head">
+          <loom-icon name="code" size={12}></loom-icon>
+          <a class="mono" href={href} onClick={linkHandler(href)}>{a.file_path}</a>
+          <span class="faint">{range}</span>
+          <span class="grow"></span>
+          {a.ref_name ? <span class="faint val">on {a.ref_name}</span> : null}
+          {/* The anchor proper. Worth showing, because it is the reason the
+              lines below are still the right ones. */}
+          <span class="faint val mono" title={`content this issue is pinned to\n${a.blob}`}>
+            {a.blob.slice(0, 12)}
+          </span>
+        </div>
+        {rows.length > 0 ? (
+          <div class="code snip">
+            {rows.map((toks, n) => (
+              <div class="cl">
+                <span class="ln">{a.line_start + n}</span>
+                <span class="src">
+                  {toks.length === 0 ? " " : toks.map((t) => <span class={t.c}>{t.t}</span>)}
+                </span>
+              </div>
+            ))}
+          </div>
+        ) : this.anchorMissing ? (
+          <div class="empty">
+            this repository no longer has that content — the issue still says
+            where it was
+          </div>
+        ) : (
+          <div class="code snip">
+            <span class="sk" style="width:min(70%,320px)"></span>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  /**
+   * The new-issue dialog.
+   *
+   * Rendered from `update` rather than from the issues page, so opening an
+   * issue about some code does not first march you away from the code. It is
+   * the same dialog either way; only where it can appear changed.
+   */
+  private renderNewIssue() {
+    const at = this.loc!;
+    if (!this.newIssue) return null;
+    return (
+      <fkit-modal
+        open={this.newIssue}
+        heading="New issue"
+        width="680px"
+        onClose={() => (this.newIssue = false)}
+      >
+        <form
+          id="new-issue"
+          class="new-issue"
+          onSubmit={(e: Event) => {
+            e.preventDefault();
+            const f = e.target as HTMLFormElement;
+            const title = (f.elements.namedItem("title") as HTMLInputElement).value;
+            const md = f.querySelector("fkit-composer") as
+              | (HTMLElement & { text: string })
+              | null;
+            void this.act(async () => {
+              const made = await api.createIssue(at.owner, at.name, {
+                title,
+                body: md?.text ?? "",
+                anchor: this.issueAnchor ?? undefined,
+              });
+              this.newIssue = false;
+              this.issueAnchor = null;
+              go(`/${at.owner}/${at.name}/issues/${made.number}`);
+            });
+          }}
+        >
+          {/* Opened from a selection: say what it is about, so nobody has
+              to trust that the anchor came along. */}
+          {this.issueAnchor ? (
+            <div class="anchored">
+              <loom-icon name="code" size={12}></loom-icon>
+              <span class="mono">{this.issueAnchor.file_path}</span>
+              <span class="faint">
+                {this.issueAnchor.line_start === this.issueAnchor.line_end
+                  ? `line ${this.issueAnchor.line_start}`
+                  : `lines ${this.issueAnchor.line_start}\u2013${this.issueAnchor.line_end}`}
+              </span>
+              <span class="grow"></span>
+              <button
+                type="button"
+                class="bare"
+                title="open this issue without the code reference"
+                onClick={() => (this.issueAnchor = null)}
+              >
+                <loom-icon name="x" size={11}></loom-icon>
+              </button>
+            </div>
+          ) : null}
+          <fkit-field label="Title" size="full">
+            <input name="title" placeholder="What is wrong, or what should exist" required />
+          </fkit-field>
+          <fkit-field
+            label="Description"
+            help="Optional. What you did, what happened, and what you expected instead. Markdown works."
+            size="full"
+          >
+            {/* The composer rather than a bare textarea, so writing an
+                issue and commenting on one are the same box. Its own send
+                button is hidden here: the modal's footer owns the action. */}
+            <fkit-composer headless placeholder="Describe it"></fkit-composer>
+          </fkit-field>
+        </form>
+
+        <span slot="footer">
+          <button type="button" class="bare" onClick={() => (this.newIssue = false)}>
+            Cancel
+          </button>
+          <button
+            type="button"
+            class="primary"
+            disabled={this.busy}
+            onClick={() => {
+              const f = this.shadowRoot?.querySelector("#new-issue") as HTMLFormElement | null;
+              // requestSubmit rather than submit(), so `required` on the
+              // title is actually enforced.
+              f?.requestSubmit();
+            }}
+          >
+            Open issue
+          </button>
+        </span>
+      </fkit-modal>
+    );
+  }
+
   private renderIssue(number: number) {
     const at = this.loc!;
     const i = this.issueQuery.data ?? null;
@@ -3814,6 +4300,8 @@ fkit push</pre>
 
         <div class="icols">
           <div class="thread-col">
+            {/* What it is about, before what was said about it. */}
+            {i.anchor ? this.renderAnchor(i.anchor) : null}
             {/* The line down the left is what makes a column of boxes read as
                 one conversation rather than a stack of unrelated notes. */}
             {i.body ? (
@@ -5580,6 +6068,10 @@ fkit push</pre>
         ) : null}
 
         {this.renderDrift(r, at)}
+
+        {/* Above the view rather than inside one: an issue can now be opened
+            from anywhere, and the dialog should appear where you already are. */}
+        {this.renderNewIssue()}
 
         {this.error ? <fkit-notice message={this.error}></fkit-notice> : null}
 
