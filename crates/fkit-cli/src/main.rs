@@ -1378,6 +1378,7 @@ fn sub_list(repo: &Repo) -> Result<()> {
         return Ok(());
     }
     let committed = head_pins(repo)?;
+    let declared = fkit_core::submodule::hints(repo);
 
     for (path, m) in &mounts {
         // Three things can be true of a submodule, and they are worth keeping
@@ -1395,6 +1396,20 @@ fn sub_list(repo: &Repo) -> Result<()> {
         println!("{}  {}  {}", m.pin.short(), path, state);
         if !m.remote.is_empty() {
             println!("    from {}", m.remote);
+        }
+        // The manifest is a declaration that travels with the tree; the tree
+        // is what actually pins. Say so rather than letting a stale line be
+        // read as fact.
+        if let Some(sug) = declared.get(path)
+            && let Some(want) = sug.pin
+            && Some(&want) != committed.get(path)
+            && want != m.pin
+        {
+            println!(
+                "    note: {} declares {} — the commit is what pins, so that line is stale",
+                fkit_core::submodule::HINTS_FILE,
+                want.short()
+            );
         }
     }
     Ok(())
@@ -1442,17 +1457,23 @@ fn sub_add(repo: &Repo, args: &[String]) -> Result<()> {
         pin: tip,
     })?;
 
-    // Prefer a relative suggestion when the submodule lives beside its parent:
-    // that is the form a fork of this repository can carry unchanged.
-    let hint = repo
-        .config_get("remote")
-        .and_then(|parent| fkit_core::submodule::relative_to(&parent, url))
-        .unwrap_or_else(|| url.to_string());
-    fkit_core::submodule::set_hint(repo, path, Some(&hint))?;
+    // The URL exactly as given, and the revision it is pinned at. Written in
+    // full rather than relative: a reader should be able to see where this
+    // comes from without first working out what it is relative to. A relative
+    // url still works if one is written by hand.
+    let hint = url.to_string();
+    fkit_core::submodule::set_hint(
+        repo,
+        path,
+        Some(fkit_core::submodule::Suggestion { url: hint.clone(), pin: Some(tip) }),
+    )?;
 
     let n = fkit_core::checkout::materialize(repo, tree_of(repo, tip)?, &dest)?;
     println!("  {} object(s), {n} file(s) at {}", stats.objects, tip.short());
-    println!("commit to record the pin");
+    // Say what went into the tracked file and what it means, so the `../`
+    // is not something to work out later from a file with no context.
+    println!("  {} now declares {hint}@{tip}", fkit_core::submodule::HINTS_FILE);
+    println!("commit to record it");
     Ok(())
 }
 

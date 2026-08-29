@@ -531,6 +531,19 @@ const sheet = css`
     border-bottom: 1px solid var(--border);
   }
   .files .fn { white-space: nowrap; }
+  /* A submodule row carries its pin beside the name. The name is what you
+     click; the hash is what you are actually looking at, so it is present but
+     quiet. */
+  .files .fn.sub {
+    display: inline-flex; align-items: baseline; gap: 7px; min-width: 0;
+  }
+  .files .fn.sub .at {
+    font-family: var(--mono); font-size: 10.5px; color: var(--faint);
+  }
+  /* No target means this hub cannot offer somewhere to go. Say so by not
+     looking like a link, rather than by offering one that fails. */
+  .files .fn.sub .nolink { color: var(--text); }
+  .files .msg.dim { color: var(--faint); font-style: normal; opacity: .8; }
   .files .sz {
     color: var(--faint); font-size: 11px; text-align: right;
     font-variant-numeric: tabular-nums; white-space: nowrap;
@@ -2151,36 +2164,68 @@ export class PageRepo extends LoomElement {
     }
 
     for (const e of this.entries ?? []) {
+      const sub = e.kind === "submodule";
       const kind = e.kind === "dir" ? "tree" : "blob";
-      const href = `/${at.owner}/${at.name}/${kind}/${r}/${e.path}`;
+      // A pin names a commit in another repository, so it leads there rather
+      // than to a path in this one. Without a target it leads nowhere, which
+      // is the honest rendering: the content is pinned but this hub either
+      // does not hold that repository or will not say that it does.
+      const href = sub
+        ? e.target
+          ? `/${e.target}/commit/${e.hash}`
+          : ""
+        : `/${at.owner}/${at.name}/${kind}/${r}/${e.path}`;
       const lc = this.lastCommits?.[e.name];
       const chref = lc ? `/${at.owner}/${at.name}/commit/${lc.hash}` : "";
       rows.push(
         <div class="r">
           <span
-            class={`ic ${e.kind === "dir" ? "d" : ""} ${e.kind === "exec" ? "x" : ""}`}
-            title={e.kind === "exec" ? "executable" : e.kind}
+            class={`ic ${e.kind === "dir" || sub ? "d" : ""} ${e.kind === "exec" ? "x" : ""}`}
+            title={
+              e.kind === "exec"
+                ? "executable"
+                : sub
+                  ? `submodule pinned at ${e.hash.slice(0, 10)}`
+                  : e.kind
+            }
           >
             <loom-icon
               name={
-                e.kind === "dir"
-                  ? dirIcon(e.name)
-                  : e.kind === "symlink"
-                    ? "link"
-                    : e.kind === "exec"
-                      ? "terminal"
-                      : fileIcon(e.name)
+                sub
+                  ? "submodule"
+                  : e.kind === "dir"
+                    ? dirIcon(e.name)
+                    : e.kind === "symlink"
+                      ? "link"
+                      : e.kind === "exec"
+                        ? "terminal"
+                        : fileIcon(e.name)
               }
               size={14}
             ></loom-icon>
           </span>
-          <a class="fn" href={href} onClick={linkHandler(href)}>
-            {e.name}
-          </a>
+          {sub ? (
+            <span class="fn sub">
+              {href ? (
+                <a href={href} onClick={linkHandler(href)}>{e.name}</a>
+              ) : (
+                <span class="nolink">{e.name}</span>
+              )}
+              <span class="at" title={e.hash}>@ {e.hash.slice(0, 10)}</span>
+            </span>
+          ) : (
+            <a class="fn" href={href} onClick={linkHandler(href)}>
+              {e.name}
+            </a>
+          )}
           {lc ? (
             <a class="msg" href={chref} onClick={linkHandler(chref)} title={lc.summary}>
               {lc.summary || "(no message)"}
             </a>
+          ) : sub ? (
+            <span class="msg dim">
+              {e.target ?? e.remote ?? "submodule"}
+            </span>
           ) : (
             <span class="msg"><span class="sk" style="width:min(80%,180px)"></span></span>
           )}
@@ -2190,7 +2235,7 @@ export class PageRepo extends LoomElement {
           {/* A directory entry already carries the total bytes beneath it —
               the tree records it at ingest, so this is a `du` that costs
               nothing. Dimmed, because it is a sum rather than a file. */}
-          <span class={`sz ${e.kind === "dir" ? "sum" : ""}`}>{humanSize(e.size)}</span>
+          <span class={`sz ${e.kind === "dir" || sub ? "sum" : ""}`}>{humanSize(e.size)}</span>
         </div>,
       );
     }

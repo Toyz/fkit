@@ -16,6 +16,10 @@ const PATHS = {
   file: `<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v5h5"/>`,
   link: `<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>`,
   commit: `<circle cx="12" cy="12" r="3"/><path d="M3 12h6M15 12h6"/>`,
+  /* A submodule: a folder that is really somewhere else. The arrow is the
+     whole message — this looks like a directory but following it leaves the
+     repository you are in. */
+  submodule: `<path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/><path d="M10 15h5m0 0-2-2m2 2-2 2"/>`,
   branch: `<path d="M6 3v12"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/>`,
   /* An executable file. The exec bit is the more salient fact about a file
      you can run than the language it happens to be written in. */

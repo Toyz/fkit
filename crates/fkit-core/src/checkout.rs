@@ -167,7 +167,7 @@ fn reconcile_mounts(repo: &Repo, tree: Hash) -> Result<()> {
             Some(m) if !m.remote.is_empty() => m.remote.clone(),
             _ => hints
                 .get(path)
-                .map(|h| submodule::resolve_remote(&parent_remote, h))
+                .map(|sug| submodule::resolve_remote(&parent_remote, &sug.url))
                 .unwrap_or_default(),
         };
         // Compare the whole record, not just the pin: a suggestion that only

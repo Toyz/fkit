@@ -59,6 +59,50 @@ pub struct Mount {
     pub pin: Hash,
 }
 
+/// One submodule as the project declares it: where to fetch it, and at which
+/// revision.
+///
+/// Written `wss://host/owner/repo@<hash>`. The hash makes a submodule bump a
+/// legible one-line diff rather than an opaque pointer change, which is the
+/// one thing git's `.gitmodules` cannot show you — there the URL sits in a
+/// tracked file and the revision in a gitlink, so a review sees the move
+/// without seeing what moved.
+///
+/// The tree remains authoritative. This hash is a declaration that travels
+/// with the working tree and is rewritten whenever the pin moves, so the two
+/// change in the same commit; where they somehow disagree, the tree wins and
+/// `fkit submodule` says so.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Suggestion {
+    pub url: String,
+    pub pin: Option<Hash>,
+}
+
+impl Suggestion {
+    /// Split `url@hash`, tolerating a URL that itself contains `@`.
+    ///
+    /// The last `@` wins, and only if what follows is a full hash — otherwise
+    /// the whole value is a URL. A userinfo `@` in a URL is therefore safe,
+    /// and so is a value with no pin at all.
+    pub fn parse(value: &str) -> Suggestion {
+        if let Some((url, tail)) = value.rsplit_once('@')
+            && let Some(pin) = Hash::from_hex(tail)
+        {
+            return Suggestion { url: url.to_string(), pin: Some(pin) };
+        }
+        Suggestion { url: value.to_string(), pin: None }
+    }
+}
+
+impl std::fmt::Display for Suggestion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.pin {
+            Some(p) => write!(f, "{}@{}", self.url, p),
+            None => write!(f, "{}", self.url),
+        }
+    }
+}
+
 /// Where the project suggests each submodule's objects can be fetched from.
 ///
 /// Tracked content, so it travels with a clone and can be reviewed in a diff.
@@ -80,9 +124,6 @@ pub const HINTS_FILE: &str = ".fkit-submodules";
 /// directory. It is worth the inconsistency: the useful question is "which
 /// repository next to mine", and this is the spelling people already know.
 pub fn resolve_remote(parent_remote: &str, hint: &str) -> String {
-    if !(hint.starts_with("../") || hint.starts_with("./")) {
-        return hint.to_string();
-    }
     let Some((scheme, rest)) = parent_remote.split_once("://") else {
         return hint.to_string();
     };
@@ -90,16 +131,31 @@ pub fn resolve_remote(parent_remote: &str, hint: &str) -> String {
         Some((a, p)) => (a, p),
         None => (rest, ""),
     };
+    match resolve_relative(path, hint) {
+        Some(p) => format!("{scheme}://{authority}/{p}"),
+        None => hint.to_string(),
+    }
+}
 
-    let mut segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+/// Apply a `../`-style hint to a slash-separated path.
+///
+/// Separate from [`resolve_remote`] because a URL is not the only thing a
+/// suggestion gets resolved against. A hub serving both repositories resolves
+/// `../dep` against `owner/app` to find `owner/dep`, and can then link a pin
+/// straight to the repository it names — no URL involved.
+///
+/// `None` for an absolute hint (there is nothing to resolve) and for one that
+/// climbs past the start of the path, which is a broken suggestion rather than
+/// something to quietly reinterpret.
+pub fn resolve_relative(base: &str, hint: &str) -> Option<String> {
+    if !(hint.starts_with("../") || hint.starts_with("./")) {
+        return None;
+    }
+    let mut segs: Vec<&str> = base.split('/').filter(|s| !s.is_empty()).collect();
     let mut rel = hint;
     loop {
         if let Some(r) = rel.strip_prefix("../") {
-            // Running out of path is a broken suggestion, not something to
-            // paper over by silently landing at the host root.
-            if segs.pop().is_none() {
-                return hint.to_string();
-            }
+            segs.pop()?;
             rel = r;
         } else if let Some(r) = rel.strip_prefix("./") {
             rel = r;
@@ -110,7 +166,25 @@ pub fn resolve_remote(parent_remote: &str, hint: &str) -> String {
     for part in rel.split('/').filter(|s| !s.is_empty()) {
         segs.push(part);
     }
-    format!("{scheme}://{authority}/{}", segs.join("/"))
+    Some(segs.join("/"))
+}
+
+/// Parse the suggestions file's contents, wherever they were read from.
+///
+/// Split out because the hub reads it out of a tree rather than off a disk:
+/// it has no working directory, only objects.
+pub fn parse_hints(text: &str) -> BTreeMap<String, Suggestion> {
+    let mut out = BTreeMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((path, value)) = line.split_once('=') {
+            out.insert(path.trim().to_string(), Suggestion::parse(value.trim()));
+        }
+    }
+    out
 }
 
 /// Express `url` relative to `parent_remote`, when they sit on the same host.
@@ -148,29 +222,21 @@ pub fn relative_to(parent_remote: &str, url: &str) -> Option<String> {
 }
 
 /// The suggested remotes, by submodule path.
-pub fn hints(repo: &Repo) -> BTreeMap<String, String> {
-    let mut out = BTreeMap::new();
-    let Ok(text) = fs::read_to_string(repo.root.join(HINTS_FILE)) else { return out };
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((path, url)) = line.split_once('=') {
-            out.insert(path.trim().to_string(), url.trim().to_string());
-        }
+pub fn hints(repo: &Repo) -> BTreeMap<String, Suggestion> {
+    match fs::read_to_string(repo.root.join(HINTS_FILE)) {
+        Ok(text) => parse_hints(&text),
+        Err(_) => BTreeMap::new(),
     }
-    out
 }
 
 /// Record, or drop, one suggestion. Rewrites the file in sorted order so that
 /// two people adding different submodules do not produce a conflict over line
 /// ordering.
-pub fn set_hint(repo: &Repo, path: &str, url: Option<&str>) -> Result<()> {
+pub fn set_hint(repo: &Repo, path: &str, what: Option<Suggestion>) -> Result<()> {
     let mut all = hints(repo);
-    match url {
-        Some(u) => {
-            all.insert(path.to_string(), u.to_string());
+    match what {
+        Some(sug) => {
+            all.insert(path.to_string(), sug);
         }
         None => {
             all.remove(path);
@@ -182,11 +248,30 @@ pub fn set_hint(repo: &Repo, path: &str, url: Option<&str>) -> Result<()> {
         return Ok(());
     }
     let mut body = String::from(
-        "# Where this project's submodules can be fetched from.\n\
-         # A suggestion only: `fkit submodule set-remote` overrides it locally.\n",
+        "\
+# Submodules used by this project.\n\
+#\n\
+# One line each:\n\
+#\n\
+#     <path in this repository> = <url>@<revision>\n\
+#\n\
+# for example\n\
+#\n\
+#     vendor/loom = wss://example.com/alice/loom@<64 hex characters>\n\
+#\n\
+# The revision after the @ is the exact commit of that repository which this\n\
+# one is pinned to, so a submodule bump reads as an ordinary one-line change.\n\
+# The commit itself is what actually carries the pin — this line is rewritten\n\
+# to match whenever it moves, and `fkit submodule` reports it if the two ever\n\
+# disagree.\n\
+#\n\
+# The url may instead be relative to this repository's own remote, written\n\
+# `../loom`, which keeps a fork on another host fetching from that host rather\n\
+# than from the original. `fkit submodule set-remote <path> <url>` points one\n\
+# somewhere else for this machine only, and does not touch this file.\n",
     );
-    for (p, u) in &all {
-        body.push_str(&format!("{p} = {u}\n"));
+    for (p, sug) in &all {
+        body.push_str(&format!("{p} = {sug}\n"));
     }
     fs::write(&file, body).with_context(|| format!("writing {HINTS_FILE}"))?;
     Ok(())
@@ -278,7 +363,14 @@ pub fn set_pin(repo: &Repo, path: &str, new_pin: Hash) -> Result<()> {
         path: path.to_string(),
         remote: existing.map(|m| m.remote).unwrap_or_default(),
         pin: new_pin,
-    })
+    })?;
+
+    // Keep the declared revision in step, so that moving a pin and recording
+    // that move are the same act rather than two that can be done separately.
+    if let Some(sug) = hints(repo).get(path) {
+        set_hint(repo, path, Some(Suggestion { url: sug.url.clone(), pin: Some(new_pin) }))?;
+    }
+    Ok(())
 }
 
 pub fn remove(repo: &Repo, path: &str) -> Result<()> {
@@ -374,22 +466,58 @@ mod tests {
     }
 
     #[test]
+    fn a_declaration_carries_its_url_and_its_revision() {
+        let pin = Hash::from_hex(&"3c".repeat(32)).unwrap();
+        let text = format!("wss://example.com/alice/loom@{pin}");
+        let sug = Suggestion::parse(&text);
+        assert_eq!(sug.url, "wss://example.com/alice/loom");
+        assert_eq!(sug.pin, Some(pin));
+        assert_eq!(sug.to_string(), text, "it must write back exactly as read");
+    }
+
+    #[test]
+    fn a_url_containing_an_at_is_not_mistaken_for_a_revision() {
+        // Userinfo in a URL, and a trailing @ with something that is not a
+        // hash. Neither may eat part of the URL.
+        for u in [
+            "wss://user@example.com/alice/loom",
+            "wss://example.com/alice/loom@main",
+            "../loom",
+        ] {
+            let sug = Suggestion::parse(u);
+            assert_eq!(sug.url, u, "{u} should be the whole url");
+            assert_eq!(sug.pin, None);
+        }
+    }
+
+    #[test]
+    fn a_declaration_with_userinfo_still_takes_a_revision() {
+        let pin = Hash::from_hex(&"9d".repeat(32)).unwrap();
+        let sug = Suggestion::parse(&format!("wss://user@example.com/alice/loom@{pin}"));
+        assert_eq!(sug.url, "wss://user@example.com/alice/loom");
+        assert_eq!(sug.pin, Some(pin));
+    }
+
+    #[test]
+    fn a_hint_resolves_against_a_plain_path_too() {
+        // What the hub does: no scheme, no host, just one repository's name
+        // resolved against another's.
+        assert_eq!(resolve_relative("helba/app", "../dep").as_deref(), Some("helba/dep"));
+        assert_eq!(resolve_relative("helba/app", "../../o/dep").as_deref(), Some("o/dep"));
+        // One step up from a single-segment base is still inside the path.
+        assert_eq!(resolve_relative("app", "../dep").as_deref(), Some("dep"));
+        assert_eq!(resolve_relative("app", "../../dep"), None, "climbs past the start");
+        assert_eq!(resolve_relative("helba/app", "wss://h/o/dep"), None, "already absolute");
+    }
+
+    #[test]
     fn a_hint_line_is_read_back() {
         // The format has to survive a human editing it, so leading space,
         // comments and blank lines are all fine.
         let text = "# comment\n\n vendor/loom = wss://h/o/loom \nb=c\n";
-        let mut out = BTreeMap::new();
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if let Some((p, u)) = line.split_once('=') {
-                out.insert(p.trim().to_string(), u.trim().to_string());
-            }
-        }
-        assert_eq!(out.get("vendor/loom").map(String::as_str), Some("wss://h/o/loom"));
-        assert_eq!(out.get("b").map(String::as_str), Some("c"));
+        let out = parse_hints(text);
+        assert_eq!(out.get("vendor/loom").map(|s| s.url.as_str()), Some("wss://h/o/loom"));
+        assert_eq!(out.get("b").map(|s| s.url.as_str()), Some("c"));
     }
 
     #[test]

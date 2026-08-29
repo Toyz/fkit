@@ -51,6 +51,14 @@ pub struct EntryView {
     pub kind: &'static str,
     pub hash: String,
     pub size: u64,
+    /// Submodules only: where the project suggests this one is fetched from,
+    /// exactly as written. May be relative.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
+    /// Submodules only: `owner/name` of the repository this pin names, when it
+    /// lives on this hub and the viewer is allowed to know that.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
 }
 
 /// List one directory level — not the whole tree. The browser only ever renders
@@ -59,6 +67,22 @@ pub struct EntryView {
 pub fn list_dir(store: &Store, tree: Hash, path: &str) -> AppResult<Vec<EntryView>> {
     let target = resolve_dir(store, tree, path)?;
     let entries = read_entries(store, target).map_err(AppError::Internal)?;
+
+    // Only worth reading when this directory actually holds a pin, and keyed by
+    // full path because the suggestions file is written from the root.
+    let hints: std::collections::BTreeMap<String, String> =
+        if entries.iter().any(|e| e.kind == EntryKind::Submodule) {
+            submodule_hints(store, tree)
+                .into_iter()
+                .filter_map(|(p, sug)| {
+                    let name = p.strip_prefix(path).unwrap_or(&p).trim_start_matches('/');
+                    (!name.is_empty() && !name.contains('/'))
+                        .then(|| (name.to_string(), sug.url))
+                })
+                .collect()
+        } else {
+            Default::default()
+        };
 
     let mut out: Vec<EntryView> = entries
         .into_iter()
@@ -73,6 +97,10 @@ pub fn list_dir(store: &Store, tree: Hash, path: &str) -> AppResult<Vec<EntryVie
             },
             hash: e.hash.to_hex(),
             size: e.size,
+            remote: (e.kind == EntryKind::Submodule)
+                .then(|| hints.get(&e.name).cloned())
+                .flatten(),
+            target: None,
             name: e.name,
         })
         .collect();
@@ -706,6 +734,33 @@ pub fn raw_blob(store: &Store, tree: Hash, path: &str) -> AppResult<(Vec<u8>, u6
     let mut bytes = Vec::new();
     read_file(store, entry.hash, &mut bytes).map_err(AppError::Internal)?;
     Ok((bytes, entry.size))
+}
+
+/// The submodule suggestions recorded in a tree.
+///
+/// Read out of the objects rather than off a disk: a hub has no working copy.
+/// A missing or unreadable file is simply no suggestions — the pin is what
+/// matters, and it is in the tree regardless.
+pub fn submodule_hints(
+    store: &Store,
+    tree: Hash,
+) -> std::collections::BTreeMap<String, fkit_core::submodule::Suggestion> {
+    let Some(entry) = entry_at(store, tree, fkit_core::submodule::HINTS_FILE) else {
+        return Default::default();
+    };
+    // A suggestions file is a few short lines. Anything remotely large is not
+    // one, and is not worth reading to find out.
+    if entry.size > 64 * 1024 {
+        return Default::default();
+    }
+    let mut bytes = Vec::new();
+    if read_file(store, entry.hash, &mut bytes).is_err() {
+        return Default::default();
+    }
+    match std::str::from_utf8(&bytes) {
+        Ok(text) => fkit_core::submodule::parse_hints(text),
+        Err(_) => Default::default(),
+    }
 }
 
 /// Find a README at the top of a tree, for the repo landing page.

@@ -186,11 +186,47 @@ async fn tree_root(
     Path((owner, name, r)): Path<(String, String, String)>,
 ) -> AppResult<Json<TreeResponse>> {
     let (store, commit, tree) = open(&state, &viewer, &owner, &name, &r).await?;
+    let mut entries = content::list_dir(&store, tree, "")?;
+    link_submodules(&state, &viewer, &owner, &name, &mut entries).await;
     Ok(Json(TreeResponse {
-        entries: content::list_dir(&store, tree, "")?,
+        entries,
         path: String::new(),
         commit: commit.to_hex(),
     }))
+}
+
+/// Point a submodule entry at the repository it pins, when that repository is
+/// on this hub and the viewer is allowed to know it exists.
+///
+/// The check is `load_repo`, which already refuses to distinguish a repository
+/// that is absent from one that is merely invisible. A pin into a private
+/// repository therefore renders as an ordinary pin, and the missing link
+/// discloses nothing the viewer could not already have guessed.
+///
+/// Only relative suggestions are resolved. An absolute URL is shown as written
+/// rather than matched against this hub: without knowing our own public host —
+/// which is configured for mail, not for this — a same-named repository
+/// elsewhere would link to the wrong place, and a wrong link is worse than
+/// none.
+async fn link_submodules(
+    state: &AppState,
+    viewer: &Viewer,
+    owner: &str,
+    name: &str,
+    entries: &mut [content::EntryView],
+) {
+    let here = format!("{owner}/{name}");
+    for e in entries.iter_mut().filter(|e| e.kind == "submodule") {
+        let Some(hint) = e.remote.as_deref() else { continue };
+        let Some(path) = fkit_core::submodule::resolve_relative(&here, hint) else { continue };
+        let Some((o, n)) = path.split_once('/') else { continue };
+        if !path.contains('/') || o.is_empty() || n.is_empty() || n.contains('/') {
+            continue;
+        }
+        if super::load_repo(state, viewer, o, n).await.is_ok() {
+            e.target = Some(path);
+        }
+    }
 }
 
 async fn tree_path(
@@ -200,8 +236,10 @@ async fn tree_path(
 ) -> AppResult<Json<TreeResponse>> {
     let (store, commit, tree, path) =
         open_in_path(&state, &viewer, &owner, &name, &r, &path).await?;
+    let mut entries = content::list_dir(&store, tree, &path)?;
+    link_submodules(&state, &viewer, &owner, &name, &mut entries).await;
     Ok(Json(TreeResponse {
-        entries: content::list_dir(&store, tree, &path)?,
+        entries,
         path,
         commit: commit.to_hex(),
     }))

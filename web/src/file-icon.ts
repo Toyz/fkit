@@ -41,6 +41,9 @@ const BY_NAME: Record<string, string> = {
   cargo: "gear",
   justfile: "gear",
   readme: "book",
+  // The submodule manifest gets the same mark as the submodules it declares,
+  // so the file and the rows it explains are recognisably the same subject.
+  "fkit-submodules": "submodule",
   license: "scale",
   licence: "scale",
   copying: "scale",

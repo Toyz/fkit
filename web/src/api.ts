@@ -146,7 +146,11 @@ export interface Ref {
 export interface Entry {
   name: string;
   path: string;
-  kind: "dir" | "file" | "exec" | "symlink";
+  kind: "dir" | "file" | "exec" | "symlink" | "submodule";
+  /** Submodules: the suggested remote, as written. May be relative. */
+  remote?: string;
+  /** Submodules: `owner/name` on this hub, when it is there and visible. */
+  target?: string;
   hash: string;
   size: number;
 }
