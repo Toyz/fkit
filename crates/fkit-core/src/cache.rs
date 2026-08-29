@@ -63,10 +63,12 @@ struct Entry {
     /// Bumped on every hit; the least recently used is evicted first.
     used: u64,
     stored: Instant,
+    /// Set per entry for a blob; the object cache passes its global figure.
+    ttl: Duration,
 }
 
-struct Inner {
-    map: HashMap<Hash, Entry>,
+struct Inner<K> {
+    map: HashMap<K, Entry>,
     bytes: usize,
     capacity: usize,
     ttl: Duration,
@@ -100,6 +102,177 @@ pub trait ObjectCache: Send + Sync {
     fn stats(&self) -> CacheStats;
 }
 
+/// Somewhere to keep bytes that are expensive to produce and named by
+/// something other than their content.
+///
+/// [`ObjectCache`] is keyed by hash, which makes it safe in a way this is not:
+/// there, the key *is* the checksum, so a wrong answer is impossible. Here the
+/// key is a name someone chose — a page path, a commit whose ancestors were
+/// counted — so an implementation may only hold values that cannot go stale
+/// within their lifetime, or must set a lifetime short enough that staleness
+/// does not matter.
+///
+/// Synchronous for the same reason as [`ObjectCache`]: the callers are, and
+/// making this async would spread `.await` through them to serve a backend
+/// that may not be configured.
+pub trait BlobCache: Send + Sync {
+    fn get(&self, key: &str) -> Option<Arc<Vec<u8>>>;
+    /// Keep `bytes` under `key` for at most `ttl`.
+    ///
+    /// The lifetime is the caller's to state, because only the caller knows
+    /// how long its answer stays true. A rendered card carries a description
+    /// and a tip hash and is wrong within minutes of either changing; a count
+    /// of a commit's ancestors is a fact about an immutable hash and can be
+    /// kept for as long as there is room.
+    fn put(&self, key: &str, bytes: Arc<Vec<u8>>, ttl: Duration);
+    /// Drop one entry, because whatever it described has changed.
+    fn forget(&self, key: &str);
+    fn stats(&self) -> CacheStats;
+}
+
+/// A bounded, age-limited blob cache in this process.
+pub struct MemoryBlobs {
+    inner: Mutex<Inner<String>>,
+}
+
+impl MemoryBlobs {
+    pub fn new(capacity: usize, ttl: Duration) -> Self {
+        MemoryBlobs {
+            inner: Mutex::new(Inner {
+                map: HashMap::new(),
+                bytes: 0,
+                capacity,
+                ttl,
+                clock: 0,
+                hits: 0,
+                misses: 0,
+            }),
+        }
+    }
+}
+
+impl BlobCache for MemoryBlobs {
+    fn get(&self, key: &str) -> Option<Arc<Vec<u8>>> {
+        let mut in_ = self.inner.lock().unwrap();
+        let expired = match in_.map.get(key) {
+            Some(e) => e.stored.elapsed() > e.ttl,
+            None => {
+                in_.misses += 1;
+                return None;
+            }
+        };
+        if expired {
+            if let Some(e) = in_.map.remove(key) {
+                in_.bytes -= e.bytes.len();
+            }
+            in_.misses += 1;
+            return None;
+        }
+        in_.clock += 1;
+        let used = in_.clock;
+        in_.hits += 1;
+        let e = in_.map.get_mut(key).expect("checked just above");
+        e.used = used;
+        Some(Arc::clone(&e.bytes))
+    }
+
+    fn put(&self, key: &str, bytes: Arc<Vec<u8>>, ttl: Duration) {
+        let mut in_ = self.inner.lock().unwrap();
+        if bytes.len() > in_.capacity / MAX_ENTRY_DIVISOR {
+            return;
+        }
+        if let Some(old) = in_.map.remove(key) {
+            in_.bytes -= old.bytes.len();
+        }
+        in_.clock += 1;
+        let used = in_.clock;
+        in_.bytes += bytes.len();
+        in_.map.insert(key.to_string(), Entry { bytes, used, stored: Instant::now(), ttl });
+
+        while in_.bytes > in_.capacity {
+            let Some((victim, _)) = in_.map.iter().min_by_key(|(_, e)| e.used) else {
+                break;
+            };
+            let victim = victim.clone();
+            if let Some(e) = in_.map.remove(&victim) {
+                in_.bytes -= e.bytes.len();
+            }
+        }
+    }
+
+    fn forget(&self, key: &str) {
+        let mut in_ = self.inner.lock().unwrap();
+        if let Some(e) = in_.map.remove(key) {
+            in_.bytes -= e.bytes.len();
+        }
+    }
+
+    fn stats(&self) -> CacheStats {
+        let in_ = self.inner.lock().unwrap();
+        CacheStats {
+            entries: in_.map.len(),
+            bytes: in_.bytes,
+            capacity: in_.capacity,
+            hits: in_.hits,
+            misses: in_.misses,
+        }
+    }
+}
+
+/// A blob cache that keeps nothing.
+pub struct NoBlobs;
+
+impl BlobCache for NoBlobs {
+    fn get(&self, _key: &str) -> Option<Arc<Vec<u8>>> {
+        None
+    }
+    fn put(&self, _key: &str, _bytes: Arc<Vec<u8>>, _ttl: Duration) {}
+    fn forget(&self, _key: &str) {}
+    fn stats(&self) -> CacheStats {
+        CacheStats { entries: 0, bytes: 0, capacity: 0, hits: 0, misses: 0 }
+    }
+}
+
+/// Near and far, for blobs. Same bargain as [`Tiered`].
+pub struct TieredBlobs {
+    near: Arc<dyn BlobCache>,
+    far: Arc<dyn BlobCache>,
+}
+
+impl TieredBlobs {
+    pub fn new(near: Arc<dyn BlobCache>, far: Arc<dyn BlobCache>) -> Self {
+        TieredBlobs { near, far }
+    }
+}
+
+impl BlobCache for TieredBlobs {
+    fn get(&self, key: &str) -> Option<Arc<Vec<u8>>> {
+        if let Some(hit) = self.near.get(key) {
+            return Some(hit);
+        }
+        let hit = self.far.get(key)?;
+        // Promoted with the near cache's own lifetime: the far one is already
+        // counting down and this copy should not outlive it by much.
+        self.near.put(key, Arc::clone(&hit), Duration::from_secs(60));
+        Some(hit)
+    }
+
+    fn put(&self, key: &str, bytes: Arc<Vec<u8>>, ttl: Duration) {
+        self.near.put(key, Arc::clone(&bytes), ttl);
+        self.far.put(key, bytes, ttl);
+    }
+
+    fn forget(&self, key: &str) {
+        self.near.forget(key);
+        self.far.forget(key);
+    }
+
+    /// The near cache's, which is the one with a capacity worth reporting.
+    fn stats(&self) -> CacheStats {
+        self.near.stats()
+    }
+}
+
 /// A cache that keeps nothing, for a store that would rather not.
 pub struct NoCache;
 
@@ -117,7 +290,7 @@ impl ObjectCache for NoCache {
 
 /// A bounded, age-limited cache of framed object bytes, in this process.
 pub struct MemoryCache {
-    inner: Mutex<Inner>,
+    inner: Mutex<Inner<Hash>>,
 }
 
 impl Default for MemoryCache {
@@ -201,7 +374,8 @@ impl ObjectCache for MemoryCache {
         let used = in_.clock;
         let size = bytes.len();
         in_.bytes += size;
-        in_.map.insert(h, Entry { bytes, used, stored: Instant::now() });
+        let ttl = in_.ttl;
+        in_.map.insert(h, Entry { bytes, used, stored: Instant::now(), ttl });
 
         // Evict least-recently-used until it fits. Scanning for the minimum is
         // O(n) per eviction, which is fine at this size and avoids carrying an
@@ -510,6 +684,47 @@ mod shared {
                 }
             }
             out.ok()
+        }
+    }
+
+    impl super::BlobCache for RedisCache {
+        fn get(&self, key: &str) -> Option<Arc<Vec<u8>>> {
+            let key = format!("{}{key}", self.prefix);
+            let got: Option<Vec<u8>> = self.with(|c| redis::cmd("GET").arg(&key).query(c))?;
+            match got {
+                Some(bytes) if !bytes.is_empty() => {
+                    self.hits.fetch_add(1, Ordering::Relaxed);
+                    Some(Arc::new(bytes))
+                }
+                _ => {
+                    self.misses.fetch_add(1, Ordering::Relaxed);
+                    None
+                }
+            }
+        }
+
+        fn put(&self, key: &str, bytes: Arc<Vec<u8>>, ttl: std::time::Duration) {
+            if bytes.len() > self.max_entry {
+                return;
+            }
+            let key = format!("{}{key}", self.prefix);
+            self.with(|c| {
+                redis::cmd("SET")
+                    .arg(&key)
+                    .arg(bytes.as_slice())
+                    .arg("EX")
+                    .arg(ttl.as_secs().max(1))
+                    .exec(c)
+            });
+        }
+
+        fn forget(&self, key: &str) {
+            let key = format!("{}{key}", self.prefix);
+            self.with(|c| redis::cmd("DEL").arg(&key).exec(c));
+        }
+
+        fn stats(&self) -> CacheStats {
+            <Self as super::ObjectCache>::stats(self)
         }
     }
 

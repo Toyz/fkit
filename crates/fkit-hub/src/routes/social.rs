@@ -12,7 +12,6 @@ use axum::{
     Json, Router,
 };
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
 
 use crate::embed;
 use crate::state::AppState;
@@ -44,21 +43,6 @@ pub fn base_url(state: &AppState, headers: &HeaderMap) -> String {
 
 // ---- the card image ------------------------------------------------------
 
-/// Rendered cards, keyed by the page path they describe.
-///
-/// Rendering is around 20ms, and a single post in a busy chat can fan out to
-/// one fetch per client. The bound is a plain count: a card is ~40KB and the
-/// number of distinct pages that get linked in any window is small.
-const CACHE_MAX: usize = 256;
-
-/// Page path -> when it was rendered, and the PNG.
-type Cards = Mutex<HashMap<String, (std::time::Instant, Vec<u8>)>>;
-
-fn cache() -> &'static Cards {
-    static C: OnceLock<Cards> = OnceLock::new();
-    C.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 /// How long a rendered card is reused. Short, because a card carries the tip
 /// hash and the description, and a stale one is a wrong one.
 const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
@@ -71,8 +55,12 @@ async fn card(State(state): State<AppState>, headers: HeaderMap, Path(path): Pat
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    if let Some(hit) = cached(page) {
-        return png(hit);
+    // Shared where a shared cache is configured, so a second hub does not
+    // re-render what the first already drew, and a busy channel's fan-out of
+    // fetches costs one render between all of them rather than one each.
+    let key = format!("og:{page}");
+    if let Some(hit) = state.blob_cache.get(&key) {
+        return png(hit.as_ref().clone());
     }
 
     // "site" is the one card with no page behind it.
@@ -96,27 +84,8 @@ async fn card(State(state): State<AppState>, headers: HeaderMap, Path(path): Pat
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
 
-    store(page, &bytes);
+    state.blob_cache.put(&key, std::sync::Arc::new(bytes.clone()), CACHE_TTL);
     png(bytes)
-}
-
-fn cached(page: &str) -> Option<Vec<u8>> {
-    let map = cache().lock().ok()?;
-    let (at, bytes) = map.get(page)?;
-    (at.elapsed() < CACHE_TTL).then(|| bytes.clone())
-}
-
-fn store(page: &str, bytes: &[u8]) {
-    let Ok(mut map) = cache().lock() else { return };
-    if map.len() >= CACHE_MAX {
-        // Drop everything expired; if that frees nothing, drop the lot. A card
-        // is cheap to rebuild and this runs at most once per 256 new pages.
-        map.retain(|_, (at, _)| at.elapsed() < CACHE_TTL);
-        if map.len() >= CACHE_MAX {
-            map.clear();
-        }
-    }
-    map.insert(page.to_string(), (std::time::Instant::now(), bytes.to_vec()));
 }
 
 fn png(bytes: Vec<u8>) -> Response {

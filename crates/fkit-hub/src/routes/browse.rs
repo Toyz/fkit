@@ -194,6 +194,18 @@ struct TreeResponse {
     entries: Vec<content::EntryView>,
 }
 
+/// Summarise the commit a tree came from, with its account link attached.
+async fn tree_head(
+    state: &AppState,
+    store: &fkit_core::Store,
+    commit: fkit_core::Hash,
+) -> Option<crate::models::HeadView> {
+    let mut head = crate::routes::repos::head_view(store, commit)?;
+    let found = content::authors_of(&state.db, std::iter::once(head.commit.as_str())).await;
+    head.pushed_by = found.get(&head.commit).cloned();
+    Some(head)
+}
+
 /// Count the commits reachable from `tip`, memoised on the commit hash.
 ///
 /// The walk itself is the one the stats endpoint does: commit objects only, so
@@ -202,22 +214,24 @@ struct TreeResponse {
 /// opens — so without the memo, walking into a subdirectory of a large
 /// repository would re-count the whole thing.
 ///
-/// The cache needs no invalidation and never goes stale. A commit hash names
-/// one exact set of ancestors for all time, so the answer for a given hash is
-/// a fact rather than a snapshot. That is the whole bargain of addressing
-/// things by their content.
-fn count_history(store: &fkit_core::Store, tip: fkit_core::Hash) -> usize {
-    /// Bounded so a server browsing endlessly many commits cannot grow it
-    /// without limit; a count is 8 bytes, so this is a few kilobytes.
-    const MAX: usize = 4096;
-    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<fkit_core::Hash, usize>>> =
-        std::sync::OnceLock::new();
-    let cache = SEEN.get_or_init(Default::default);
+/// The memo needs no invalidation and cannot go stale, which is why it is safe
+/// to share between hubs and to keep for a long time: a commit hash names one
+/// exact set of ancestors for all time, so the answer is a fact rather than a
+/// snapshot. That is the whole bargain of addressing things by their content.
+async fn count_history(
+    state: &AppState,
+    store: &fkit_core::Store,
+    tip: fkit_core::Hash,
+) -> usize {
+    // Long, because the answer can never become wrong. It expires only so an
+    // abandoned repository's counts do not sit in a shared cache forever.
+    const KEEP: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
-    if let Ok(map) = cache.lock()
-        && let Some(n) = map.get(&tip)
+    let key = format!("nc:{}", tip.to_hex());
+    if let Some(hit) = state.blob_cache.get(&key)
+        && let Ok(bytes) = <[u8; 8]>::try_from(hit.as_slice())
     {
-        return *n;
+        return u64::from_le_bytes(bytes) as usize;
     }
 
     let mut seen = std::collections::HashSet::new();
@@ -233,25 +247,12 @@ fn count_history(store: &fkit_core::Store, tip: fkit_core::Hash) -> usize {
         }
     }
 
-    if let Ok(mut map) = cache.lock() {
-        if map.len() >= MAX {
-            map.clear();
-        }
-        map.insert(tip, n);
-    }
+    state.blob_cache.put(
+        &key,
+        std::sync::Arc::new((n as u64).to_le_bytes().to_vec()),
+        KEEP,
+    );
     n
-}
-
-/// Summarise the commit a tree came from, with its account link attached.
-async fn tree_head(
-    state: &AppState,
-    store: &fkit_core::Store,
-    commit: fkit_core::Hash,
-) -> Option<crate::models::HeadView> {
-    let mut head = crate::routes::repos::head_view(store, commit)?;
-    let found = content::authors_of(&state.db, std::iter::once(head.commit.as_str())).await;
-    head.pushed_by = found.get(&head.commit).cloned();
-    Some(head)
 }
 
 async fn tree_root(
@@ -268,7 +269,7 @@ async fn tree_root(
         entries,
         path: String::new(),
         commit: commit.to_hex(),
-        commits: count_history(&store, commit),
+        commits: count_history(&state, &store, commit).await,
         head,
     }))
 }
@@ -339,7 +340,7 @@ async fn tree_path(
         entries,
         path,
         commit: commit.to_hex(),
-        commits: count_history(&store, commit),
+        commits: count_history(&state, &store, commit).await,
         head,
     }))
 }

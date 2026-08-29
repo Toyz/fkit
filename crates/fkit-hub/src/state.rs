@@ -33,6 +33,9 @@ pub struct AppState {
     /// move out of this process without any read path changing — see
     /// [`fkit_core::cache`].
     pub object_cache: Arc<dyn fkit_core::cache::ObjectCache>,
+    /// Bytes that are expensive to produce but not named by their content —
+    /// rendered social cards, counted histories.
+    pub blob_cache: Arc<dyn fkit_core::cache::BlobCache>,
     /// Where that cache holds things, for the admin panel to report. Carried
     /// rather than inferred: by the time anyone has the `Arc`, the config that
     /// chose between one tier and two is gone.

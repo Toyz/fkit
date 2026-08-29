@@ -97,6 +97,7 @@ async fn main() -> Result<()> {
     .context("loading instance settings")?;
 
     let (object_cache, cache_backend) = build_object_cache(&cfg);
+    let blob_cache = build_blob_cache(&cfg);
 
     let state = AppState {
         db,
@@ -108,6 +109,7 @@ async fn main() -> Result<()> {
         limiter: std::sync::Arc::new(ratelimit::MemoryLimiter::default()),
         trust_proxy: cfg.trust_proxy,
         object_cache,
+        blob_cache,
         cache_backend,
     };
 
@@ -382,6 +384,51 @@ async fn shutdown() {
 /// fatal. The server is completely functional without it — it is an
 /// optimisation, and refusing to start over one would trade the whole service
 /// for a faster one.
+/// The blob cache, on the same two tiers as the object cache.
+///
+/// Separate from the object cache so the two cannot evict each other: a
+/// hundred social cards must not push the objects a clone is reading out of
+/// memory, and both are bounded by the same configured figure. Keys carry
+/// their own prefix, so the two never collide in a shared Redis either.
+fn build_blob_cache(
+    cfg: &config::Config,
+) -> std::sync::Arc<dyn fkit_core::cache::BlobCache> {
+    use fkit_core::cache::{BlobCache, MemoryBlobs};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    // A quarter of the object cache's budget. These are conveniences — a
+    // rendered card, a commit count — where a miss costs milliseconds, not a
+    // disk read on the critical path of a clone.
+    let capacity = (cfg.cache_memory_bytes / 4).max(1 << 20);
+    let ttl = Duration::from_secs(cfg.cache_ttl_secs);
+    let near: Arc<dyn BlobCache> = Arc::new(MemoryBlobs::new(capacity, ttl));
+
+    let Some(url) = cfg.cache_redis_url.as_deref() else {
+        return near;
+    };
+
+    #[cfg(feature = "redis-cache")]
+    {
+        match fkit_core::cache::RedisCache::connect(url, "fkit:blob:", ttl) {
+            Ok(far) => {
+                tracing::info!("blob cache: memory + shared at {url}");
+                Arc::new(fkit_core::cache::TieredBlobs::new(near, Arc::new(far)))
+            }
+            Err(e) => {
+                tracing::warn!("shared blob cache unavailable ({e}); memory only");
+                near
+            }
+        }
+    }
+
+    #[cfg(not(feature = "redis-cache"))]
+    {
+        let _ = url;
+        near
+    }
+}
+
 /// The cache, and a description of where it actually holds things.
 ///
 /// The description is carried rather than inferred: what a caller can see is
