@@ -1,7 +1,16 @@
 # fkit
 
-A version control system built on a real Merkle DAG and content-addressed
-storage, written to be read.
+A content-addressed store with git-shaped commands on top, for the repositories
+git handles badly: the ones with large files in them.
+
+Change one byte of a 12 MB file and it writes **4 objects, 18.5 KiB** — because
+a file is a Merkle tree over content-defined chunks, not one opaque blob. Point
+it at a 154 GiB tree of build output and disk images and it stores **1.2 GB**,
+128× smaller, almost entirely from noticing the same bytes twice.
+
+It is honest about the other direction too: for ordinary source history, git's
+delta compression still wins, and by how much is [measured
+below](#not-done-yet).
 
 ```
 fkit init                 fkit commit -m "..."      fkit push
