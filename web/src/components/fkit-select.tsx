@@ -7,8 +7,20 @@
  * this dense that is the one control that gives the game away.
  *
  * Emits a `pick` CustomEvent carrying the chosen value.
+ *
+ * The list opens into the browser's top layer rather than into the component's
+ * own shadow root. A shadow root does not escape an ancestor's `overflow`, so
+ * a picker in a table row was clipped by the row: opening it showed the first
+ * option and a straight cut where the rest should be. The top layer paints
+ * above everything regardless of where the element sits in the tree, and
+ * brings light dismiss, Escape and focus handling with it.
+ *
+ * The cost is that a top-layer element is positioned against the viewport, not
+ * against its trigger, so the position is measured and written on open.
  */
-import { LoomElement, component, css, styles, reactive, prop, mount } from "@toyz/loom";
+import {
+  LoomElement, component, css, styles, reactive, prop, mount, query, popover,
+} from "@toyz/loom";
 
 export interface SelectOption {
   value: string;
@@ -35,12 +47,19 @@ const sheet = css`
   .trigger .chev { color: var(--muted); transition: transform .12s; }
   .trigger.open .chev { transform: rotate(180deg); }
 
+  /* Everything here that looks redundant is overriding the user-agent's own
+     [popover] rules, which set inset:0, margin:auto and a border of their own
+     to centre the thing in the viewport. */
   .pop {
-    position: absolute; top: calc(100% + 4px); left: 0; z-index: 40;
-    min-width: 100%; width: max-content; max-width: 320px;
-    background: var(--surface); border: 1px solid var(--border-hi);
+    position: fixed; inset: auto; margin: 0;
+    width: max-content; max-width: 320px;
+    background: var(--surface); color: var(--text);
+    border: 1px solid var(--border-hi);
     border-radius: var(--radius); overflow: hidden; padding: 3px 0;
   }
+  .pop:not(:popover-open) { display: none; }
+  /* Where the popover API is missing, loom toggles the hidden property. */
+  .pop[hidden] { display: none; }
   .opt {
     display: grid; grid-template-columns: 14px minmax(0, 1fr);
     align-items: start; gap: 8px; padding: 6px 10px; cursor: pointer; font-size: 12px;
@@ -50,13 +69,6 @@ const sheet = css`
      that overflow instead of making it wrap, so the hints came out cut off
      mid-sentence. */
   .pop.hinted { width: 320px; }
-
-  /* Anchored to the trigger's left edge by default. Against the right edge of
-     the window that puts the popup off-screen — which is where a control in
-     the last column of a table always sits — so it anchors right instead. */
-  .pop.flip-x { left: auto; right: 0; }
-  /* Same for a trigger near the bottom of the window. */
-  .pop.flip-y { top: auto; bottom: calc(100% + 4px); }
 
   .pop.flip-x { left: auto; right: 0; }
   /* Same for a trigger near the bottom of the window. */
@@ -77,26 +89,24 @@ export class FkitSelect extends LoomElement {
   @prop accessor options: SelectOption[] = [];
   @prop accessor value = "";
 
-  @reactive accessor open = false;
+  /** Drives the [popover] element, and is written back by light dismiss. */
+  @popover accessor open = false;
   @reactive accessor active = 0;
 
-  /** Which way the popup had to open to stay on screen. */
-  @reactive accessor flipX = false;
-  @reactive accessor flipY = false;
+  @query(".pop") accessor pop!: HTMLElement;
+  @query(".trigger") accessor trigger!: HTMLElement;
 
-  /** Widest the popup is allowed to get, matching the sheet's default. */
-  static readonly MAX_W = 320;
+  /** Gap between the trigger and the list, and from the window edge. */
+  static readonly GAP = 4;
+  static readonly MARGIN = 8;
 
   @mount
   init() {
-    const away = (e: Event) => {
-      if (this.open && !e.composedPath().includes(this)) this.open = false;
-    };
+    // Escape and clicking away are the popover's own behaviour now, and it
+    // writes the result back to `open`. Only the arrow keys are ours.
     const key = (e: KeyboardEvent) => {
       if (!this.open) return;
-      if (e.key === "Escape") {
-        this.open = false;
-      } else if (e.key === "ArrowDown") {
+      if (e.key === "ArrowDown") {
         e.preventDefault();
         this.active = Math.min(this.active + 1, this.options.length - 1);
       } else if (e.key === "ArrowUp") {
@@ -108,30 +118,68 @@ export class FkitSelect extends LoomElement {
         if (hit) this.choose(hit.value);
       }
     };
-    document.addEventListener("pointerdown", away, true);
+    // A top-layer element does not move with the page, so anything that
+    // changes where the trigger is has to reposition it.
+    const follow = () => this.open && this.place();
+
     document.addEventListener("keydown", key);
+    window.addEventListener("resize", follow);
+    window.addEventListener("scroll", follow, true);
     return () => {
-      document.removeEventListener("pointerdown", away, true);
       document.removeEventListener("keydown", key);
+      window.removeEventListener("resize", follow);
+      window.removeEventListener("scroll", follow, true);
     };
   }
 
+  firstUpdated() {
+    // `beforetoggle` fires synchronously before the popover is painted, so
+    // placing it here means it never appears in the wrong spot first.
+    this.pop?.addEventListener("beforetoggle", (e: Event) => {
+      if ((e as unknown as { newState?: string }).newState === "open") this.place();
+    });
+  }
+
   /**
-   * Decide which way to open, before opening.
+   * Put the list under its trigger, in viewport coordinates.
    *
-   * Measured against the trigger rather than the popup because the popup does
-   * not exist yet: its widest possible size is known, and opening in the wrong
-   * place for one frame and correcting is worse than being conservative.
+   * Flips to whichever side keeps it on screen. A picker in the last column of
+   * a table sits against the right edge, and one in the last row sits against
+   * the bottom, so both are ordinary rather than exceptional.
    */
-  private measure() {
-    const r = this.getBoundingClientRect();
-    const margin = 8;
-    this.flipX = r.left + FkitSelect.MAX_W > window.innerWidth - margin;
-    // Roughly what the tallest sensible list needs; a longer one scrolls the
-    // page rather than being pinned to a corner.
-    const need = Math.min(this.options.length * 52 + 12, 280);
-    this.flipY =
-      r.bottom + need > window.innerHeight - margin && r.top - need > margin;
+  private place() {
+    const t = this.trigger?.getBoundingClientRect();
+    const el = this.pop;
+    if (!t || !el) return;
+
+    const { GAP, MARGIN } = FkitSelect;
+
+    // Placed from `beforetoggle`, which runs while the popover is still
+    // display:none and therefore has no box at all — measuring it there gave a
+    // width of zero and every clamp below silently did nothing. Show it
+    // invisibly for the measurement instead; inline display beats the
+    // :not(:popover-open) rule, and nothing is painted between here and the
+    // real show.
+    const shown = { display: el.style.display, visibility: el.style.visibility };
+    el.style.left = "0px";
+    el.style.top = "0px";
+    el.style.minWidth = `${t.width}px`;
+    el.style.display = "block";
+    el.style.visibility = "hidden";
+    const box = el.getBoundingClientRect();
+    el.style.display = shown.display;
+    el.style.visibility = shown.visibility;
+
+    const left = Math.min(
+      Math.max(MARGIN, t.left),
+      Math.max(MARGIN, window.innerWidth - box.width - MARGIN),
+    );
+    const below = t.bottom + GAP;
+    const above = t.top - box.height - GAP;
+    const top = below + box.height > window.innerHeight - MARGIN && above > MARGIN ? above : below;
+
+    el.style.left = `${Math.round(left)}px`;
+    el.style.top = `${Math.round(top)}px`;
   }
 
   private choose(value: string) {
@@ -148,9 +196,7 @@ export class FkitSelect extends LoomElement {
         <button
           class={`trigger ${this.open ? "open" : ""}`}
           onClick={() => {
-            const opening = !this.open;
-            if (opening) this.measure();
-            this.open = opening;
+            this.open = !this.open;
             this.active = Math.max(0, this.options.findIndex((o) => o.value === this.value));
           }}
         >
@@ -158,29 +204,28 @@ export class FkitSelect extends LoomElement {
           <loom-icon class="chev" name="chevron" size={11}></loom-icon>
         </button>
 
-        {this.open ? (
-          <div
-            class={`pop ${this.options.some((o) => o.hint) ? "hinted" : ""} ${
-              this.flipX ? "flip-x" : ""
-            } ${this.flipY ? "flip-y" : ""}`}
-          >
-            {this.options.map((o, i) => (
-              <div
-                class={`opt ${o.value === this.value ? "on" : ""} ${i === this.active ? "active" : ""}`}
-                onClick={() => this.choose(o.value)}
-                onMouseEnter={() => (this.active = i)}
-              >
-                <span class="tick">
-                  {o.value === this.value ? <loom-icon name="check" size={12}></loom-icon> : null}
-                </span>
-                <span>
-                  <span class="lab">{o.label}</span>
-                  {o.hint ? <span class="hint">{o.hint}</span> : null}
-                </span>
-              </div>
-            ))}
-          </div>
-        ) : null}
+        {/* Always in the DOM, and always carrying `popover`: the decorator
+            drives this element, so it cannot be conditionally rendered. */}
+        <div
+          popover="auto"
+          class={`pop ${this.options.some((o) => o.hint) ? "hinted" : ""}`}
+        >
+          {this.options.map((o, i) => (
+            <div
+              class={`opt ${o.value === this.value ? "on" : ""} ${i === this.active ? "active" : ""}`}
+              onClick={() => this.choose(o.value)}
+              onMouseEnter={() => (this.active = i)}
+            >
+              <span class="tick">
+                {o.value === this.value ? <loom-icon name="check" size={12}></loom-icon> : null}
+              </span>
+              <span>
+                <span class="lab">{o.label}</span>
+                {o.hint ? <span class="hint">{o.hint}</span> : null}
+              </span>
+            </div>
+          ))}
+        </div>
       </div>
     );
   }

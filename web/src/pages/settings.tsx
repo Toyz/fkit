@@ -86,12 +86,38 @@ const sheet = css`
   }
   .mint-link .why { color: var(--faint); }
 
-  /* Per-token, in the row it belongs to. */
-  .linktog {
-    display: flex; align-items: center; gap: 6px;
-    text-transform: none; letter-spacing: 0; font-weight: 400;
-    font-size: 11.5px; color: var(--muted); cursor: pointer; user-select: none;
+  /* The right end of a token row: what it can do, whether it links, and the
+     one destructive action. Fixed columns, because ragged ones down a list of
+     ten tokens read as ten different layouts. */
+  .tmeta {
+    display: grid; grid-template-columns: 88px 74px 56px;
+    align-items: center; gap: 10px; flex: none;
   }
+
+  .chip {
+    font: inherit; font-family: var(--mono); font-size: 11px;
+    display: inline-flex; align-items: center; justify-content: center;
+    padding: 3px 0; width: 100%;
+    border: 1px solid var(--border); border-radius: var(--radius);
+    background: none; color: var(--faint); white-space: nowrap;
+  }
+  .chip.on { border-color: var(--accent-weak); color: var(--accent); }
+  /* Only the second chip is a control, so only it reacts to the pointer. */
+  .chip.act { cursor: pointer; }
+  .chip.act:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  .chip.act:disabled { opacity: .5; cursor: default; }
+
+  .revoke {
+    font: inherit; font-family: var(--mono); font-size: 11px;
+    padding: 3px 0; width: 100%; cursor: pointer;
+    border: 1px solid transparent; border-radius: var(--radius);
+    background: none; color: var(--muted);
+  }
+  .revoke:hover:not(:disabled) {
+    border-color: color-mix(in srgb, var(--removed) 55%, transparent);
+    color: var(--removed);
+  }
+  .revoke:disabled { opacity: .5; cursor: default; }
 
   /* The token that was just made. Accented because it is the one thing on
      this page that cannot be recovered by reloading. */
@@ -552,49 +578,54 @@ export class PageSettings extends SettingsBase {
             ) : (
               list.map((t) => (
                 <fkit-row loom-key={t.id} icon="key" name={t.name} meta={tokenMeta(t)}>
-                  <span class={`tag ${t.can_write ? "on" : ""}`}>
-                    {t.can_write ? "read + write" : "read"}
-                  </span>
-                  {/* Editable in place. A token's scope is otherwise fixed at
-                      creation, so changing your mind about whether a machine's
-                      pushes land on your profile meant revoking it and
-                      reconfiguring everything that used it. */}
-                  {t.can_write ? (
-                    <label class="linktog" title={LINK_HINT}>
-                      <fkit-toggle
-                        checked={t.attributes}
-                        label={`link commits pushed with ${t.name} to my account`}
-                        onToggle={(e: Event) =>
+                  {/* One shape for both facts about a token, on fixed columns
+                      so they line up down the list rather than shuffling with
+                      the width of each word. The second is a button because
+                      it is the one that can be changed. */}
+                  <span class="tmeta">
+                    <span class={`chip ${t.can_write ? "on" : ""}`}>
+                      {t.can_write ? "read + write" : "read"}
+                    </span>
+
+                    {t.can_write ? (
+                      <button
+                        class={`chip act ${t.attributes ? "on" : ""}`}
+                        disabled={this.busy}
+                        aria-pressed={String(t.attributes)}
+                        title={LINK_HINT}
+                        onClick={() =>
                           void this.act(async () => {
-                            await api.updateToken(t.id, {
-                              attributes: (e as CustomEvent<boolean>).detail,
-                            });
+                            await api.updateToken(t.id, { attributes: !t.attributes });
                             this.tokens = await api.tokens();
                           })
                         }
-                      ></fkit-toggle>
-                      {t.attributes ? "linked" : "unlinked"}
-                    </label>
-                  ) : null}
-                  <button
-                    class="danger bare"
-                    disabled={this.busy}
-                    onClick={async () => {
-                      const ok = await confirmAction({
-                        title: `Revoke "${t.name}"?`,
-                        body: "Anything using this token stops working immediately. This cannot be undone — you would need to create a new one.",
-                        confirm: "Revoke token",
-                        danger: true,
-                      });
-                      if (!ok) return;
-                      void this.act(async () => {
-                        await api.revokeToken(t.id);
-                        this.tokens = await api.tokens();
-                      });
-                    }}
-                  >
-                    Revoke
-                  </button>
+                      >
+                        {t.attributes ? "linked" : "unlinked"}
+                      </button>
+                    ) : (
+                      <span></span>
+                    )}
+
+                    <button
+                      class="revoke"
+                      disabled={this.busy}
+                      onClick={async () => {
+                        const ok = await confirmAction({
+                          title: `Revoke "${t.name}"?`,
+                          body: "Anything using this token stops working immediately. This cannot be undone — you would need to create a new one.",
+                          confirm: "Revoke token",
+                          danger: true,
+                        });
+                        if (!ok) return;
+                        void this.act(async () => {
+                          await api.revokeToken(t.id);
+                          this.tokens = await api.tokens();
+                        });
+                      }}
+                    >
+                      revoke
+                    </button>
+                  </span>
                 </fkit-row>
               ))
             )}
