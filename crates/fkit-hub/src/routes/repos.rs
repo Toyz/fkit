@@ -287,9 +287,12 @@ async fn create_repo(
     }
 
     let id = Uuid::new_v4();
+    // A new repository is the root of its own fork network, so it owns the
+    // object store that any fork of it will later share. The column is NOT
+    // NULL and self-referencing; leaving it out fails the insert outright.
     let res = sqlx::query(
-        "INSERT INTO repos (id, owner_id, name, description, visibility)
-         VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO repos (id, owner_id, name, description, visibility, network_id)
+         VALUES ($1, $2, $3, $4, $5, $1)",
     )
     .bind(id)
     .bind(u.id)
