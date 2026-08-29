@@ -203,6 +203,27 @@ const DEFS: Record<string, LangDef> = {
   },
 
   /**
+   * `go.mod` and `go.sum`. Line-oriented, and what a reader is scanning for is
+   * the version on each line rather than the words around it.
+   */
+  gomod: {
+    files: "go.mod go.sum go.work go.work.sum",
+    patterns: [
+      [/\/\/.*/, "cm"],
+      // The keywords that open a line, and the block forms.
+      [/^(module|go|toolchain|require|replace|exclude|retract|use|godebug)\b/, "kw"],
+      [/\b(=>|indirect)\b/, "kw"],
+      // A version, including the pseudo-versions the proxy hands out, and the
+      // `/go.mod` suffix that marks a go.sum line as the manifest's own hash.
+      [/\bv\d+\.\d+\.\d+(?:-[\w.-]+)?(?:\+incompatible)?(?:\/go\.mod)?/, "nu"],
+      // A base64 checksum in go.sum: long, and never worth reading closely.
+      [/\bh1:[A-Za-z0-9+\/=]+/, "st"],
+      // Everything else on a require line is a module path.
+      [/[\w.~-]+(?:\.[\w.~-]+)*\/[\w.~\/-]+/, "ty"],
+    ],
+  },
+
+  /**
    * Ignore files. Line-oriented, and what matters is seeing the shape of a
    * pattern at a glance: what is negated, what is anchored to the root, what
    * is a directory, and which parts are wildcards rather than literal text.

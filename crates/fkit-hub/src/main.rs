@@ -121,6 +121,9 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .nest("/api", api)
+        // Top level, not under /api: the base URL is handed to the Go
+        // toolchain in a meta tag, and it fetches exactly what it is given.
+        .merge(routes::gomod::routes())
         .route("/_health", get(health))
         // Built assets MUST be mounted before the repo route. `/assets/app.js`
         // has exactly two segments, so it also matches `/{owner}/{repo}` — and a
@@ -142,6 +145,9 @@ async fn main() -> Result<()> {
         // decides which.
         .route("/{owner}/{repo}", get(repo_entrypoint))
         .fallback_service(spa(&cfg.web_dir))
+        // Before routing, because `?go-get=1` can arrive on any path under a
+        // repository and every one of them must answer the same thing.
+        .layer(axum::middleware::from_fn(go_get))
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -237,6 +243,51 @@ async fn repo_entrypoint(
     match WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
         Ok(ws) => sync::handler(ws, State(state), Path(path)).await,
         Err(rejection) => rejection.into_response(),
+    }
+}
+
+/// Intercept Go's module discovery request.
+///
+/// `go get` fetches the import path with `?go-get=1` and reads a meta tag out
+/// of whatever HTML comes back. The SPA shell would be served here otherwise,
+/// and Go would find no tag and fall back to guessing a VCS.
+async fn go_get(req: Request, next: axum::middleware::Next) -> Response {
+    let wants = req.uri().query().is_some_and(|q| {
+        q.split('&').any(|kv| kv == "go-get=1")
+    });
+    if !wants {
+        return next.run(req).await;
+    }
+
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost")
+        .to_string();
+
+    // A proxy that terminated TLS says so; otherwise loopback is plain and
+    // anything else is assumed to be behind one. Guessing https for a local
+    // server would produce a tag pointing at a port that is not listening.
+    let scheme = req
+        .headers()
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            let local = host.starts_with("127.0.0.1")
+                || host.starts_with("localhost")
+                || host.starts_with("[::1]");
+            if local { "http".into() } else { "https".into() }
+        });
+
+    match routes::gomod::go_import_page(&host, &scheme, req.uri().path()) {
+        Some(html) => (
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            html,
+        )
+            .into_response(),
+        None => next.run(req).await,
     }
 }
 

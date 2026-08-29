@@ -2,6 +2,7 @@
 
 pub mod admin;
 pub mod browse;
+pub mod gomod;
 pub mod issues;
 pub mod merges;
 pub mod repos;

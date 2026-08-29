@@ -72,7 +72,7 @@ async fn lookup_ref(state: &AppState, repo: &RepoRow, name: &str) -> AppResult<O
 /// `tags/v1.0` as well. Branch first: a branch and a tag may share a name, and
 /// the branch is the one someone browsing is more likely to mean. The prefixed
 /// spelling is also accepted, so a link that already carries it still works.
-async fn resolve_ref(state: &AppState, repo: &RepoRow, spec: &str) -> AppResult<Hash> {
+pub(crate) async fn resolve_ref(state: &AppState, repo: &RepoRow, spec: &str) -> AppResult<Hash> {
     if let Some(h) = try_resolve_ref(state, repo, spec).await? {
         return Ok(h);
     }
