@@ -41,8 +41,234 @@ pub fn routes() -> Router<AppState> {
             "/repos/{owner}/{name}/merges/{number}/resolve",
             post(resolve_thread),
         )
+        .route("/repos/{owner}/{name}/labels", get(list_labels).post(create_label))
+        .route(
+            "/repos/{owner}/{name}/labels/{id}",
+            patch(edit_label).delete(delete_label),
+        )
+        .route(
+            "/repos/{owner}/{name}/issues/{number}/labels",
+            post(set_issue_labels),
+        )
         .route("/repos/{owner}/{name}/n/{number}", get(what_is))
         .route("/repos/{owner}/{name}/issues/{number}/refs", get(issue_refs))
+}
+
+// ---- labels -------------------------------------------------------------
+
+#[derive(sqlx::FromRow, Serialize)]
+pub struct LabelView {
+    pub id: Uuid,
+    pub name: String,
+    /// 0-359. The palette is derived from this against whichever theme is in
+    /// use, so a label picked in the dark theme stays readable in the light.
+    pub hue: i32,
+    pub description: Option<String>,
+}
+
+async fn list_labels(
+    State(state): State<AppState>,
+    viewer: Viewer,
+    Path((owner, name)): Path<(String, String)>,
+) -> AppResult<Json<Vec<LabelView>>> {
+    let (repo, access, _) = super::load_repo(&state, &viewer, &owner, &name).await?;
+    require_read(access, &owner, &name)?;
+    let rows: Vec<LabelView> = sqlx::query_as(
+        "SELECT id, name, hue, description FROM labels WHERE repo_id = $1 ORDER BY lower(name)",
+    )
+    .bind(repo.id)
+    .fetch_all(&state.db)
+    .await?;
+    Ok(Json(rows))
+}
+
+#[derive(Deserialize)]
+struct LabelInput {
+    name: Option<String>,
+    hue: Option<i32>,
+    description: Option<String>,
+}
+
+fn clean_label(name: &str) -> AppResult<String> {
+    let n = name.trim();
+    if n.is_empty() {
+        return Err(AppError::BadRequest("a label needs a name".into()));
+    }
+    if n.chars().count() > 40 {
+        return Err(AppError::BadRequest("that label name is too long".into()));
+    }
+    Ok(n.to_string())
+}
+
+/// Defining the vocabulary is an administrative act; applying it is not.
+///
+/// Anyone who can write may label an issue, because that is triage. Only an
+/// administrator may invent a label, because a shared vocabulary stops being
+/// one the moment everybody can add to it — which is how repositories end up
+/// with "bug", "Bug", "bugs" and "defect".
+async fn create_label(
+    State(state): State<AppState>,
+    viewer: Viewer,
+    Path((owner, name)): Path<(String, String)>,
+    Json(input): Json<LabelInput>,
+) -> AppResult<impl IntoResponse> {
+    let (repo, access, _) = super::load_repo(&state, &viewer, &owner, &name).await?;
+    crate::perms::require_admin(access)?;
+    let u = viewer.require()?;
+
+    let label = clean_label(input.name.as_deref().unwrap_or(""))?;
+    let hue = input.hue.unwrap_or(0).rem_euclid(360);
+
+    let id = Uuid::new_v4();
+    let res = sqlx::query(
+        "INSERT INTO labels (id, repo_id, name, hue, description) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(id)
+    .bind(repo.id)
+    .bind(&label)
+    .bind(hue)
+    .bind(input.description.as_deref().map(str::trim).filter(|d| !d.is_empty()))
+    .execute(&state.db)
+    .await;
+
+    if let Err(sqlx::Error::Database(e)) = &res
+        && e.is_unique_violation()
+    {
+        return Err(AppError::conflict(format!("there is already a \"{label}\" label")));
+    }
+    res?;
+
+    super::audit(&state, Some(u.id), Some(repo.id), "label.create",
+        serde_json::json!({ "name": label })).await;
+
+    let row: LabelView = sqlx::query_as("SELECT id, name, hue, description FROM labels WHERE id = $1")
+        .bind(id)
+        .fetch_one(&state.db)
+        .await?;
+    Ok((StatusCode::CREATED, Json(row)))
+}
+
+async fn edit_label(
+    State(state): State<AppState>,
+    viewer: Viewer,
+    Path((owner, name, id)): Path<(String, String, Uuid)>,
+    Json(input): Json<LabelInput>,
+) -> AppResult<Json<LabelView>> {
+    let (repo, access, _) = super::load_repo(&state, &viewer, &owner, &name).await?;
+    crate::perms::require_admin(access)?;
+
+    if let Some(n) = input.name.as_deref() {
+        let n = clean_label(n)?;
+        sqlx::query("UPDATE labels SET name = $3 WHERE id = $1 AND repo_id = $2")
+            .bind(id)
+            .bind(repo.id)
+            .bind(n)
+            .execute(&state.db)
+            .await?;
+    }
+    if let Some(h) = input.hue {
+        sqlx::query("UPDATE labels SET hue = $3 WHERE id = $1 AND repo_id = $2")
+            .bind(id)
+            .bind(repo.id)
+            .bind(h.rem_euclid(360))
+            .execute(&state.db)
+            .await?;
+    }
+    if let Some(d) = input.description.as_deref() {
+        sqlx::query("UPDATE labels SET description = $3 WHERE id = $1 AND repo_id = $2")
+            .bind(id)
+            .bind(repo.id)
+            .bind(d.trim())
+            .execute(&state.db)
+            .await?;
+    }
+
+    let row: Option<LabelView> =
+        sqlx::query_as("SELECT id, name, hue, description FROM labels WHERE id = $1 AND repo_id = $2")
+            .bind(id)
+            .bind(repo.id)
+            .fetch_optional(&state.db)
+            .await?;
+    row.map(Json).ok_or_else(|| AppError::not_found("no such label"))
+}
+
+async fn delete_label(
+    State(state): State<AppState>,
+    viewer: Viewer,
+    Path((owner, name, id)): Path<(String, String, Uuid)>,
+) -> AppResult<Json<serde_json::Value>> {
+    let (repo, access, _) = super::load_repo(&state, &viewer, &owner, &name).await?;
+    crate::perms::require_admin(access)?;
+
+    // The rows on issues go with it: a label nobody can see is not a label.
+    let done = sqlx::query("DELETE FROM labels WHERE id = $1 AND repo_id = $2")
+        .bind(id)
+        .bind(repo.id)
+        .execute(&state.db)
+        .await?;
+    if done.rows_affected() == 0 {
+        return Err(AppError::not_found("no such label"));
+    }
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct IssueLabels {
+    /// The complete set, not a delta. A caller that sends what it believes the
+    /// labels to be cannot half-apply a change it thought it made.
+    labels: Vec<Uuid>,
+}
+
+async fn set_issue_labels(
+    State(state): State<AppState>,
+    viewer: Viewer,
+    Path((owner, name, number)): Path<(String, String, i32)>,
+    Json(input): Json<IssueLabels>,
+) -> AppResult<Json<Vec<LabelView>>> {
+    let (repo_id, id, _) = load_issue(&state, &viewer, &owner, &name, number).await?;
+    // Triage, not vocabulary: write access is enough.
+    writer(&viewer)?;
+
+    let mut tx = state.db.begin().await?;
+    sqlx::query("DELETE FROM issue_labels WHERE issue_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+
+    for label in &input.labels {
+        // Scoped to the repository, so an id from elsewhere cannot be pasted
+        // onto an issue here.
+        sqlx::query(
+            "INSERT INTO issue_labels (issue_id, label_id)
+             SELECT $1, id FROM labels WHERE id = $2 AND repo_id = $3
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(id)
+        .bind(label)
+        .bind(repo_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query("UPDATE issues SET updated_at = now() WHERE id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
+    Ok(Json(labels_of(&state, id).await?))
+}
+
+/// The labels on one issue.
+async fn labels_of(state: &AppState, issue: Uuid) -> AppResult<Vec<LabelView>> {
+    Ok(sqlx::query_as(
+        "SELECT l.id, l.name, l.hue, l.description
+           FROM issue_labels il JOIN labels l ON l.id = il.label_id
+          WHERE il.issue_id = $1
+          ORDER BY lower(l.name)",
+    )
+    .bind(issue)
+    .fetch_all(&state.db)
+    .await?)
 }
 
 // ---- issues -------------------------------------------------------------
@@ -72,6 +298,8 @@ pub struct IssueView {
     pub updated_at: DateTime<Utc>,
     /// Shown in the list, so it does not take a second request per row.
     pub comments: i64,
+    /// Filled in bulk after the rows are fetched, for the same reason.
+    pub labels: Vec<LabelView>,
 }
 
 impl From<IssueRow> for IssueView {
@@ -86,6 +314,41 @@ impl From<IssueRow> for IssueView {
             created_at: r.created_at,
             updated_at: r.updated_at,
             comments: r.comments,
+            labels: Vec::new(),
+        }
+    }
+}
+
+/// One row of the bulk label join: which issue, and the label's own columns.
+type LabelRow = (i32, Uuid, String, i32, Option<String>);
+
+/// Attach each issue's labels in one query rather than one per row.
+async fn attach_labels(state: &AppState, views: &mut [IssueView], repo: Uuid) {
+    if views.is_empty() {
+        return;
+    }
+    let numbers: Vec<i32> = views.iter().map(|v| v.number).collect();
+    let rows: Result<Vec<LabelRow>, _> = sqlx::query_as(
+        "SELECT i.number, l.id, l.name, l.hue, l.description
+           FROM issues i
+           JOIN issue_labels il ON il.issue_id = i.id
+           JOIN labels l ON l.id = il.label_id
+          WHERE i.repo_id = $1 AND i.number = ANY($2)
+          ORDER BY lower(l.name)",
+    )
+    .bind(repo)
+    .bind(&numbers)
+    .fetch_all(&state.db)
+    .await;
+
+    let Ok(rows) = rows else { return };
+    let mut by: std::collections::HashMap<i32, Vec<LabelView>> = std::collections::HashMap::new();
+    for (number, id, name, hue, description) in rows {
+        by.entry(number).or_default().push(LabelView { id, name, hue, description });
+    }
+    for v in views.iter_mut() {
+        if let Some(ls) = by.remove(&v.number) {
+            v.labels = ls;
         }
     }
 }
@@ -113,6 +376,8 @@ macro_rules! select_issue {
 struct ListQuery {
     /// "open" (default), "closed", or "all".
     state: Option<String>,
+    /// Show only issues carrying this label, by name.
+    label: Option<String>,
 }
 
 async fn list(
@@ -125,6 +390,42 @@ async fn list(
     require_read(access, &owner, &name)?;
 
     let want = q.state.as_deref().unwrap_or("open");
+    let label = q.label.as_deref().map(str::trim).filter(|l| !l.is_empty());
+
+    // A label filter is a different query rather than a clause appended to a
+    // string: sqlx wants the SQL known at compile time, and four spelled-out
+    // queries are easier to read than one built by concatenation anyway.
+    if let Some(label) = label {
+        let mut rows: Vec<IssueRow> = if want == "all" {
+            sqlx::query_as(select_issue!(
+                "WHERE i.repo_id = $1 AND EXISTS (
+                     SELECT 1 FROM issue_labels il JOIN labels l ON l.id = il.label_id
+                      WHERE il.issue_id = i.id AND lower(l.name) = lower($2))
+                 ORDER BY i.number DESC LIMIT 200"
+            ))
+            .bind(repo.id)
+            .bind(label)
+            .fetch_all(&state.db)
+            .await?
+        } else {
+            sqlx::query_as(select_issue!(
+                "WHERE i.repo_id = $1 AND i.state = $3 AND EXISTS (
+                     SELECT 1 FROM issue_labels il JOIN labels l ON l.id = il.label_id
+                      WHERE il.issue_id = i.id AND lower(l.name) = lower($2))
+                 ORDER BY i.number DESC LIMIT 200"
+            ))
+            .bind(repo.id)
+            .bind(label)
+            .bind(want)
+            .fetch_all(&state.db)
+            .await?
+        };
+        let mut views: Vec<IssueView> =
+            rows.drain(..).map(IssueView::from).collect();
+        attach_labels(&state, &mut views, repo.id).await;
+        return Ok(Json(views));
+    }
+
     let rows: Vec<IssueRow> = if want == "all" {
         sqlx::query_as(select_issue!(
             "WHERE i.repo_id = $1 ORDER BY i.number DESC LIMIT 200"
@@ -142,7 +443,9 @@ async fn list(
         .await?
     };
 
-    Ok(Json(rows.into_iter().map(IssueView::from).collect()))
+    let mut views: Vec<IssueView> = rows.into_iter().map(IssueView::from).collect();
+    attach_labels(&state, &mut views, repo.id).await;
+    Ok(Json(views))
 }
 
 #[derive(Deserialize)]
@@ -240,8 +543,11 @@ async fn detail(
     viewer: Viewer,
     Path((owner, name, number)): Path<(String, String, i32)>,
 ) -> AppResult<Json<IssueView>> {
-    let (_, _, row) = load_issue(&state, &viewer, &owner, &name, number).await?;
-    Ok(Json(IssueView::from(row)))
+    let (repo_id, id, row) = load_issue(&state, &viewer, &owner, &name, number).await?;
+    let mut view = IssueView::from(row);
+    view.labels = labels_of(&state, id).await?;
+    let _ = repo_id;
+    Ok(Json(view))
 }
 
 #[derive(Deserialize)]

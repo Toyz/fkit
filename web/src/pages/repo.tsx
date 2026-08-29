@@ -25,6 +25,7 @@ import {
   relativeTime,
   type Comment,
   type Issue,
+  type Label,
   type GcReport,
   type BlobResponse,
   type TreeResponse,
@@ -666,6 +667,36 @@ const sheet = css`
   .links a:hover { text-decoration: underline; }
   .links .st { color: var(--faint); margin-left: 3px; }
 
+  .lrow { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0; }
+  .lrow .d {
+    font-family: var(--sans); font-size: 11.5px; color: var(--muted);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .huein { width: 66px; font-size: 11.5px; height: 24px; padding: 0 7px; }
+
+  .ilabels {
+    display: flex; align-items: center; flex-wrap: wrap; gap: 6px;
+    margin: 0 0 12px;
+  }
+  .ilabels .none { font-size: 12px; color: var(--faint); font-family: var(--sans); }
+  .lpick {
+    display: flex; flex-wrap: wrap; gap: 6px;
+    padding: 10px 11px; margin: 0 0 14px;
+    border: 1px solid var(--border); border-radius: var(--radius);
+    background: var(--surface);
+  }
+
+  /* Labels: the strip that narrows the list, and the row that shows them. */
+  .lfilter {
+    display: flex; align-items: center; flex-wrap: wrap; gap: 6px;
+    margin-bottom: 12px;
+  }
+  .lfilter .lbl {
+    font-size: 10px; text-transform: uppercase; letter-spacing: .09em;
+    color: var(--faint); margin-right: 3px;
+  }
+  .tline { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; min-width: 0; }
+
   /* ---- issues ---- */
   .seg { display: flex; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
   .seg button {
@@ -681,6 +712,14 @@ const sheet = css`
   .issue-line { display: flex; flex-direction: column; flex: 1; min-width: 0; gap: 2px; }
   .issue-line .t { font-size: 13px; color: var(--text); text-decoration: none; }
   .issue-line .t:hover { color: var(--accent); }
+  /* The title is the row's link, and its clickable area is the row. Anything
+     else in the row that can be clicked sits above it. */
+  .issue-line .t::after { content: ""; position: absolute; inset: 0; }
+  .issue-line fkit-label,
+  fkit-row .tag,
+  fkit-row .cbadge,
+  fkit-row button,
+  fkit-row a:not(.t) { position: relative; z-index: 1; }
   .issue-line .sub { font-size: 11.5px; color: var(--faint); }
   .cbadge { display: flex; align-items: center; gap: 4px; color: var(--faint); font-size: 11.5px; }
 
@@ -1230,6 +1269,10 @@ export class PageRepo extends LoomElement {
   /// What mentions the issue being viewed. Reading an issue without knowing a
   /// change already proposes to fix it is how the same work gets done twice.
   @reactive accessor issueRefs: CrossRef[] | null = null;
+  /// Which label the issue list is narrowed to, "" for all of them.
+  @reactive accessor labelFilter = "";
+  /// Open while choosing labels for an issue.
+  @reactive accessor pickingLabels = false;
   /// Set while composing a new issue, so the form and the list are one page.
   @reactive accessor newIssue = false;
   /// The comment currently open for editing. One at a time, for the same
@@ -1308,9 +1351,27 @@ export class PageRepo extends LoomElement {
   })
   accessor commentsQuery!: ApiState<Comment[]>;
 
+  @query<Label[]>({
+    url: (el: PageRepo) => `/api/repos/${el.loc!.owner}/${el.loc!.name}/labels`,
+    enabled: (el: PageRepo) => {
+      const v = el.loc?.view;
+      if (!v || !el.repoQuery.data) return false;
+      // The three places a label is shown: the list, one issue, and the page
+      // that defines them.
+      return (
+        v.kind === "issues" ||
+        v.kind === "issue" ||
+        (v.kind === "settings" && v.section === "labels")
+      );
+    },
+    init: { credentials: "same-origin" },
+  })
+  accessor labelsQuery!: ApiState<Label[]>;
+
   @query<Issue[]>({
     url: (el: PageRepo) =>
-      `/api/repos/${el.loc!.owner}/${el.loc!.name}/issues?state=${el.issueFilter}`,
+      `/api/repos/${el.loc!.owner}/${el.loc!.name}/issues?state=${el.issueFilter}` +
+      (el.labelFilter ? `&label=${encodeURIComponent(el.labelFilter)}` : ""),
     enabled: (el: PageRepo) =>
       Boolean(el.loc && el.repoQuery.data && el.loc.view.kind === "issues"),
     init: { credentials: "same-origin" },
@@ -2993,14 +3054,38 @@ fkit push</pre>
             </span>
           </fkit-modal>
 
+          {(this.labelsQuery.data ?? []).length ? (
+            <div class="lfilter">
+              <span class="lbl">labels</span>
+              {(this.labelsQuery.data ?? []).map((l) => (
+                <fkit-label
+                  loom-key={l.id}
+                  clickable
+                  off={this.labelFilter !== l.name}
+                  name={l.name}
+                  hue={l.hue}
+                  title={l.description ?? l.name}
+                  onClick={() => (this.labelFilter = this.labelFilter === l.name ? "" : l.name)}
+                ></fkit-label>
+              ))}
+              {this.labelFilter ? (
+                <button type="button" class="bare" onClick={() => (this.labelFilter = "")}>
+                  clear
+                </button>
+              ) : null}
+            </div>
+          ) : null}
+
           <fkit-list>
             {list === null ? (
               <fkit-empty><span class="sk" style="width:220px"></span></fkit-empty>
             ) : list.length === 0 ? (
               <fkit-empty>
-                {this.issueFilter === "open"
-                  ? "No open issues. Anything wrong, or anything missing, goes here."
-                  : `No ${this.issueFilter} issues.`}
+                {this.labelFilter
+                  ? `No ${this.issueFilter === "all" ? "" : this.issueFilter} issues labelled ${this.labelFilter}.`
+                  : this.issueFilter === "open"
+                    ? "No open issues. Anything wrong, or anything missing, goes here."
+                    : `No ${this.issueFilter} issues.`}
               </fkit-empty>
             ) : (
               list.map((i) => {
@@ -3014,7 +3099,21 @@ fkit push</pre>
                     meta=""
                   >
                     <span slot="main" class="issue-line">
-                      <a class="t" href={href} onClick={linkHandler(href)}>{i.title}</a>
+                      <span class="tline">
+                        <a class="t" href={href} onClick={linkHandler(href)}>{i.title}</a>
+                        {i.labels.map((l) => (
+                          <fkit-label
+                            loom-key={l.id}
+                            clickable
+                            name={l.name}
+                            hue={l.hue}
+                            title={l.description ?? l.name}
+                            onClick={() =>
+                              (this.labelFilter = this.labelFilter === l.name ? "" : l.name)
+                            }
+                          ></fkit-label>
+                        ))}
+                      </span>
                       <span class="sub">
                         #{i.number} opened {relativeTime(i.created_at)}
                         {i.author ? ` by ${i.author}` : ""}
@@ -3091,6 +3190,55 @@ fkit push</pre>
             <span class="sk" style="width:260px"></span>
           ) : (
             <>
+              {/* The labels on this issue, and the way to change them. Every
+                  label the repository has is offered, drained until applied,
+                  so choosing is one click rather than a search. */}
+              <div class="ilabels">
+                {i.labels.map((l) => (
+                  <fkit-label loom-key={l.id} name={l.name} hue={l.hue}
+                    title={l.description ?? l.name}></fkit-label>
+                ))}
+                {i.labels.length === 0 && !this.pickingLabels ? (
+                  <span class="none">No labels</span>
+                ) : null}
+                {this.session.isAuthed && (this.labelsQuery.data ?? []).length ? (
+                  <button
+                    type="button"
+                    class="bare"
+                    onClick={() => (this.pickingLabels = !this.pickingLabels)}
+                  >
+                    {this.pickingLabels ? "done" : "edit labels"}
+                  </button>
+                ) : null}
+              </div>
+
+              {this.pickingLabels ? (
+                <div class="lpick">
+                  {(this.labelsQuery.data ?? []).map((l) => {
+                    const on = i.labels.some((x) => x.id === l.id);
+                    return (
+                      <fkit-label
+                        loom-key={l.id}
+                        clickable
+                        off={!on}
+                        name={l.name}
+                        hue={l.hue}
+                        title={l.description ?? l.name}
+                        onClick={() =>
+                          void this.act(async () => {
+                            const next = on
+                              ? i.labels.filter((x) => x.id !== l.id).map((x) => x.id)
+                              : [...i.labels.map((x) => x.id), l.id];
+                            await api.setIssueLabels(at.owner, at.name, i.number, next);
+                            await this.issueQuery.refetch();
+                          })
+                        }
+                      ></fkit-label>
+                    );
+                  })}
+                </div>
+              ) : null}
+
               {this.issueRefs && this.issueRefs.length ? (
                 <div class="links">
                   <loom-icon name="link" size={12}></loom-icon>
@@ -3163,73 +3311,87 @@ fkit push</pre>
     const list = this.merges;
     const canOpen = this.repo!.access !== "read" && this.repo!.access !== "none";
 
+    const propose = `/${at.owner}/${at.name}/compare/${this.repo!.default_branch}...${this.refName()}`;
+
     return (
-      <div>
-        <div class="cmp-bar">
-          {(["open", "merged", "closed", "all"] as const).map((k) => (
-            <button
-              class={this.mergeState === k ? "" : "bare"}
-              onClick={async () => {
-                // The query takes its state through `params`, so this
-                // assignment changes the key and the refetch is the decorator's.
-                this.mergeState = k;
-              }}
-            >
-              {k}
-            </button>
-          ))}
-          <div class="grow"></div>
-          {canOpen ? (
-            <a
-              class="btn primary"
-              href={`/${at.owner}/${at.name}/compare/${this.repo!.default_branch}...${this.refName()}`}
-              onClick={linkHandler(
-                `/${at.owner}/${at.name}/compare/${this.repo!.default_branch}...${this.refName()}`,
-              )}
-            >
-              <loom-icon name="plus" size={12}></loom-icon> new merge request
-            </a>
-          ) : null}
-        </div>
+      <div class="wrap">
+        <fkit-section
+          heading="Merge requests"
+          value={list ? `${list.length} ${this.mergeState}` : ""}
+        >
+          <span slot="action" class="head-acts">
+            <span class="seg">
+              {(["open", "merged", "closed", "all"] as const).map((k) => (
+                <button
+                  loom-key={k}
+                  type="button"
+                  class={this.mergeState === k ? "on" : ""}
+                  // The query takes its state through `params`, so this
+                  // assignment changes the key and the refetch is the
+                  // decorator's.
+                  onClick={() => (this.mergeState = k)}
+                >
+                  {k}
+                </button>
+              ))}
+            </span>
+            {canOpen ? (
+              <a class="btn" href={propose} onClick={linkHandler(propose)}>
+                <loom-icon name="plus" size={11}></loom-icon> new merge request
+              </a>
+            ) : null}
+          </span>
 
         {list === null ? (
-          <div class="panel">
-            {[0, 1, 2].map(() => (
-              <div class="mrow sk-row">
-                <span class="sk" style="width:13px;height:13px"></span>
-                <span class="sk" style="width:min(50%,280px)"></span>
-                <span class="sk" style="width:90px"></span>
-              </div>
-            ))}
-          </div>
+          <fkit-list>
+            <fkit-empty><span class="sk" style="width:220px"></span></fkit-empty>
+          </fkit-list>
         ) : list.length === 0 ? (
-          <div class="panel">
-            <div class="empty">
-              <h2>no {this.mergeState === "all" ? "" : this.mergeState} merge requests</h2>
-              <p class="prose">
-                Compare two branches to propose one.
-              </p>
-            </div>
-          </div>
+          <fkit-list>
+            <fkit-empty>
+              No {this.mergeState === "all" ? "" : `${this.mergeState} `}merge requests.
+              Compare two branches to propose one.
+            </fkit-empty>
+          </fkit-list>
         ) : (
-          <div class="panel">
+          <fkit-list>
             {list.map((m) => {
               const href = `/${at.owner}/${at.name}/merges/${m.number}`;
               return (
-                <div class="mrow">
-                  {this.stateTag(m.state)}
-                  <a class="mtitle" href={href} onClick={linkHandler(href)}>
-                    <span class="num">#{m.number}</span> {m.title}
-                  </a>
-                  <span class="mbr">
-                    {m.source_branch} <span class="faint">into</span> {m.target_branch}
+                <fkit-row
+                  loom-key={m.number}
+                  icon={m.state === "merged" ? "check" : m.state === "closed" ? "x" : "merge"}
+                  current={m.state === "open"}
+                  name=""
+                  meta=""
+                >
+                  {/* The same two-line shape the issue list uses: what it is,
+                      then who and when. Who opened a change is most of what
+                      decides whether you are the person who should look at
+                      it, and this list did not say. */}
+                  <span slot="main" class="issue-line">
+                    <a class="t" href={href} onClick={linkHandler(href)}>{m.title}</a>
+                    <span class="sub">
+                      #{m.number} opened {relativeTime(m.created_at)}
+                      {m.author ? ` by ${m.author}` : ""} · {m.source_branch} into{" "}
+                      {m.target_branch}
+                      {m.state === "merged" && m.merged_at
+                        ? ` · merged ${relativeTime(m.merged_at)}`
+                        : ""}
+                    </span>
                   </span>
-                  <span class="faint" style="font-size:11px">{relativeTime(m.created_at)}</span>
-                </div>
+                  {m.closes.length ? (
+                    <span class="cbadge" title={`closes #${m.closes.join(", #")}`}>
+                      <loom-icon name="link" size={11}></loom-icon> {m.closes.length}
+                    </span>
+                  ) : null}
+                  {m.state !== "open" ? <span class="tag">{m.state}</span> : null}
+                </fkit-row>
               );
             })}
-          </div>
+          </fkit-list>
         )}
+        </fkit-section>
       </div>
     );
   }
@@ -3778,6 +3940,7 @@ fkit push</pre>
     const tabs: [string, string, string][] = [
       ["general", "general", "settings"],
       ["branches", "branches", "branch"],
+      ["labels", "labels", "tag"],
       ["access", "access", "lock"],
       ["setup", "push & clone", "link"],
       ["danger", "danger zone", "alert"],
@@ -3801,6 +3964,7 @@ fkit push</pre>
         <div class="sec">
           {section === "general" ? this.settingsGeneral(r, at) : null}
           {section === "branches" ? this.settingsBranches(r, at) : null}
+          {section === "labels" ? this.settingsLabels(at) : null}
           {section === "access" ? this.settingsAccess(r, at) : null}
           {section === "setup" ? (
             <fkit-page heading="Push & clone" value={syncUrl(r.owner, r.name)}>
@@ -3996,6 +4160,111 @@ fkit push</pre>
                       t.name,
                       `The tag name goes; the commit it points at stays in the store.`,
                     )}
+                  >
+                    Delete
+                  </button>
+                </fkit-row>
+              ))
+            )}
+          </fkit-list>
+        </fkit-section>
+      </fkit-page>
+    );
+  }
+
+  /// The repository's label vocabulary.
+  ///
+  /// Defining it is an administrative act and applying it is not: anyone who
+  /// can write may label an issue, because that is triage, but a shared
+  /// vocabulary stops being shared the moment everyone can add to it — which
+  /// is how a tracker ends up with "bug", "Bug", "bugs" and "defect".
+  private settingsLabels(at: { owner: string; name: string }) {
+    const labels = this.labelsQuery.data ?? null;
+
+    return (
+      <fkit-page>
+        <fkit-section
+          heading="Labels"
+          value={labels ? `${labels.length}` : ""}
+          blurb="The words this repository sorts its issues by. A label's colour is stored as a hue, and each theme derives its own shade from it — so one that reads well in the dark also reads well in the light."
+        >
+          <form
+            onSubmit={(e: Event) => {
+              e.preventDefault();
+              const f = e.target as HTMLFormElement;
+              const name = (f.elements.namedItem("lname") as HTMLInputElement).value;
+              const hue = Number((f.elements.namedItem("hue") as HTMLInputElement).value);
+              const description = (f.elements.namedItem("ldesc") as HTMLInputElement).value;
+              void this.act(async () => {
+                await api.createLabel(at.owner, at.name, { name, hue, description });
+                await this.labelsQuery.refetch();
+                f.reset();
+              }, "Label added");
+            }}
+          >
+            <fkit-add>
+              <fkit-field label="Name" size="mid">
+                <input name="lname" placeholder="bug" required maxLength={40} />
+              </fkit-field>
+              <fkit-field label="Description">
+                <input name="ldesc" placeholder="What it means, for whoever applies it" />
+              </fkit-field>
+              <fkit-field label="Hue" size="narrow">
+                <input name="hue" type="number" min={0} max={359} value="200" />
+              </fkit-field>
+              <button class="primary" type="submit" disabled={this.busy}>
+                <loom-icon name="plus" size={12}></loom-icon> Add
+              </button>
+            </fkit-add>
+          </form>
+
+          <fkit-list>
+            {labels === null ? (
+              <fkit-empty><span class="sk" style="width:200px"></span></fkit-empty>
+            ) : labels.length === 0 ? (
+              <fkit-empty>
+                No labels yet. They are how a tracker stays navigable once it has
+                more issues than fit on a screen.
+              </fkit-empty>
+            ) : (
+              labels.map((l) => (
+                <fkit-row loom-key={l.id} name="" meta="">
+                  <span slot="main" class="lrow">
+                    <fkit-label name={l.name} hue={l.hue}></fkit-label>
+                    {l.description ? <span class="d">{l.description}</span> : null}
+                  </span>
+                  <input
+                    class="huein"
+                    type="number"
+                    min={0}
+                    max={359}
+                    value={String(l.hue)}
+                    title="Hue"
+                    onChange={(e: Event) =>
+                      void this.act(async () => {
+                        const hue = Number((e.target as HTMLInputElement).value);
+                        await api.editLabel(at.owner, at.name, l.id, { hue });
+                        await this.labelsQuery.refetch();
+                      })
+                    }
+                  />
+                  <button
+                    type="button"
+                    class="danger bare"
+                    disabled={this.busy}
+                    onClick={async () => {
+                      const ok = await confirmAction({
+                        title: `Delete the "${l.name}" label?`,
+                        body: "It is removed from every issue carrying it. The issues themselves are untouched.",
+                        confirm: "Delete label",
+                        danger: true,
+                      });
+                      if (!ok) return;
+                      await this.act(async () => {
+                        await api.deleteLabel(at.owner, at.name, l.id);
+                        await this.labelsQuery.refetch();
+                      }, "Label deleted");
+                    }}
                   >
                     Delete
                   </button>

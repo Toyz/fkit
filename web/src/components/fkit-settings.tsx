@@ -247,7 +247,12 @@ const itemSheet = css`
     display: flex; align-items: center; gap: 12px;
     padding: 10px 14px;
     border-bottom: 1px solid var(--border);
+    /* So a row's primary link can stretch its clickable area over the whole
+       row. The link stays a real link — keyboard, middle-click, copy address
+       all still work — it simply also covers the space around itself. */
+    position: relative;
   }
+  :host(:hover) { background: var(--raised); }
   :host(:last-of-type) { border-bottom: 0; }
 
   .ic { color: var(--faint); display: flex; flex: none; }

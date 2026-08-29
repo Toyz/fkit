@@ -46,6 +46,14 @@ export interface Repo {
   open_merges: number;
 }
 
+export interface Label {
+  id: string;
+  name: string;
+  /** 0-359; each theme derives its own palette from it. */
+  hue: number;
+  description: string | null;
+}
+
 export interface Issue {
   number: number;
   title: string;
@@ -56,6 +64,7 @@ export interface Issue {
   created_at: string;
   updated_at: string;
   comments: number;
+  labels: Label[];
 }
 
 export interface CrossRef {
@@ -528,8 +537,42 @@ export const api = {
   deleteRepo: (owner: string, name: string) =>
     request<{ ok: boolean }>(`/repos/${owner}/${name}`, { method: "DELETE" }),
 
-  issues: (owner: string, name: string, state: "open" | "closed" | "all" = "open") =>
-    request<Issue[]>(`/repos/${owner}/${name}/issues?state=${state}`),
+  issues: (
+    owner: string,
+    name: string,
+    state: "open" | "closed" | "all" = "open",
+    label = "",
+  ) =>
+    request<Issue[]>(
+      `/repos/${owner}/${name}/issues?state=${state}${
+        label ? `&label=${encodeURIComponent(label)}` : ""
+      }`,
+    ),
+
+  labels: (owner: string, name: string) => request<Label[]>(`/repos/${owner}/${name}/labels`),
+  createLabel: (
+    owner: string,
+    name: string,
+    input: { name: string; hue: number; description?: string },
+  ) => request<Label>(`/repos/${owner}/${name}/labels`, { method: "POST", body: body(input) }),
+  editLabel: (
+    owner: string,
+    name: string,
+    id: string,
+    input: { name?: string; hue?: number; description?: string },
+  ) =>
+    request<Label>(`/repos/${owner}/${name}/labels/${id}`, {
+      method: "PATCH",
+      body: body(input),
+    }),
+  deleteLabel: (owner: string, name: string, id: string) =>
+    request<{ ok: boolean }>(`/repos/${owner}/${name}/labels/${id}`, { method: "DELETE" }),
+  /** The complete set, not a delta. */
+  setIssueLabels: (owner: string, name: string, number: number, labels: string[]) =>
+    request<Label[]>(`/repos/${owner}/${name}/issues/${number}/labels`, {
+      method: "POST",
+      body: body({ labels }),
+    }),
   issue: (owner: string, name: string, number: number) =>
     request<Issue>(`/repos/${owner}/${name}/issues/${number}`),
   createIssue: (owner: string, name: string, input: { title: string; body?: string }) =>
