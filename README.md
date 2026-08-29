@@ -385,6 +385,46 @@ Per-repository visibility is independent of all that: a public instance can host
 private repositories, and a public repository on it is readable — and cloneable —
 by someone with no account at all, while still refusing their pushes.
 
+### Protected branches
+
+Write access is one bit — you can push, or you cannot — which is right for a
+scratch branch and wrong for the one everything is cut from. A rule names a
+branch or a prefix and refuses the two operations that destroy work already
+pushed:
+
+```
+main         no rewriting · no deleting
+release/*    no rewriting · no deleting
+```
+
+The two limits are separate switches, not one setting: refusing to let a
+release branch be rewritten while still allowing it to be retired is a coherent
+policy, so a rule can forbid either or both. It cannot forbid neither — that is
+a row which looks like protection and is not.
+
+An ordinary push is never affected. A fast-forward only ever adds, so nothing
+anybody already pulled can disappear underneath them; what a rule stops is a
+non-fast-forward push and an outright deletion. Longer patterns are named first
+when explaining a refusal, and a narrower rule never lifts a wider one.
+
+The settings page says so plainly when the default branch has no rule. It is
+the branch every clone lands on and every merge request targets, so it is where
+a rewrite costs the most, and going unprotected is a decision people usually
+make by never having considered it.
+
+**The repository's owner is not bound by them.** That is the point rather than
+an oversight: a mirror pushes with a token, a token belongs to an account, and
+mirroring somebody else's repository means reproducing whatever they rewrote.
+Binding the owner would make protection and mirroring mutually exclusive.
+Everyone else — every collaborator, with a session or a token — is bound.
+
+The cost is that these rules cannot protect an owner from themselves. They are
+here to say what *other people* may do to a branch.
+
+The check fails closed. If the rules cannot be read, the push is refused rather
+than allowed, because protection that evaporates when the database is unhappy
+is not protection.
+
 ### Link previews
 
 Paste a link to a repository, profile, issue, merge request, commit or file

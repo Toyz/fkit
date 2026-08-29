@@ -15,12 +15,19 @@ use crate::proto::{fetch_closure, serve_wants, verify_closure, Msg, TransferStat
 use crate::store::Store;
 use anyhow::{bail, Result};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefUpdate {
     Updated,
     AlreadyCurrent,
     /// The server's current tip is not an ancestor of the pushed commit.
     NotFastForward,
+    /// The server refuses this update on policy grounds, with its reason.
+    ///
+    /// Distinct from `NotFastForward` because the advice is opposite: that one
+    /// means "your history is behind, catch up and try again", this one means
+    /// "what you are asking for is not allowed here, and retrying will not
+    /// change that".
+    Refused(String),
 }
 
 /// Everything the shared session loop needs from a particular server.
@@ -164,6 +171,9 @@ pub fn serve_session<T: Transport + ?Sized, H: RepoHost + ?Sized>(
                         crate::proto::send(t, &Msg::Ok {
                             message: format!("{branch} already up to date"),
                         })?;
+                    }
+                    RefUpdate::Refused(why) => {
+                        send_error(t, format!("rejected: {why}"))?;
                     }
                     RefUpdate::NotFastForward => {
                         // A tag has no ancestry to be behind, so the branch

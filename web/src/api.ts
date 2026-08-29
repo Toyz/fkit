@@ -265,6 +265,16 @@ export interface NewToken extends Token {
   secret: string;
 }
 
+/** A limit on what may be done to the branches a pattern covers. */
+export interface BranchRule {
+  id: string;
+  /** A branch name, or a prefix ending in `*`. */
+  pattern: string;
+  no_force: boolean;
+  no_delete: boolean;
+  created_at: string;
+}
+
 export interface Collaborator {
   user_id: string;
   username: string;
@@ -913,6 +923,26 @@ export const api = {
     request<NewToken>("/tokens", { method: "POST", body: body(input) }),
   updateToken: (id: string, input: { name?: string; attributes?: boolean }) =>
     request<{ ok: boolean }>(`/tokens/${id}`, { method: "PATCH", body: body(input) }),
+  branchRules: (owner: string, name: string) =>
+    request<BranchRule[]>(`/repos/${owner}/${name}/rules`),
+  addBranchRule: (
+    owner: string,
+    name: string,
+    input: { pattern: string; no_force: boolean; no_delete: boolean },
+  ) => request<BranchRule>(`/repos/${owner}/${name}/rules`, { method: "POST", body: body(input) }),
+  updateBranchRule: (
+    owner: string,
+    name: string,
+    id: string,
+    input: { no_force?: boolean; no_delete?: boolean },
+  ) =>
+    request<BranchRule>(`/repos/${owner}/${name}/rules/${id}`, {
+      method: "PATCH",
+      body: body(input),
+    }),
+  deleteBranchRule: (owner: string, name: string, id: string) =>
+    request<{ ok: boolean }>(`/repos/${owner}/${name}/rules/${id}`, { method: "DELETE" }),
+
   revokeToken: (id: string) => request<{ ok: boolean }>(`/tokens/${id}`, { method: "DELETE" }),
 
   // collaborators

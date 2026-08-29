@@ -23,6 +23,8 @@ pub fn routes() -> Router<AppState> {
         .route("/repos/{owner}/{name}", patch(update_repo))
         .route("/repos/{owner}/{name}", delete(delete_repo))
         .route("/repos/{owner}/{name}/refs", get(list_refs).delete(delete_ref))
+        .route("/repos/{owner}/{name}/rules", get(list_rules).post(create_rule))
+        .route("/repos/{owner}/{name}/rules/{id}", patch(update_rule).delete(delete_rule))
         .route("/repos/{owner}/{name}/stats", get(repo_stats))
         .route("/repos/{owner}/{name}/gc", post(collect_garbage))
         .route("/repos/{owner}/{name}/fork", post(fork_repo))
@@ -90,6 +92,199 @@ struct RepoStats {
     /// offer a download that the server would refuse, rather than handing
     /// someone a button whose only outcome is an error.
     archive_limit: u64,
+}
+
+// ---- branch rules --------------------------------------------------------
+
+/// Anyone who can read the repository can see what its branches allow.
+///
+/// A rule is not a secret — it is the reason a push will be refused, and
+/// finding that out at push time rather than beforehand is the whole
+/// frustration this feature exists to remove.
+async fn list_rules(
+    State(state): State<AppState>,
+    viewer: Viewer,
+    axum::extract::Path((owner, name)): axum::extract::Path<(String, String)>,
+) -> AppResult<Json<Vec<crate::rules::BranchRule>>> {
+    let (repo, access, _) = super::load_repo(&state, &viewer, &owner, &name).await?;
+    require_read(access, &owner, &name)?;
+    Ok(Json(crate::rules::for_repo(&state.db, repo.id).await?))
+}
+
+#[derive(serde::Deserialize)]
+struct NewRule {
+    pattern: String,
+    #[serde(default = "yes")]
+    no_force: bool,
+    #[serde(default = "yes")]
+    no_delete: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+async fn create_rule(
+    State(state): State<AppState>,
+    viewer: Viewer,
+    axum::extract::Path((owner, name)): axum::extract::Path<(String, String)>,
+    Json(body): Json<NewRule>,
+) -> AppResult<Json<crate::rules::BranchRule>> {
+    let (repo, access, _) = super::load_repo(&state, &viewer, &owner, &name).await?;
+    require_admin(access)?;
+
+    let pattern = body.pattern.trim().to_string();
+    if pattern.is_empty() {
+        return Err(AppError::bad("a rule needs a branch name or pattern"));
+    }
+    // `*` is only meaningful at the end, and a pattern that silently means
+    // something other than it looks like is worse than no rule at all.
+    if pattern.trim_end_matches('*').contains('*') {
+        return Err(AppError::bad(
+            "a pattern may only end in `*` — `main`, or `release/*`",
+        ));
+    }
+    if pattern.starts_with(fkit_core::session::TAG_PREFIX) {
+        return Err(AppError::bad("branch rules govern branches, not tags"));
+    }
+    if !body.no_force && !body.no_delete {
+        return Err(AppError::bad("a rule that forbids nothing has no effect"));
+    }
+
+    let id = Uuid::new_v4();
+    let done = sqlx::query(
+        "INSERT INTO branch_rules (id, repo_id, pattern, no_force, no_delete)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (repo_id, pattern) DO NOTHING",
+    )
+    .bind(id)
+    .bind(repo.id)
+    .bind(&pattern)
+    .bind(body.no_force)
+    .bind(body.no_delete)
+    .execute(&state.db)
+    .await?;
+
+    if done.rows_affected() == 0 {
+        return Err(AppError::Conflict(format!(
+            "there is already a rule for `{pattern}`"
+        )));
+    }
+
+    super::audit(
+        &state,
+        viewer.id(),
+        Some(repo.id),
+        "rule.create",
+        serde_json::json!({
+            "pattern": pattern, "no_force": body.no_force, "no_delete": body.no_delete
+        }),
+    )
+    .await;
+
+    let row = sqlx::query_as(
+        "SELECT id, pattern, no_force, no_delete, created_at FROM branch_rules WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await?;
+    Ok(Json(row))
+}
+
+#[derive(serde::Deserialize)]
+struct RulePatch {
+    #[serde(default)]
+    no_force: Option<bool>,
+    #[serde(default)]
+    no_delete: Option<bool>,
+}
+
+/// Turn one limit of a rule on or off.
+///
+/// The two are separate decisions — forbidding a rewrite of a release branch
+/// while still allowing it to be retired is a coherent policy — so they are
+/// toggled rather than fixed at creation.
+async fn update_rule(
+    State(state): State<AppState>,
+    viewer: Viewer,
+    axum::extract::Path((owner, name, id)): axum::extract::Path<(String, String, Uuid)>,
+    Json(body): Json<RulePatch>,
+) -> AppResult<Json<crate::rules::BranchRule>> {
+    let (repo, access, _) = super::load_repo(&state, &viewer, &owner, &name).await?;
+    require_admin(access)?;
+
+    // Read, decide, then write. The first version applied the update and then
+    // deleted the row when the result forbade nothing — so a request that came
+    // back 400 had already destroyed the rule it was refusing to empty. A
+    // rejected request must leave everything exactly as it was.
+    let current: Option<crate::rules::BranchRule> = sqlx::query_as(
+        "SELECT id, pattern, no_force, no_delete, created_at
+           FROM branch_rules WHERE id = $1 AND repo_id = $2",
+    )
+    .bind(id)
+    .bind(repo.id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let current = current.ok_or_else(|| AppError::not_found("no such rule"))?;
+    let no_force = body.no_force.unwrap_or(current.no_force);
+    let no_delete = body.no_delete.unwrap_or(current.no_delete);
+
+    // A rule forbidding nothing looks like protection and is not, which is
+    // worse than no rule at all — but that is a reason to refuse, not to
+    // silently remove what is there.
+    if !no_force && !no_delete {
+        return Err(AppError::bad(
+            "a rule must forbid something — turn the other one on, or remove the rule",
+        ));
+    }
+
+    let row: crate::rules::BranchRule = sqlx::query_as(
+        "UPDATE branch_rules SET no_force = $3, no_delete = $4
+          WHERE id = $1 AND repo_id = $2
+          RETURNING id, pattern, no_force, no_delete, created_at",
+    )
+    .bind(id)
+    .bind(repo.id)
+    .bind(no_force)
+    .bind(no_delete)
+    .fetch_one(&state.db)
+    .await?;
+
+    super::audit(
+        &state,
+        viewer.id(),
+        Some(repo.id),
+        "rule.update",
+        serde_json::json!({
+            "pattern": row.pattern, "no_force": row.no_force, "no_delete": row.no_delete
+        }),
+    )
+    .await;
+    Ok(Json(row))
+}
+
+async fn delete_rule(
+    State(state): State<AppState>,
+    viewer: Viewer,
+    axum::extract::Path((owner, name, id)): axum::extract::Path<(String, String, Uuid)>,
+) -> AppResult<Json<serde_json::Value>> {
+    let (repo, access, _) = super::load_repo(&state, &viewer, &owner, &name).await?;
+    require_admin(access)?;
+
+    // Scoped to the repository, so a rule id from elsewhere is simply absent.
+    let done = sqlx::query("DELETE FROM branch_rules WHERE id = $1 AND repo_id = $2")
+        .bind(id)
+        .bind(repo.id)
+        .execute(&state.db)
+        .await?;
+    if done.rows_affected() == 0 {
+        return Err(AppError::not_found("no such rule"));
+    }
+
+    super::audit(&state, viewer.id(), Some(repo.id), "rule.delete",
+        serde_json::json!({ "id": id })).await;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 /// Size and history counts for one repository.
@@ -957,6 +1152,15 @@ async fn delete_ref(
             return Err(AppError::Conflict(format!(
                 "merge request #{number} is open on {bare} — merge or close it first"
             )));
+        }
+    }
+
+    // Branch rules govern branches, not tags: a tag is moved and deleted by
+    // the release process, and its own protection is the force check on push.
+    if !is_tag && !crate::rules::exempt(viewer.id(), repo.owner_id) {
+        let rules = crate::rules::for_repo(&state.db, repo.id).await?;
+        if let Some(why) = crate::rules::deny_delete(&rules, bare) {
+            return Err(AppError::Forbidden(why));
         }
     }
 

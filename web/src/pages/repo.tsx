@@ -37,6 +37,7 @@ import {
   type Collaborator,
   type Comparison,
   type Upstream,
+  type BranchRule,
   type CrossRef,
   type FileDiff,
   type MergeRequest,
@@ -60,6 +61,7 @@ import { adoptInto } from "../adopt";
 import { dirIcon, fileIcon } from "../file-icon";
 import { confirmAction } from "../components/fkit-dialog";
 import { notify } from "../components/fkit-notice";
+import "../components/fkit-toggle";
 
 type View =
   | { kind: "tree"; ref: string; path: string }
@@ -1650,6 +1652,26 @@ const sheet = css`
     padding: 7px 10px; font-size: 12px; overflow-x: auto; white-space: nowrap; color: var(--muted);
   }
   .cmd b { color: var(--text); font-weight: 400; }
+  /* Adding a protection rule. Boxed with the same inset as a list row and the
+     notice above it, so the three controls down the right edge line up instead
+     of each ending wherever its own container happens to stop. */
+  .mkrule {
+    display: flex; gap: 10px; align-items: center; margin-bottom: 12px;
+    padding: 10px 14px;
+    border: 1px solid var(--border); border-radius: var(--radius);
+    background: var(--raised);
+  }
+  .mkrule input { flex: 1; font-size: 12px; }
+
+  /* The limits a rule imposes, each one its own switch. */
+  .rlim { display: flex; align-items: center; gap: 14px; flex: none; }
+  .rlim .lim {
+    display: flex; align-items: center; gap: 6px;
+    text-transform: none; letter-spacing: 0; font-weight: 400;
+    font-size: 11.5px; color: var(--muted); cursor: pointer; user-select: none;
+    white-space: nowrap;
+  }
+
 `;
 
 @route("*")
@@ -1691,6 +1713,15 @@ export class PageRepo extends LoomElement {
   private get refs(): Ref[] | null {
     return this.refsQuery.data ?? null;
   }
+
+  /** Branch protection. Only fetched where it is shown, which is settings. */
+  @query<BranchRule[]>({
+    url: (el: PageRepo) => `/api/repos/${el.loc!.owner}/${el.loc!.name}/rules`,
+    enabled: (el: PageRepo) =>
+      Boolean(el.loc) && el.loc!.view.kind === "settings",
+    init: { credentials: "same-origin" },
+  })
+  accessor rulesQuery!: ApiState<BranchRule[]>;
   /**
    * Decoration: counts and sizes for the sidebar. A failure here must not take
    * the page with it, which `@fetch` gives for free — the error lands in
@@ -5814,6 +5845,158 @@ fkit push</pre>
   /// Deleting a ref removes a name, not history: the commits stay in the
   /// store, addressable by hash. That is worth saying on the page, because
   /// "delete branch" reads as destructive and here it very nearly is not.
+  /**
+   * Branch protection.
+   *
+   * The two operations worth stopping are the two that destroy work already
+   * pushed. Everything else a rule could govern — who may push at all — is
+   * already answered by access.
+   */
+  private settingsProtection(r: Repo, at: { owner: string; name: string }) {
+    const rules = this.rulesQuery.data ?? [];
+    const has = (p: string) => rules.some((x) => x.pattern === p);
+
+    const add = (pattern: string) =>
+      void this.act(async () => {
+        await api.addBranchRule(at.owner, at.name, {
+          pattern,
+          no_force: true,
+          no_delete: true,
+        });
+        await this.rulesQuery.refetch();
+      }, `${pattern} protected`);
+
+    return (
+      <fkit-section
+        heading="Protected branches"
+        value={rules.length ? `${rules.length} rule${rules.length === 1 ? "" : "s"}` : ""}
+        blurb={`Rules stop a rewrite or a deletion — never an ordinary push, which only ever adds. ${r.owner} owns this repository and is not bound by them, so a mirror pushing with their token keeps working.`}
+      >
+        <form
+          class="mkrule"
+          onSubmit={(e: Event) => {
+            e.preventDefault();
+            const f = e.target as HTMLFormElement;
+            const input = f.elements.namedItem("pattern") as HTMLInputElement;
+            const pattern = input.value.trim();
+            if (!pattern) return;
+            add(pattern);
+            input.value = "";
+          }}
+        >
+          <input
+            name="pattern"
+            placeholder="a branch name, or a prefix like release/*"
+            aria-label="Branch or pattern to protect"
+            required
+          />
+          <button class="primary" type="submit" disabled={this.busy}>
+            Protect
+          </button>
+        </form>
+
+        {/* Said plainly rather than left to be inferred from an empty list.
+            The default branch is the one every clone lands on and every merge
+            request targets, so it is the one where a rewrite costs the most —
+            and not protecting it is a decision people make by never having
+            thought about it. Only shown once the rules have actually loaded,
+            so it cannot flash on a page that turns out to be fine. */}
+        {this.rulesQuery.ok && !has(r.default_branch) ? (
+          <fkit-notice
+            tone="warn"
+            title={`${r.default_branch} is not protected.`}
+            message="Any collaborator who can push can rewrite or delete it."
+          >
+            <button
+              slot="action"
+              class="primary"
+              disabled={this.busy}
+              onClick={() => add(r.default_branch)}
+            >
+              Protect {r.default_branch}
+            </button>
+          </fkit-notice>
+        ) : null}
+
+        <fkit-list>
+          {this.rulesQuery.loading && rules.length === 0 ? (
+            <fkit-empty><span class="sk" style="width:180px"></span></fkit-empty>
+          ) : rules.length === 0 ? (
+            <fkit-empty>
+              No rules. Anyone who can push can rewrite or delete any branch.
+            </fkit-empty>
+          ) : (
+            rules.map((rule) => (
+              <fkit-row
+                loom-key={rule.id}
+                icon="lock"
+                name={rule.pattern}
+                meta={
+                  rule.no_force && rule.no_delete
+                    ? "rewriting and deleting are refused"
+                    : rule.no_force
+                      ? "rewriting is refused; it may still be deleted"
+                      : "deleting is refused; it may still be rewritten"
+                }
+              >
+                {/* Each limit on its own, because they are separate decisions:
+                    refusing to let a release branch be rewritten while still
+                    allowing it to be retired is a coherent policy. */}
+                <span class="rlim">
+                  {(
+                    [
+                      ["no_force", "rewrite", rule.no_force],
+                      ["no_delete", "delete", rule.no_delete],
+                    ] as [("no_force" | "no_delete"), string, boolean][]
+                  ).map(([field, label, on]) => (
+                    <label class="lim" title={`Refuse ${label} on ${rule.pattern}`}>
+                      <fkit-toggle
+                        checked={on}
+                        label={`refuse ${label} on ${rule.pattern}`}
+                        onToggle={(e: Event) => {
+                          const next = (e as CustomEvent<boolean>).detail;
+                          void this.act(async () => {
+                            await api.updateBranchRule(at.owner, at.name, rule.id, {
+                              [field]: next,
+                            });
+                            await this.rulesQuery.refetch();
+                          });
+                        }}
+                      ></fkit-toggle>
+                      no {label}
+                    </label>
+                  ))}
+                </span>
+                <button
+                  class="revoke"
+                  disabled={this.busy}
+                  onClick={async () => {
+                    const ok = await confirmAction({
+                      title: `Stop protecting ${rule.pattern}?`,
+                      effects: [
+                        { text: "Anyone who can push may rewrite or delete these branches" },
+                        { text: "Nothing already pushed is changed", tone: "safe" },
+                      ],
+                      confirm: "remove rule",
+                      danger: true,
+                    });
+                    if (!ok) return;
+                    await this.act(async () => {
+                      await api.deleteBranchRule(at.owner, at.name, rule.id);
+                      await this.rulesQuery.refetch();
+                    }, `${rule.pattern} unprotected`);
+                  }}
+                >
+                  remove
+                </button>
+              </fkit-row>
+            ))
+          )}
+        </fkit-list>
+      </fkit-section>
+    );
+  }
+
   private settingsBranches(r: Repo, at: { owner: string; name: string }) {
     const branches = this.branches();
     const tags = this.tags();
@@ -5835,6 +6018,8 @@ fkit push</pre>
 
     return (
       <fkit-page>
+        {this.settingsProtection(r, at)}
+
         <fkit-section
           heading="Branches"
           value={loading ? "" : `${branches.length} · default ${r.default_branch}`}

@@ -76,6 +76,27 @@ struct PgHost {
 }
 
 impl PgHost {
+    /// Why a rewrite of `branch` is refused, if it is.
+    ///
+    /// Fails closed: if the rules cannot be read, the answer is no. Letting a
+    /// force-push through because a query failed would make the protection
+    /// worth nothing exactly when the server is unhealthy.
+    async fn protection_denies(&self, branch: &str) -> anyhow::Result<Option<String>> {
+        if crate::rules::exempt(self.user_id, self.repo.owner_id) {
+            return Ok(None);
+        }
+        match crate::rules::for_repo(&self.state.db, self.repo.id).await {
+            Ok(rules) => Ok(crate::rules::deny_force(&rules, branch)),
+            Err(e) => {
+                tracing::error!("could not read branch rules for {}: {e}", self.label);
+                Ok(Some(
+                    "branch protection could not be checked, so this push is refused"
+                        .to_string(),
+                ))
+            }
+        }
+    }
+
     /// Record which account delivered these commits.
     ///
     /// Walks back from the new tip and stops at the first commit already
@@ -222,10 +243,22 @@ impl RepoHost for PgHost {
                     if !force {
                         return Ok(RefUpdate::NotFastForward);
                     }
-                } else if !force && !is_ancestor(&self.store, old, tip)? {
+                } else {
                     // Reachability is a pure question about the object store,
                     // so it is safe to answer while holding the row lock.
-                    return Ok(RefUpdate::NotFastForward);
+                    let adds_only = is_ancestor(&self.store, old, tip)?;
+                    if !adds_only {
+                        // A rewrite: it drops commits that were already here.
+                        // Protection is about exactly this, so it is checked
+                        // whether or not --force was passed — the flag says
+                        // the pusher meant it, not that they may.
+                        if let Some(why) = self.protection_denies(branch).await? {
+                            return Ok(RefUpdate::Refused(why));
+                        }
+                        if !force {
+                            return Ok(RefUpdate::NotFastForward);
+                        }
+                    }
                 }
             }
 

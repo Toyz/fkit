@@ -40,15 +40,21 @@ const noticeSheet = css`
   :host([hidden]) { display: none; }
 
   .n {
-    display: flex; align-items: flex-start; gap: 9px;
-    padding: 9px 12px; margin-bottom: 12px;
+    /* Centred, not top-aligned. With an action beside it the button centres
+       itself against the box while top-aligned text sits above that line, so
+       the two never met. These messages are a line or two; centring the icon
+       with them is right at that length. */
+    display: flex; align-items: center; gap: 9px;
+    /* Matches a list row's inset, so an action here lines up with the actions
+       in the rows underneath rather than sitting a couple of pixels off. */
+    padding: 10px 14px; margin-bottom: 12px;
     border: 1px solid color-mix(in srgb, var(--tc) 40%, transparent);
     border-radius: var(--radius);
     background: color-mix(in srgb, var(--tc) 7%, transparent);
     font-family: var(--sans); font-size: 12.5px; line-height: 1.5;
     color: var(--text);
   }
-  .ic { flex: none; margin-top: 1px; color: var(--tc); display: flex; }
+  .ic { flex: none; color: var(--tc); display: flex; }
   .msg { flex: 1; min-width: 0; overflow-wrap: anywhere; }
   .msg .t { font-weight: 600; }
   .x {
@@ -56,6 +62,11 @@ const noticeSheet = css`
     color: var(--faint); display: flex; border-radius: var(--radius);
   }
   .x:hover { background: var(--raised); color: var(--text); }
+
+  /* Whatever fixes the thing the notice is about, beside it. A notice that
+     names a problem and leaves you to go and find the control for it is half
+     a message. */
+  ::slotted([slot="action"]) { flex: none; }
 `;
 
 /** A message that sits beside what it is about. */
@@ -80,6 +91,7 @@ export class FkitNotice extends LoomElement {
           {this.title ? <span class="t">{this.title} </span> : null}
           {this.message}
         </span>
+        <slot name="action"></slot>
         {this.dismissible ? (
           <button
             type="button"
