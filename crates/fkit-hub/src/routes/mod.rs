@@ -64,6 +64,8 @@ pub fn repo_view(repo: &RepoRow, owner: &str, access: Access) -> RepoView {
         head: None,
         branches: 0,
         tags: 0,
+        open_issues: 0,
+        open_merges: 0,
     }
 }
 
@@ -96,12 +98,40 @@ pub async fn attach_heads(state: &AppState, views: &mut [RepoView]) {
             }
         };
 
+    // Two more bulk counts rather than two queries per repository. A listing
+    // is worth showing without them, so a failure here is logged and dropped
+    // the same way the refs are.
+    let mut open: HashMap<uuid::Uuid, (i64, i64)> = HashMap::new();
+    let counts: Result<Vec<(uuid::Uuid, i64, i64)>, _> = sqlx::query_as(
+        "SELECT r.id,
+                (SELECT COUNT(*) FROM issues i
+                  WHERE i.repo_id = r.id AND i.state = 'open'),
+                (SELECT COUNT(*) FROM merge_requests m
+                  WHERE m.repo_id = r.id AND m.state = 'open')
+           FROM repos r WHERE r.id = ANY($1)",
+    )
+    .bind(&ids)
+    .fetch_all(&state.db)
+    .await;
+    match counts {
+        Ok(rows) => {
+            for (id, issues, merges) in rows {
+                open.insert(id, (issues, merges));
+            }
+        }
+        Err(e) => tracing::warn!("listing open counts: {e}"),
+    }
+
     let mut tips: HashMap<uuid::Uuid, HashMap<String, Vec<u8>>> = HashMap::new();
     for (id, name, target) in rows {
         tips.entry(id).or_default().insert(name, target);
     }
 
     for v in views.iter_mut() {
+        if let Some(&(issues, merges)) = open.get(&v.id) {
+            v.open_issues = issues;
+            v.open_merges = merges;
+        }
         let Some(refs) = tips.get(&v.id) else { continue };
         // Counted separately: `refs` is every ref, and tags live in the same
         // namespace. Counting the lot reported a repository with one branch

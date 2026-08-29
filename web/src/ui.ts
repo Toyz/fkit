@@ -27,6 +27,17 @@ export const base = css`
   /* Wide, left-anchored. A file browser wants horizontal room, not a column. */
   .wrap { max-width: 1440px; margin: 0 auto; padding: 0 18px; }
 
+  /* Controls that ride a section heading rather than belonging to a field —
+     a filter over the list below it, a segmented state picker, the button
+     that adds to it. Defined here because three pages wanted it and three
+     copies is how they drift apart. */
+  .head-acts {
+    display: flex; align-items: center; gap: 9px;
+    flex: none; white-space: nowrap;
+  }
+  .head-acts .btn { font-size: 11.5px; }
+  .head-acts input { width: 170px; font-size: 12px; height: 24px; padding: 0 9px; }
+
   h1, h2, h3 { margin: 0; font-weight: 600; letter-spacing: 0; }
   h1 { font-size: 15px; }
   h2 { font-size: 13px; }
@@ -170,5 +181,50 @@ export const base = css`
   }
   @media (prefers-reduced-motion: reduce) {
     .sk { animation: none; opacity: .55; }
+  }
+`;
+
+/**
+ * The app's button, for components that render their own.
+ *
+ * A shadow root inherits custom properties but not rules, so `button` inside
+ * one falls back to the browser's default — which is how a Comment button ends
+ * up looking like it belongs to a different program. This is the same
+ * declaration `base` makes for the light DOM, kept here for the roots that
+ * cannot see it.
+ */
+export const buttons = css`
+  button {
+    font: inherit; font-size: 12px;
+    padding: 4px 10px;
+    border-radius: var(--radius);
+    border: 1px solid var(--border-hi);
+    background: transparent; color: var(--text);
+    cursor: pointer;
+    display: inline-flex; align-items: center; gap: 6px;
+    white-space: nowrap;
+    transition: background .1s, border-color .1s, color .1s;
+  }
+  button:hover { background: var(--raised); border-color: var(--faint); }
+  button:active { transform: translateY(0.5px); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button:disabled:hover { background: transparent; border-color: var(--border-hi); }
+
+  button.primary {
+    border-color: var(--accent); color: var(--accent); background: var(--accent-weak);
+  }
+  button.primary:hover { background: var(--accent); color: var(--bg); }
+  button.primary:disabled:hover { background: var(--accent-weak); color: var(--accent); }
+
+  button.bare { border-color: transparent; color: var(--muted); padding: 4px 7px; }
+  button.bare:hover { background: var(--raised); color: var(--text); border-color: transparent; }
+
+  button.danger {
+    border-color: color-mix(in srgb, var(--removed) 50%, transparent);
+    color: var(--removed);
+  }
+  button.danger:hover {
+    background: color-mix(in srgb, var(--removed) 12%, transparent);
+    border-color: var(--removed);
   }
 `;

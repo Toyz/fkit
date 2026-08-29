@@ -100,6 +100,10 @@ pub struct RepoView {
     /// How many tags. Counted apart from branches: both are refs, and tags
     /// share the branch namespace behind a prefix.
     pub tags: i64,
+    /// Open issues and open merge requests, so the tabs can carry a number
+    /// without each of them fetching its own list to count it.
+    pub open_issues: i64,
+    pub open_merges: i64,
 }
 
 /// A one-line summary of a commit, for a listing that should say what the

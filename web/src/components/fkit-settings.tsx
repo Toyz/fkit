@@ -255,6 +255,7 @@ const itemSheet = css`
   /* Stacked, not inline: as plain spans these ran together into
      "ChromeSigned in just now". */
   .main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  ::slotted([slot="main"]) { flex: 1; min-width: 0; }
   .name { font-size: 12.5px; color: var(--text); }
   .meta {
     font-size: 11.5px; color: var(--faint); margin-top: 2px;
@@ -279,10 +280,18 @@ export class FkitRow extends LoomElement {
             <loom-icon name={this.icon} size={14}></loom-icon>
           </span>
         ) : null}
-        <span class="main">
-          <span class="name">{this.name}</span>
-          {this.meta ? <span class="meta">{this.meta}</span> : null}
-        </span>
+        {/* A row is usually a name over a line of metadata. When what it
+            holds does not fit that — an issue title that is also a link, say —
+            the whole middle is slotted instead of the two props being bent
+            into a shape they do not have. */}
+        {this.name || this.meta ? (
+          <span class="main">
+            <span class="name">{this.name}</span>
+            {this.meta ? <span class="meta">{this.meta}</span> : null}
+          </span>
+        ) : (
+          <slot name="main"></slot>
+        )}
         <slot></slot>
       </>
     );

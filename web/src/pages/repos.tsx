@@ -10,13 +10,6 @@ import { repoRow, repoRowSheet, spansOwners } from "../repo-row";
 import { Session } from "../session";
 
 const sheet = css`
-  /* The index was the one page the rest of the app's vocabulary never reached:
-     its own bar, its own count, its own filter placement. It uses the same
-     heading every other page does now — accent under the word, the state of
-     the list at the right of the rule, actions at the outer edge. */
-  .head-acts { display: flex; align-items: center; gap: 9px; }
-  .head-acts input { width: 170px; font-size: 12px; height: 24px; padding: 0 9px; }
-  .head-acts .btn { font-size: 11.5px; }
 
   .empty { padding: 40px 14px; text-align: center; }
   .empty h2 { color: var(--muted); }

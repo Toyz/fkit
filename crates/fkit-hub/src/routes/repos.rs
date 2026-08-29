@@ -317,7 +317,12 @@ async fn get_repo(
     Path((owner, name)): Path<(String, String)>,
 ) -> AppResult<Json<RepoView>> {
     let (repo, access, owner_lc) = super::load_repo(&state, &viewer, &owner, &name).await?;
-    Ok(Json(super::repo_view(&repo, &owner_lc, access)))
+    // The same decoration the listing gets: the tip, the ref counts, and how
+    // much is open. The page's tabs read the last of those, and were showing
+    // nothing because this endpoint skipped the step that fills them in.
+    let mut views = vec![super::repo_view(&repo, &owner_lc, access)];
+    super::attach_heads(&state, &mut views).await;
+    Ok(Json(views.remove(0)))
 }
 
 async fn update_repo(

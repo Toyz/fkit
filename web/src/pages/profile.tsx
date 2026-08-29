@@ -100,10 +100,6 @@ const sheet = css`
   }
   .empty .btn { margin-top: 14px; }
 
-  /* Both live on the Repositories heading, so they need to sit on its line
-     rather than on the text baseline a slot would otherwise give them. */
-  .head-acts { display: flex; align-items: center; gap: 9px; }
-  .head-acts .btn { font-size: 11.5px; }
 `;
 
 @route("/:owner")

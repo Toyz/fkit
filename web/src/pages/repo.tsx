@@ -24,6 +24,7 @@ import {
   syncUrl,
   relativeTime,
   type Comment,
+  type Issue,
   type GcReport,
   type BlobResponse,
   type TreeResponse,
@@ -62,6 +63,8 @@ type View =
   | { kind: "tags" }
   | { kind: "merges" }
   | { kind: "merge"; number: number }
+  | { kind: "issues" }
+  | { kind: "issue"; number: number }
   | { kind: "settings"; section: string }
   | { kind: "unknown" };
 
@@ -98,6 +101,14 @@ function parse(): { owner: string; name: string; view: View } | null {
     return { owner, name, view: { kind: "settings", section: rest[0] ?? "general" } };
   }
   if (kind === "tags") return { owner, name, view: { kind: "tags" } };
+  if (kind === "issues") {
+    const n = rest[0] ? Number(rest[0]) : NaN;
+    return {
+      owner,
+      name,
+      view: Number.isFinite(n) ? { kind: "issue", number: n } : { kind: "issues" },
+    };
+  }
   if (kind === "merges") {
     const n = rest[0] ? Number(rest[0]) : NaN;
     return {
@@ -585,6 +596,40 @@ const sheet = css`
     margin: 12px 0 0; line-height: 1.5; max-width: 78ch;
   }
 
+  /* A count riding a tab. Quiet by default; it picks up the accent on the
+     tab you are actually on, the same way the label does. */
+  .tabs .tabn {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 16px; height: 16px; padding: 0 5px; margin-left: 2px;
+    border-radius: 999px; background: var(--raised); color: var(--muted);
+    font-size: 10.5px; font-variant-numeric: tabular-nums;
+  }
+  .tabs a.on .tabn { background: var(--accent-weak); color: var(--accent); }
+
+  /* ---- issues ---- */
+  .seg { display: flex; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+  .seg button {
+    border: 0; border-radius: 0; background: transparent; color: var(--muted);
+    font-size: 11.5px; padding: 3px 10px; height: 24px;
+  }
+  .seg button + button { border-left: 1px solid var(--border); }
+  .seg button:hover { background: var(--raised); color: var(--text); }
+  .seg button.on { background: var(--raised); color: var(--text); }
+
+  /* The row component centres one line; an issue needs two, so the whole of
+     it goes in the slot rather than fighting the name/meta props. */
+  .issue-line { display: flex; flex-direction: column; flex: 1; min-width: 0; gap: 2px; }
+  .issue-line .t { font-size: 13px; color: var(--text); text-decoration: none; }
+  .issue-line .t:hover { color: var(--accent); }
+  .issue-line .sub { font-size: 11.5px; color: var(--faint); }
+  .cbadge { display: flex; align-items: center; gap: 4px; color: var(--faint); font-size: 11.5px; }
+
+  .issue-meta {
+    font-family: var(--sans); font-size: 12px; color: var(--muted);
+    margin: -4px 0 4px;
+  }
+  .new-issue fkit-field:last-of-type { margin-bottom: 0; }
+
   /* ---- reviewing a change ----------------------------------------------
    *
    * A file tree beside the diff rather than above it. Twenty stacked panels
@@ -1017,6 +1062,14 @@ export class PageRepo extends LoomElement {
   /// is open at a time — two half-written comments on one screen is a way to
   /// lose one.
   @reactive accessor writingAt = "";
+  /// Which issues the list is showing. Part of the query URL, so changing it
+  /// refetches rather than filtering a list that was never loaded.
+  @reactive accessor issueFilter: "open" | "closed" | "all" = "open";
+  /// Set while composing a new issue, so the form and the list are one page.
+  @reactive accessor newIssue = false;
+  /// The comment currently open for editing. One at a time, for the same
+  /// reason only one line composer is open at a time.
+  @reactive accessor editing = "";
   /// Which file the tree should highlight.
   @reactive accessor viewing = "";
   /**
@@ -1089,6 +1142,37 @@ export class PageRepo extends LoomElement {
     init: { credentials: "same-origin" },
   })
   accessor commentsQuery!: ApiState<Comment[]>;
+
+  @query<Issue[]>({
+    url: (el: PageRepo) =>
+      `/api/repos/${el.loc!.owner}/${el.loc!.name}/issues?state=${el.issueFilter}`,
+    enabled: (el: PageRepo) =>
+      Boolean(el.loc && el.repoQuery.data && el.loc.view.kind === "issues"),
+    init: { credentials: "same-origin" },
+  })
+  accessor issuesQuery!: ApiState<Issue[]>;
+
+  @query<Issue>({
+    url: (el: PageRepo) =>
+      `/api/repos/${el.loc!.owner}/${el.loc!.name}/issues/${
+        el.loc!.view.kind === "issue" ? el.loc!.view.number : 0
+      }`,
+    enabled: (el: PageRepo) =>
+      Boolean(el.loc && el.repoQuery.data && el.loc.view.kind === "issue"),
+    init: { credentials: "same-origin" },
+  })
+  accessor issueQuery!: ApiState<Issue>;
+
+  @query<Comment[]>({
+    url: (el: PageRepo) =>
+      `/api/repos/${el.loc!.owner}/${el.loc!.name}/issues/${
+        el.loc!.view.kind === "issue" ? el.loc!.view.number : 0
+      }/comments`,
+    enabled: (el: PageRepo) =>
+      Boolean(el.loc && el.repoQuery.data && el.loc.view.kind === "issue"),
+    init: { credentials: "same-origin" },
+  })
+  accessor issueTalkQuery!: ApiState<Comment[]>;
 
   /// Null while unknown, which is not the same as "nobody has said anything"
   /// — the difference decides whether the page shows a skeleton or a prompt.
@@ -1861,6 +1945,80 @@ export class PageRepo extends LoomElement {
     );
   }
 
+  /// One comment, with the actions its author gets.
+  ///
+  /// Written once because the merge request conversation, a line thread and an
+  /// issue all render the same thing, and three copies is how they drift.
+  private renderComment(c: Comment, refetch: () => Promise<void>, note?: string) {
+    const at = this.loc!;
+    const me = this.session.current?.username;
+    const mine = !!me && c.author === me;
+
+    if (this.editing === c.id) {
+      return (
+        <fkit-composer
+          loom-key={`edit-${c.id}`}
+          compact
+          label="Save"
+          value={c.body}
+          busy={this.busy}
+          onSend={(e: Event) => {
+            const body = (e as CustomEvent<string>).detail;
+            void this.act(async () => {
+              await api.editComment(at.owner, at.name, c.id, body);
+              this.editing = "";
+              await refetch();
+            });
+          }}
+        >
+          <button type="button" slot="extra" class="bare" onClick={() => (this.editing = "")}>
+            cancel
+          </button>
+        </fkit-composer>
+      );
+    }
+
+    return (
+      <fkit-comment
+        loom-key={c.id}
+        author={c.author ?? ""}
+        when={note ? `${relativeTime(c.created_at)} · ${note}` : relativeTime(c.created_at)}
+        body={c.body}
+        edited={!!c.edited_at}
+        mine={mine}
+      >
+        {mine ? (
+          <span slot="actions">
+            <button type="button" class="bare" onClick={() => (this.editing = c.id)}>
+              edit
+            </button>
+            <button
+              type="button"
+              class="bare danger"
+              onClick={() =>
+                void (async () => {
+                  const ok = await confirmAction({
+                    title: "Delete this comment?",
+                    body: "It is removed for everyone. This cannot be undone.",
+                    confirm: "Delete",
+                    danger: true,
+                  });
+                  if (!ok) return;
+                  await this.act(async () => {
+                    await api.deleteComment(at.owner, at.name, c.id);
+                    await refetch();
+                  });
+                })()
+              }
+            >
+              delete
+            </button>
+          </span>
+        ) : null}
+      </fkit-comment>
+    );
+  }
+
   /// Comments anchored to one line of one side of a file.
   ///
   /// Matched on the *content* hash, not the path: the same file at a different
@@ -1892,29 +2050,11 @@ export class PageRepo extends LoomElement {
     side: "old" | "new",
     line: number,
   ) {
-    const me = this.session.current?.username;
     const open = this.writingAt === key;
 
     return (
       <div class="thread">
-        {here.map((c) => (
-          <fkit-comment
-            loom-key={c.id}
-            author={c.author ?? ""}
-            when={relativeTime(c.created_at)}
-            body={c.body}
-            edited={!!c.edited_at}
-            mine={c.author === me}
-          >
-            {c.author === me ? (
-              <span slot="actions">
-                <button class="bare danger" onClick={() => void this.removeComment(c.id)}>
-                  delete
-                </button>
-              </span>
-            ) : null}
-          </fkit-comment>
-        ))}
+        {here.map((c) => this.renderComment(c, () => this.commentsQuery.refetch()))}
 
         {open ? (
           <fkit-composer
@@ -1957,22 +2097,6 @@ export class PageRepo extends LoomElement {
       for (const el of this.shadowRoot?.querySelectorAll("fkit-composer") ?? []) {
         (el as HTMLElement & { clear(): void }).clear();
       }
-    });
-  }
-
-  private async removeComment(id: string) {
-    const at = this.loc!;
-    if (at.view.kind !== "merge") return;
-    const ok = await confirmAction({
-      title: "Delete this comment?",
-      body: "It is removed for everyone. This cannot be undone.",
-      confirm: "Delete",
-      danger: true,
-    });
-    if (!ok) return;
-    await this.act(async () => {
-      await api.deleteComment(at.owner, at.name, id);
-      await this.commentsQuery.refetch();
     });
   }
 
@@ -2329,6 +2453,238 @@ fkit push</pre>
     );
   }
 
+  /// The issue list, and the form that adds to it.
+  private renderIssues() {
+    const at = this.loc!;
+    const list = this.issuesQuery.data ?? null;
+    const tabs: ["open" | "closed" | "all", string][] = [
+      ["open", "open"],
+      ["closed", "closed"],
+      ["all", "all"],
+    ];
+
+    return (
+      <div class="wrap">
+        <fkit-section
+          heading="Issues"
+          value={list ? `${list.length} ${this.issueFilter}` : ""}
+        >
+          <span slot="action" class="head-acts">
+            <span class="seg">
+              {tabs.map(([id, label]) => (
+                <button
+                  loom-key={id}
+                  class={this.issueFilter === id ? "on" : ""}
+                  onClick={() => (this.issueFilter = id)}
+                >
+                  {label}
+                </button>
+              ))}
+            </span>
+            {this.session.isAuthed ? (
+              <button class="btn" onClick={() => (this.newIssue = !this.newIssue)}>
+                <loom-icon name="plus" size={11}></loom-icon> new issue
+              </button>
+            ) : null}
+          </span>
+
+          <fkit-modal
+            open={this.newIssue}
+            heading="New issue"
+            width="680px"
+            onClose={() => (this.newIssue = false)}
+          >
+            <form
+              id="new-issue"
+              class="new-issue"
+              onSubmit={(e: Event) => {
+                e.preventDefault();
+                const f = e.target as HTMLFormElement;
+                const title = (f.elements.namedItem("title") as HTMLInputElement).value;
+                const md = f.querySelector("fkit-composer") as
+                  | (HTMLElement & { text: string })
+                  | null;
+                void this.act(async () => {
+                  const made = await api.createIssue(at.owner, at.name, {
+                    title,
+                    body: md?.text ?? "",
+                  });
+                  this.newIssue = false;
+                  go(`/${at.owner}/${at.name}/issues/${made.number}`);
+                });
+              }}
+            >
+              <fkit-field label="Title" size="full">
+                <input name="title" placeholder="What is wrong, or what should exist" required />
+              </fkit-field>
+              <fkit-field
+                label="Description"
+                help="Optional. What you did, what happened, and what you expected instead. Markdown works."
+                size="full"
+              >
+                {/* The composer rather than a bare textarea, so writing an
+                    issue and commenting on one are the same box. Its own send
+                    button is hidden here: the modal's footer owns the action. */}
+                <fkit-composer headless placeholder="Describe it"></fkit-composer>
+              </fkit-field>
+            </form>
+
+            <span slot="footer">
+              <button type="button" class="bare" onClick={() => (this.newIssue = false)}>
+                Cancel
+              </button>
+              <button
+                type="button"
+                class="primary"
+                disabled={this.busy}
+                onClick={() => {
+                  const f = this.shadowRoot?.querySelector("#new-issue") as HTMLFormElement | null;
+                  // requestSubmit rather than submit(), so `required` on the
+                  // title is actually enforced.
+                  f?.requestSubmit();
+                }}
+              >
+                Open issue
+              </button>
+            </span>
+          </fkit-modal>
+
+          <fkit-list>
+            {list === null ? (
+              <fkit-empty><span class="sk" style="width:220px"></span></fkit-empty>
+            ) : list.length === 0 ? (
+              <fkit-empty>
+                {this.issueFilter === "open"
+                  ? "No open issues. Anything wrong, or anything missing, goes here."
+                  : `No ${this.issueFilter} issues.`}
+              </fkit-empty>
+            ) : (
+              list.map((i) => {
+                const href = `/${at.owner}/${at.name}/issues/${i.number}`;
+                return (
+                  <fkit-row
+                    loom-key={i.number}
+                    icon={i.state === "open" ? "alert" : "check"}
+                    current={i.state === "open"}
+                    name=""
+                    meta=""
+                  >
+                    <span slot="main" class="issue-line">
+                      <a class="t" href={href} onClick={linkHandler(href)}>{i.title}</a>
+                      <span class="sub">
+                        #{i.number} opened {relativeTime(i.created_at)}
+                        {i.author ? ` by ${i.author}` : ""}
+                        {i.state === "closed" && i.closed_at
+                          ? ` · closed ${relativeTime(i.closed_at)}`
+                          : ""}
+                      </span>
+                    </span>
+                    {i.comments > 0 ? (
+                      <span class="cbadge">
+                        <loom-icon name="merge" size={11}></loom-icon> {i.comments}
+                      </span>
+                    ) : null}
+                  </fkit-row>
+                );
+              })
+            )}
+          </fkit-list>
+        </fkit-section>
+      </div>
+    );
+  }
+
+  /// One issue: what it says, and everything said about it.
+  private renderIssue(number: number) {
+    const at = this.loc!;
+    const i = this.issueQuery.data ?? null;
+    const talk = this.issueTalkQuery.data ?? null;
+    const me = this.session.current?.username;
+
+    if (this.issueQuery.error) {
+      return (
+        <div class="wrap">
+          <div class="panel"><div class="empty"><h2>no such issue</h2></div></div>
+        </div>
+      );
+    }
+
+    return (
+      <div class="wrap">
+        <fkit-section
+          heading={i ? i.title : "Issue"}
+          value={i ? `#${i.number}` : ""}
+        >
+          {i ? (
+            <span slot="action" class="head-acts">
+              <span class={`tag ${i.state === "open" ? "on" : ""}`}>{i.state}</span>
+              {this.session.isAuthed ? (
+                <button
+                  disabled={this.busy}
+                  onClick={() =>
+                    void this.act(async () => {
+                      await api.setIssueState(at.owner, at.name, i.number, i.state === "closed");
+                      await this.issueQuery.refetch();
+                    })
+                  }
+                >
+                  {i.state === "open" ? "Close issue" : "Reopen"}
+                </button>
+              ) : null}
+            </span>
+          ) : null}
+
+          {i === null ? (
+            <span class="sk" style="width:260px"></span>
+          ) : (
+            <>
+              <div class="issue-meta">
+                {i.author ?? "someone"} opened this {relativeTime(i.created_at)}
+              </div>
+
+              <div class="talk">
+                {i.body ? (
+                  <fkit-comment
+                    author={i.author ?? ""}
+                    when={relativeTime(i.created_at)}
+                    body={i.body}
+                    mine={i.author === me}
+                  ></fkit-comment>
+                ) : null}
+
+                {talk === null ? (
+                  <span class="sk" style="width:200px"></span>
+                ) : (
+                  talk.map((c) =>
+                    this.renderComment(c, () => this.issueTalkQuery.refetch()),
+                  )
+                )}
+
+                {this.session.isAuthed ? (
+                  <fkit-composer
+                    label="Comment"
+                    placeholder="Add to this issue"
+                    busy={this.busy}
+                    onSend={(e: Event) => {
+                      const body = (e as CustomEvent<string>).detail;
+                      void this.act(async () => {
+                        await api.commentOnIssue(at.owner, at.name, number, { body });
+                        await this.issueTalkQuery.refetch();
+                        for (const el of this.shadowRoot?.querySelectorAll("fkit-composer") ?? []) {
+                          (el as HTMLElement & { clear(): void }).clear();
+                        }
+                      });
+                    }}
+                  ></fkit-composer>
+                ) : null}
+              </div>
+            </>
+          )}
+        </fkit-section>
+      </div>
+    );
+  }
+
   private renderMergeList() {
     const at = this.loc!;
     const list = this.merges;
@@ -2607,7 +2963,6 @@ fkit push</pre>
   private renderOutdated(f: FileDiff) {
     const stale = this.staleComments(f);
     if (stale.length === 0) return null;
-    const me = this.session.current?.username;
 
     return (
       <div class="thread-out">
@@ -2615,24 +2970,9 @@ fkit push</pre>
           {stale.length} {stale.length === 1 ? "comment" : "comments"} on an earlier version of{" "}
           <b>{f.path}</b>. The lines they were written against have changed.
         </div>
-        {stale.map((c) => (
-          <fkit-comment
-            loom-key={c.id}
-            author={c.author ?? ""}
-            when={`${relativeTime(c.created_at)} · line ${c.line}`}
-            body={c.body}
-            edited={!!c.edited_at}
-            mine={c.author === me}
-          >
-            {c.author === me ? (
-              <span slot="actions">
-                <button class="bare danger" onClick={() => void this.removeComment(c.id)}>
-                  delete
-                </button>
-              </span>
-            ) : null}
-          </fkit-comment>
-        ))}
+        {stale.map((c) =>
+          this.renderComment(c, () => this.commentsQuery.refetch(), `line ${c.line}`),
+        )}
       </div>
     );
   }
@@ -2641,7 +2981,6 @@ fkit push</pre>
   private renderConversation(number: number) {
     const all = this.comments;
     const talk = (all ?? []).filter((c) => !c.blob);
-    const me = this.session.current?.username;
 
     return (
       <div class="talk">
@@ -2655,24 +2994,7 @@ fkit push</pre>
         ) : talk.length === 0 ? (
           <div class="none">Nothing said yet about this change as a whole.</div>
         ) : (
-          talk.map((c) => (
-            <fkit-comment
-              loom-key={c.id}
-              author={c.author ?? ""}
-              when={relativeTime(c.created_at)}
-              body={c.body}
-              edited={!!c.edited_at}
-              mine={c.author === me}
-            >
-              {c.author === me ? (
-                <span slot="actions">
-                  <button class="bare danger" onClick={() => void this.removeComment(c.id)}>
-                    delete
-                  </button>
-                </span>
-              ) : null}
-            </fkit-comment>
-          ))
+          talk.map((c) => this.renderComment(c, () => this.commentsQuery.refetch()))
         )}
 
         {this.session.isAuthed ? (
@@ -3318,15 +3640,21 @@ fkit push</pre>
         ? "commits"
         : v.kind === "merge"
           ? "merges"
+          : v.kind === "issue"
+            ? "issues"
           : v.kind === "tags"
             ? "tree"
             : v.kind;
     const other =
       this.branches().find((b) => b.name !== r.default_branch)?.name ?? r.default_branch;
-    const tabs: [string, string, string, string][] = [
+    // The trailing number is what is *open*, which is the only count anyone
+    // is deciding anything from; a total including years of closed issues
+    // would be a bigger number saying less.
+    const tabs: [string, string, string, string, number?][] = [
       ["tree", "files", "file", `/${at.owner}/${at.name}/tree/${ref}`],
       ["commits", "history", "history", `/${at.owner}/${at.name}/commits/${ref}`],
-      ["merges", "merges", "merge", `/${at.owner}/${at.name}/merges`],
+      ["issues", "issues", "alert", `/${at.owner}/${at.name}/issues`, r.open_issues],
+      ["merges", "merges", "merge", `/${at.owner}/${at.name}/merges`, r.open_merges],
       [
         "compare",
         "compare",
@@ -3359,10 +3687,13 @@ fkit push</pre>
           </div>
           {r.description ? <div class="desc">{r.description}</div> : null}
           <div class="tabs">
-            {tabs.map(([key, label, ic, href]) => (
+            {tabs.map(([key, label, ic, href, count]) => (
               <a class={tab === key ? "on" : ""} href={href} onClick={linkHandler(href)}>
                 <loom-icon name={ic} size={12}></loom-icon>
                 {label}
+                {/* Zero is not worth a badge — an empty issue tracker should
+                    look empty rather than decorated with a nought. */}
+                {count ? <span class="tabn">{count}</span> : null}
               </a>
             ))}
           </div>
@@ -3381,6 +3712,10 @@ fkit push</pre>
           this.renderCompare()
         ) : v.kind === "tags" ? (
           this.renderTags()
+        ) : v.kind === "issues" ? (
+          this.renderIssues()
+        ) : v.kind === "issue" ? (
+          this.renderIssue(v.number)
         ) : v.kind === "merges" ? (
           this.renderMergeList()
         ) : v.kind === "merge" ? (

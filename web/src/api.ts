@@ -41,6 +41,9 @@ export interface Repo {
   head: Head | null;
   branches: number;
   tags: number;
+  /** Open counts, so a tab can carry a number without fetching a list. */
+  open_issues: number;
+  open_merges: number;
 }
 
 export interface Issue {
