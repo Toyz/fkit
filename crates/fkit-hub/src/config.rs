@@ -432,16 +432,6 @@ secure_cookies = false
 # it there lets anyone mint a new identity per request and skip the limit.
 trust_proxy = false
 
-[cache]
-# Object bytes held in this process. The store is content-addressed, so a
-# cached object can never be stale — only unwanted.
-memory_mb = 64
-ttl_secs = 1800
-# A shared second tier. Leave unset on a single host with local storage: a
-# round trip to Redis costs more than reading the object off disk, so it only
-# pays when a miss is expensive — several hub processes, or slow storage.
-# redis_url = "redis://valkey:6379"
-
 # Set false to run a private instance where only an admin can create accounts.
 # The very first account is always allowed, so a fresh server is never locked
 # out of itself.
@@ -453,6 +443,16 @@ require_auth = false
 
 # Visibility given to a new repository when the request does not specify one.
 default_repo_visibility = "private"
+
+[cache]
+# Object bytes held in this process. The store is content-addressed, so a
+# cached object can never be stale — only unwanted.
+memory_mb = 64
+ttl_secs = 1800
+# A shared second tier. Leave unset on a single host with local storage: a
+# round trip to Redis costs more than reading the object off disk, so it only
+# pays when a miss is expensive — several hub processes, or slow storage.
+# redis_url = "redis://valkey:6379"
 
 [database]
 # Prefer the DATABASE_URL environment variable. A connection string here is a
