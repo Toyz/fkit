@@ -60,7 +60,7 @@ const commentSheet = css`
   .body a { color: var(--accent); }
   .body code {
     font-family: var(--mono); font-size: 12px;
-    background: var(--raised); border-radius: 3px; padding: 1px 4px;
+    background: var(--raised); border-radius: var(--radius); padding: 1px 4px;
   }
   .body pre {
     background: var(--bg); border: 1px solid var(--border);
@@ -158,7 +158,7 @@ const composerSheet = css`
   .tools button {
     height: 22px; min-width: 24px; padding: 0 6px;
     border: 1px solid transparent; background: transparent; color: var(--muted);
-    border-radius: 3px; font-size: 11.5px;
+    border-radius: var(--radius); font-size: 11.5px;
     font-family: var(--mono);
   }
   .tools button:hover { background: var(--surface); color: var(--text); border-color: transparent; }
@@ -176,7 +176,7 @@ const composerSheet = css`
   .preview > :last-child { margin-bottom: 0; }
   .preview code {
     font-family: var(--mono); font-size: 12px;
-    background: var(--raised); border-radius: 3px; padding: 1px 4px;
+    background: var(--raised); border-radius: var(--radius); padding: 1px 4px;
   }
   .preview pre {
     background: var(--bg); border: 1px solid var(--border);

@@ -86,7 +86,7 @@ const sheet = css`
   }
   .works .chip {
     font-size: 11px; padding: 1px 8px; line-height: 18px;
-    border: 1px solid var(--border-hi); border-radius: 999px;
+    border: 1px solid var(--border-hi); border-radius: var(--radius-pill);
     color: var(--muted); background: var(--raised);
   }
 

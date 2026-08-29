@@ -37,11 +37,11 @@ const sheet = css`
     padding: 1px 3px 1px 8px; line-height: 18px;
     font-family: var(--mono); font-size: 11px;
     color: var(--text); background: var(--raised);
-    border: 1px solid var(--border-hi); border-radius: 999px;
+    border: 1px solid var(--border-hi); border-radius: var(--radius-pill);
   }
   .chip button {
     display: flex; align-items: center; justify-content: center;
-    width: 15px; height: 15px; padding: 0; border: 0; border-radius: 999px;
+    width: 15px; height: 15px; padding: 0; border: 0; border-radius: var(--radius-pill);
     background: transparent; color: var(--faint); cursor: pointer;
   }
   .chip button:hover { background: var(--removed); color: var(--bg); }

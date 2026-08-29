@@ -688,7 +688,7 @@ const sheet = css`
   .aside .topics { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 11px; }
   .aside .topic {
     font-size: 11px; padding: 1px 7px; line-height: 17px;
-    border: 1px solid var(--border-hi); border-radius: 999px;
+    border: 1px solid var(--border-hi); border-radius: var(--radius-pill);
     color: var(--muted); background: var(--raised);
   }
 
@@ -787,7 +787,7 @@ const sheet = css`
   .tabs .tabn {
     display: inline-flex; align-items: center; justify-content: center;
     min-width: 16px; height: 16px; padding: 0 5px; margin-left: 2px;
-    border-radius: 999px; background: var(--raised); color: var(--muted);
+    border-radius: var(--radius-pill); background: var(--raised); color: var(--muted);
     font-size: 10.5px; font-variant-numeric: tabular-nums;
   }
   .tabs a.on .tabn { background: var(--accent-weak); color: var(--accent); }
@@ -876,7 +876,7 @@ const sheet = css`
   }
   .tl::after {
     content: ""; position: absolute; left: 2px; top: 15px;
-    width: 7px; height: 7px; border-radius: 999px;
+    width: 7px; height: 7px; border-radius: var(--radius-pill);
     background: var(--border-hi);
   }
   .tl.last { padding-bottom: 0; }
@@ -1072,7 +1072,7 @@ const sheet = css`
   .mtabs a .n {
     display: inline-flex; align-items: center; justify-content: center;
     min-width: 16px; height: 16px; padding: 0 5px;
-    border-radius: 999px; background: var(--raised); color: var(--muted);
+    border-radius: var(--radius-pill); background: var(--raised); color: var(--muted);
     font-size: 10.5px; font-variant-numeric: tabular-nums;
   }
   .mtabs a.on .n { background: var(--accent-weak); color: var(--accent); }
@@ -1139,7 +1139,7 @@ const sheet = css`
   .df .viewed {
     display: inline-flex; align-items: center; gap: 6px;
     flex: none; height: 20px; padding: 0 10px;
-    border: 1px solid var(--border-hi); border-radius: 999px;
+    border: 1px solid var(--border-hi); border-radius: var(--radius-pill);
     background: var(--bg); color: var(--muted);
     cursor: pointer; user-select: none;
     /* Undo the caption styling inherited from the base sheet. */
@@ -1178,7 +1178,7 @@ const sheet = css`
     position: absolute; left: 2px; top: 50%; transform: translateY(-50%);
     width: 17px; height: 17px; padding: 0; display: none;
     align-items: center; justify-content: center;
-    border: 0; border-radius: 3px; cursor: pointer;
+    border: 0; border-radius: var(--radius); cursor: pointer;
     background: var(--accent); color: var(--bg); z-index: 2;
   }
   .dl:hover .addc { display: flex; }
@@ -1327,7 +1327,7 @@ const sheet = css`
     z-index: 40;
     display: flex; align-items: center; gap: 4px;
     padding: 6px 6px 6px 12px;
-    border: 1px solid var(--border-hi); border-radius: 10px;
+    border: 1px solid var(--border-hi); border-radius: var(--radius-lg);
     background: color-mix(in srgb, var(--raised) 92%, var(--bg));
     backdrop-filter: blur(8px);
     box-shadow: 0 10px 30px rgb(0 0 0 / .5), 0 0 0 1px rgb(0 0 0 / .25);
@@ -1345,7 +1345,7 @@ const sheet = css`
   .selbar .cas {
     font-family: var(--mono); font-size: 10.5px; color: var(--faint);
     padding: 2px 6px; margin-left: 4px;
-    border: 1px solid var(--border); border-radius: 5px;
+    border: 1px solid var(--border); border-radius: var(--radius-md);
     background: var(--bg);
   }
   .selbar .sep {
@@ -1355,7 +1355,7 @@ const sheet = css`
   .selbar .act {
     display: inline-flex; align-items: center; gap: 6px;
     height: 26px; padding: 0 10px;
-    border: 1px solid transparent; border-radius: 7px;
+    border: 1px solid transparent; border-radius: var(--radius-md);
     background: transparent; color: var(--muted);
     font: inherit; font-size: 11.5px; cursor: pointer;
   }
@@ -1372,7 +1372,7 @@ const sheet = css`
   .selbar .shut {
     display: inline-flex; align-items: center; justify-content: center;
     width: 26px; height: 26px; margin-left: 2px;
-    border: 0; border-radius: 7px;
+    border: 0; border-radius: var(--radius-md);
     background: transparent; color: var(--faint); cursor: pointer;
   }
   .selbar .shut:hover { background: var(--bg); color: var(--text); }
@@ -1444,7 +1444,7 @@ const sheet = css`
      should be able to find without looking for it. */
   .mstate {
     display: inline-flex; align-items: center; gap: 5px;
-    font-size: 11px; padding: 3px 10px; border-radius: 999px;
+    font-size: 11px; padding: 3px 10px; border-radius: var(--radius-pill);
     white-space: nowrap; font-family: var(--sans);
   }
   .mstate.open {
@@ -1540,7 +1540,7 @@ const sheet = css`
   .md h1:first-child { margin-top: 0; }
   .md h3, .md h4 { margin: 1.3em 0 .4em; }
   .md p { margin: 0 0 .9em; }
-  .md code { font-family: var(--mono); font-size: .85em; background: var(--raised); padding: .1em .35em; border-radius: 2px; }
+  .md code { font-family: var(--mono); font-size: .85em; background: var(--raised); padding: .1em .35em; border-radius: var(--radius-sm); }
   .md pre { background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 11px 13px; overflow-x: auto; }
   .md pre code { background: none; padding: 0; font-size: 12px; }
   .md table { border-collapse: collapse; margin: 0 0 1em; font-size: 13px; }

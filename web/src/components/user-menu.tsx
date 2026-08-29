@@ -28,30 +28,83 @@ const sheet = css`
   .trigger.open .chev { transform: rotate(180deg); }
 
   .pop {
-    position: absolute; top: calc(100% + 5px); right: 0; z-index: 60;
-    min-width: 190px; padding: 3px;
+    position: absolute; top: calc(100% + 6px); right: 0; z-index: 60;
+    /* Sized so the longest label sits on one line. "server administration" was
+       wrapping onto two, which reads as a broken row rather than a long one —
+       and nowrap below makes that a guarantee rather than a width that
+       happened to fit today. */
+    min-width: 232px; padding: 5px;
     background: var(--surface); border: 1px solid var(--border-hi);
-    border-radius: var(--radius);
+    border-radius: var(--radius-lg);
+    box-shadow: 0 12px 32px rgb(0 0 0 / .5), 0 0 0 1px rgb(0 0 0 / .2);
   }
+  @media (prefers-reduced-motion: no-preference) {
+    .pop { animation: pop-in .11s cubic-bezier(.22,.61,.36,1); }
+  }
+  @keyframes pop-in {
+    from { opacity: 0; transform: translateY(-5px) scale(.985); }
+    to   { opacity: 1; transform: translateY(0) scale(1); }
+  }
+
+  /* Who you are. The same avatar the trigger shows, so the menu is visibly
+     attached to the thing that opened it, and the role is stated rather than
+     inferred from whether an admin link happens to be present. */
   .who {
-    padding: 7px 9px 8px; border-bottom: 1px solid var(--border); margin-bottom: 3px;
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 9px 10px; margin-bottom: 2px;
   }
-  .who .n { font-size: 12.5px; color: var(--text); }
+  .who .id { min-width: 0; flex: 1; }
+  .who .n {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 13px; color: var(--text);
+  }
+  .who .n b {
+    font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
   .who .e {
     display: block; color: var(--faint); font-size: 11px; margin-top: 2px;
-    font-family: var(--sans); overflow: hidden; text-overflow: ellipsis;
+    font-family: var(--sans);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
+  .role {
+    flex: none; font-size: 9.5px; letter-spacing: .06em; text-transform: uppercase;
+    padding: 1px 5px; border-radius: var(--radius-md);
+    color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  }
+
+  /* The same caption the admin sidebar uses, so this reads as part of the app
+     rather than a menu that arrived from somewhere else. */
+  .grp {
+    font-size: 9.5px; letter-spacing: .08em; text-transform: uppercase;
+    color: var(--faint); padding: 7px 9px 4px;
+  }
+
   a.item, button.item {
-    display: flex; align-items: center; gap: 9px; width: 100%;
-    padding: 6px 9px; border-radius: var(--radius);
-    font: inherit; font-size: 12px; text-align: left;
+    display: flex; align-items: center; gap: 10px; width: 100%;
+    padding: 7px 9px; border-radius: var(--radius-md);
+    font: inherit; font-size: 12px; text-align: left; white-space: nowrap;
     color: var(--muted); background: transparent; border: 0; cursor: pointer;
     text-decoration: none;
   }
-  a.item:hover, button.item:hover { background: var(--raised); color: var(--text); text-decoration: none; }
-  .item loom-icon { opacity: .75; flex: none; }
-  .sep { height: 1px; background: var(--border); margin: 3px 0; }
+  a.item:hover, button.item:hover {
+    background: var(--raised); color: var(--text); text-decoration: none;
+  }
+  a.item:focus-visible, button.item:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: -2px;
+  }
+  .item loom-icon { opacity: .65; flex: none; }
+  .item:hover loom-icon { opacity: 1; }
+  /* Reading someone else's repository because you administer the server is a
+     different kind of act from editing your own profile, and the menu should
+     not present them identically. */
+  a.item.admin { color: var(--accent); }
+  a.item.admin loom-icon { opacity: .9; }
+
+  .sep { height: 1px; background: var(--border); margin: 5px 0; }
   button.item.out:hover { color: var(--removed); }
+  button.item.out:hover loom-icon { color: var(--removed); }
 `;
 
 @component("user-menu")
@@ -87,7 +140,9 @@ export class UserMenu extends LoomElement {
   }
 
   update() {
-    const items: [string, string, string][] = [
+    // Grouped rather than one flat list: four account links and a server-wide
+    // one are different kinds of thing, and a separator alone does not say so.
+    const account: [string, string, string][] = [
       [`/${this.username}`, "your repositories", "repo"],
       ["/settings", "profile", "settings"],
       ["/settings/tokens", "access tokens", "key"],
@@ -110,12 +165,19 @@ export class UserMenu extends LoomElement {
         {this.open ? (
           <div class="pop" role="menu">
             <div class="who">
-              <span class="n">{this.username}</span>
-              <span class="e">{this.email}</span>
+              <fkit-avatar name={this.username} size={30}></fkit-avatar>
+              <span class="id">
+                <span class="n">
+                  <b>{this.username}</b>
+                  {this.admin ? <span class="role">admin</span> : null}
+                </span>
+                <span class="e" title={this.email}>{this.email}</span>
+              </span>
             </div>
 
-            {items.map(([href, label, ic]) => (
-              <a class="item" href={href} onClick={this.go(href)}>
+            <div class="grp">Account</div>
+            {account.map(([href, label, ic]) => (
+              <a class="item" href={href} onClick={this.go(href)} role="menuitem">
                 <loom-icon name={ic} size={13}></loom-icon>
                 {label}
               </a>
@@ -123,10 +185,10 @@ export class UserMenu extends LoomElement {
 
             {this.admin ? (
               <>
-                <div class="sep"></div>
-                <a class="item" href="/admin" onClick={this.go("/admin")}>
-                  <loom-icon name="lock" size={13}></loom-icon>
-                  server administration
+                <div class="grp">Server</div>
+                <a class="item admin" href="/admin" onClick={this.go("/admin")} role="menuitem">
+                  <loom-icon name="shield" size={13}></loom-icon>
+                  administration
                 </a>
               </>
             ) : null}
@@ -134,6 +196,7 @@ export class UserMenu extends LoomElement {
             <div class="sep"></div>
             <button
               class="item out"
+              role="menuitem"
               onClick={() => {
                 this.open = false;
                 this.dispatchEvent(
@@ -141,7 +204,7 @@ export class UserMenu extends LoomElement {
                 );
               }}
             >
-              <loom-icon name="external" size={13}></loom-icon>
+              <loom-icon name="signout" size={13}></loom-icon>
               sign out
             </button>
           </div>

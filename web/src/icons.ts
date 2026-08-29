@@ -29,6 +29,10 @@ const PATHS = {
      nothing; these are distinguishable at 12px, which is the whole point. */
   /* A signpost. A getting-started guide points you somewhere; it is not a
      thing you run, so an arrow or a play triangle would both mislead. */
+  /* Leaving. `external` was standing in for this, and an arrow out of a box
+     means "opens in a new tab" everywhere else here — one glyph cannot mean
+     two things. */
+  signout: `<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/>`,
   guide: `<path d="M12 2v20"/><path d="M12 5h7l2 3-2 3h-7"/><path d="M12 13H5l-2 3 2 3h7"/>`,
   book: `<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2Z"/><path d="M9 7h7M9 11h5"/>`,
   scale: `<path d="M12 3v18M7 21h10"/><path d="M5 7h14"/><path d="m5 7-3 6a3 3 0 0 0 6 0Z"/><path d="m19 7-3 6a3 3 0 0 0 6 0Z"/>`,

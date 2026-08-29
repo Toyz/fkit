@@ -130,7 +130,7 @@ export const base = css`
     font-size: 11px;
     padding: 0 5px;
     border: 1px solid var(--border-hi);
-    border-radius: 2px;
+    border-radius: var(--radius-sm);
     color: var(--muted);
     line-height: 17px;
     display: inline-block;
@@ -165,7 +165,7 @@ export const base = css`
   .sk {
     display: block;
     height: 9px;
-    border-radius: 2px;
+    border-radius: var(--radius-sm);
     background: var(--border);
     animation: sk-pulse 1.5s ease-in-out infinite;
   }

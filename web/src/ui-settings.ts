@@ -181,7 +181,7 @@ export const settingsLayout = css`
   /* A switch reads as state at a glance; a checkbox reads as a form to fill in. */
   .toggle {
     position: relative; width: 34px; height: 19px; flex: none;
-    border-radius: 999px; border: 1px solid var(--border-hi);
+    border-radius: var(--radius-pill); border: 1px solid var(--border-hi);
     background: var(--bg); cursor: pointer; padding: 0;
     transition: background .14s, border-color .14s;
   }

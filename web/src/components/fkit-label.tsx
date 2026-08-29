@@ -16,7 +16,7 @@ const sheet = css`
   .l {
     display: inline-flex; align-items: center; gap: 5px;
     padding: 1px 9px; line-height: 18px;
-    border-radius: 999px; font-size: 11px; white-space: nowrap;
+    border-radius: var(--radius-pill); font-size: 11px; white-space: nowrap;
     background: hsl(var(--h, 0) 30% 14%);
     color: hsl(var(--h, 0) 55% 68%);
     box-shadow: inset 0 0 0 1px hsl(var(--h, 0) 28% 26%);

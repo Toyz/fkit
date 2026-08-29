@@ -28,7 +28,7 @@ const sheet = css`
   button {
     display: flex; align-items: center; gap: 7px;
     padding: 7px 12px;
-    border: 1px solid var(--border-hi); border-radius: 999px;
+    border: 1px solid var(--border-hi); border-radius: var(--radius-pill);
     background: var(--surface); color: var(--muted);
     font: inherit; font-family: var(--mono); font-size: 11.5px;
     cursor: pointer;

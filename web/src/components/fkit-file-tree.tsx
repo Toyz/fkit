@@ -69,7 +69,7 @@ const sheet = css`
   .row.ghost { cursor: default; }
   .row.ghost:hover { background: none; }
   .row .sk {
-    display: block; height: 9px; border-radius: 3px;
+    display: block; height: 9px; border-radius: var(--radius);
     background: var(--raised);
     width: var(--w, 70%);
   }

@@ -18,7 +18,7 @@ const sheet = css`
   :host { display: inline-flex; }
   button {
     position: relative; width: 34px; height: 19px; flex: none; padding: 0;
-    border-radius: 999px; border: 1px solid var(--border-hi);
+    border-radius: var(--radius-pill); border: 1px solid var(--border-hi);
     background: var(--bg); cursor: pointer;
     transition: background .14s, border-color .14s;
   }
