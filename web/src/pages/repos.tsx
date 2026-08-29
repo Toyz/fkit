@@ -64,7 +64,7 @@ export class PageRepos extends LoomElement {
 
     return (
       <div class="wrap">
-        {this.repos.error ? <div class="error">{this.repos.error.message}</div> : null}
+        {this.repos.error ? <fkit-notice message={this.repos.error.message}></fkit-notice> : null}
 
         <fkit-section heading="Repositories" value={value}>
           <span slot="action" class="head-acts">

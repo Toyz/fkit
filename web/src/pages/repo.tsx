@@ -56,6 +56,7 @@ import "../components/fkit-choice";
 import { adoptInto } from "../adopt";
 import { dirIcon, fileIcon } from "../file-icon";
 import { confirmAction } from "../components/fkit-dialog";
+import { notify } from "../components/fkit-notice";
 
 type View =
   | { kind: "tree"; ref: string; path: string }
@@ -2171,7 +2172,13 @@ export class PageRepo extends LoomElement {
       this.copied = true;
       setTimeout(() => (this.copied = false), 1400);
     } catch {
-      this.error = "could not copy — the browser refused clipboard access";
+      // A banner at the top of the page is not where someone who just pressed
+      // "copy" is looking, and this needs explaining rather than noticing.
+      void notify({
+        title: "Could not copy",
+        body: "The browser refused access to the clipboard. Selecting the text and copying it by hand still works.",
+        tone: "warn",
+      });
     }
   }
 
@@ -3751,7 +3758,18 @@ fkit push</pre>
         await this.refsQuery.refetch();
       }
     } catch (e) {
-      this.error = (e as Error).message;
+      // A failed action is shown in front of the page rather than as a banner
+      // somewhere on it. The person just pressed something and is looking at
+      // where they pressed it — an inline message above the fold they are not
+      // reading is how an action comes to look like it silently did nothing.
+      // Reported once, in front of the page. Setting the inline banner too
+      // would say the same thing twice — that one is for failures nobody
+      // asked for, like a listing that would not load.
+      void notify({
+        title: "That did not happen",
+        body: (e as Error).message,
+        tone: "error",
+      });
     } finally {
       this.busy = false;
     }
@@ -4295,7 +4313,13 @@ fkit push</pre>
       });
       go(`/${at.owner}/${at.name}/merges/${m.number}`);
     } catch (e) {
-      this.error = (e as Error).message;
+      // Reported in front of the page: the person just pressed something and
+      // is looking at where they pressed it, not at a banner elsewhere on it.
+      void notify({
+        title: "That did not happen",
+        body: (e as Error).message,
+        tone: "error",
+      });
     } finally {
       this.busy = false;
     }
@@ -4327,7 +4351,13 @@ fkit push</pre>
         if (this.copiedKey === id) this.copiedKey = "";
       }, 1400);
     } catch {
-      this.error = "could not copy — the browser refused clipboard access";
+      // A banner at the top of the page is not where someone who just pressed
+      // "copy" is looking, and this needs explaining rather than noticing.
+      void notify({
+        title: "Could not copy",
+        body: "The browser refused access to the clipboard. Selecting the text and copying it by hand still works.",
+        tone: "warn",
+      });
     }
   }
 
@@ -5137,7 +5167,7 @@ fkit push</pre>
 
         {this.renderDrift(r, at)}
 
-        {this.error ? <div class="error">{this.error}</div> : null}
+        {this.error ? <fkit-notice message={this.error}></fkit-notice> : null}
 
         {this.refs !== null && this.branches().length === 0 && v.kind !== "settings" ? (
           <div class="panel">

@@ -6,7 +6,7 @@
  * from the empty state and the settings page.
  */
 import { LoomElement, component, css, styles, reactive, prop, mount, query } from "@toyz/loom";
-import { debounce } from "@toyz/loom/element";
+import { debounce, hotkey } from "@toyz/loom/element";
 
 /** Bytes, for a label. Local so the component stays self-contained. */
 function size(bytes: number): string {
@@ -38,44 +38,69 @@ const sheet = css`
   .trigger.open .chev { transform: rotate(180deg); }
 
   .pop {
-    position: absolute; top: calc(100% + 4px); right: 0; z-index: 40;
-    width: 340px; padding: 11px;
+    position: absolute; top: calc(100% + 5px); right: 0; z-index: 40;
+    width: 370px;
     background: var(--surface); border: 1px solid var(--border-hi);
     border-radius: var(--radius);
-    display: flex; flex-direction: column; gap: 11px;
+    box-shadow: 0 12px 32px rgb(0 0 0 / .38);
+    overflow: hidden;
   }
-  .label {
-    display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
-    font-size: 10px; text-transform: uppercase; letter-spacing: .07em; color: var(--muted);
+
+  .sec { padding: 12px 13px; }
+  .sec + .sec { border-top: 1px solid var(--border); }
+
+  .lbl {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 10px; text-transform: uppercase; letter-spacing: .09em;
+    color: var(--faint); margin-bottom: 8px;
   }
-  .label button {
-    font: inherit; font-size: 11px; padding: 1px 5px;
-    border: 1px solid transparent; border-radius: 2px;
-    background: transparent; color: var(--muted); cursor: pointer;
+  .lbl .grow { flex: 1; }
+  .lbl .sz { text-transform: none; letter-spacing: 0; color: var(--muted); }
+
+  /* The URL and the command, each in a box with its copy button inside it
+     rather than floating above — the button belongs to the value, and the
+     value is the reason the popover exists. */
+  .field {
+    display: flex; align-items: stretch;
+    background: var(--bg);
+    border: 1px solid var(--border); border-radius: var(--radius);
+    overflow: hidden;
   }
-  .label button:hover { background: var(--raised); color: var(--text); }
-  .val {
-    background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
-    padding: 6px 8px; font-size: 11.5px; color: var(--text);
-    overflow-x: auto; white-space: nowrap;
+  .field:focus-within { border-color: var(--accent); }
+  .field .v {
+    flex: 1; min-width: 0;
+    padding: 7px 9px; font-size: 11.5px; color: var(--text);
+    /* Wraps rather than scrolling sideways. A horizontal scrollbar inside a
+       340px popover is a way to hide the end of the one string people came
+       for. */
+    overflow-wrap: anywhere; line-height: 1.45;
   }
-  .dl { padding: 9px 10px; border-top: 1px solid var(--border); }
-  .dl .lbl {
-    display: block; font-size: 10.5px; color: var(--faint);
-    text-transform: uppercase; letter-spacing: .07em; margin-bottom: 7px;
+  .field .cp {
+    flex: none; display: flex; align-items: center; gap: 5px;
+    padding: 0 10px; border: 0; border-left: 1px solid var(--border);
+    background: var(--raised); color: var(--muted);
+    font: inherit; font-size: 11px; cursor: pointer;
   }
-  .dl .lbl .sz { text-transform: none; letter-spacing: 0; margin-left: 7px; color: var(--muted); }
-  .dl .fmts { display: flex; gap: 6px; }
+  .field .cp:hover { background: var(--surface); color: var(--text); }
+  .field .cp.done { color: var(--added); }
+
+  .cmd { margin-top: 9px; }
+
+  .fmts { display: flex; gap: 7px; }
   .fmt {
     display: inline-flex; align-items: center; gap: 6px;
-    font-size: 11.5px; padding: 3px 9px;
+    font-size: 11.5px; padding: 5px 11px;
     border: 1px solid var(--border-hi); border-radius: var(--radius);
     color: var(--muted); text-decoration: none;
   }
   .fmt:hover { color: var(--accent); border-color: var(--accent); text-decoration: none; }
   .fmt loom-icon { opacity: .8; }
 
-  .note { color: var(--faint); font-size: 11px; font-family: var(--sans); line-height: 1.45; }
+  .note {
+    padding: 9px 13px; border-top: 1px solid var(--border);
+    background: var(--raised);
+    color: var(--faint); font-size: 11px; font-family: var(--sans); line-height: 1.45;
+  }
 `;
 
 @component("clone-button")
@@ -110,14 +135,13 @@ export class CloneButton extends LoomElement {
       if (this.open && !e.composedPath().includes(this)) this.open = false;
     };
     document.addEventListener("pointerdown", away, true);
-    const esc = (e: KeyboardEvent) => {
-      if (e.key === "Escape") this.open = false;
-    };
-    document.addEventListener("keydown", esc);
-    return () => {
-      document.removeEventListener("pointerdown", away, true);
-      document.removeEventListener("keydown", esc);
-    };
+    return () => document.removeEventListener("pointerdown", away, true);
+  }
+
+  /// Not private: the decorator calls it, and nothing in the class does.
+  @hotkey("escape", { global: true })
+  closeOnEscape() {
+    this.open = false;
   }
 
   private async copy(key: string, text: string) {
@@ -130,17 +154,21 @@ export class CloneButton extends LoomElement {
     }
   }
 
-  private row(key: string, label: string, value: string) {
+  /// A value and the button that copies it, as one control.
+  private field(key: string, value: string) {
+    const done = this.copied === key;
     return (
-      <div>
-        <div class="label">
-          <span>{label}</span>
-          <button onClick={() => void this.copy(key, value)}>
-            <loom-icon name={this.copied === key ? "check" : "copy"} size={11}></loom-icon>
-            {this.copied === key ? " copied" : " copy"}
-          </button>
-        </div>
-        <div class="val">{value}</div>
+      <div class="field">
+        <span class="v">{value}</span>
+        <button
+          type="button"
+          class={`cp ${done ? "done" : ""}`}
+          title={done ? "Copied" : "Copy"}
+          onClick={() => void this.copy(key, value)}
+        >
+          <loom-icon name={done ? "check" : "copy"} size={11}></loom-icon>
+          {done ? "copied" : "copy"}
+        </button>
       </div>
     );
   }
@@ -159,9 +187,9 @@ export class CloneButton extends LoomElement {
 
     if (over) {
       return (
-        <div class="dl">
-          <span class="lbl">download</span>
-          <div class="note" style="margin:0;padding:0">
+        <div class="sec">
+          <div class="lbl"><span>download</span></div>
+          <div style="color:var(--faint);font-size:11px;font-family:var(--sans);line-height:1.45">
             This repository holds {size(this.archiveBytes)}, and this server
             will not build an archive over {size(this.archiveLimit)}. Clone it
             instead — that transfers only what you do not already have.
@@ -171,11 +199,12 @@ export class CloneButton extends LoomElement {
     }
 
     return (
-      <div class="dl">
-        <span class="lbl">
-          download this ref
+      <div class="sec">
+        <div class="lbl">
+          <span>download this ref</span>
+          <span class="grow"></span>
           {this.archiveBytes > 0 ? <span class="sz">{size(this.archiveBytes)}</span> : null}
-        </span>
+        </div>
         <div class="fmts">
           {/* Real links, so middle-click and "save as" behave and the browser
               owns the download. The server streams, so a large repository
@@ -202,9 +231,17 @@ export class CloneButton extends LoomElement {
 
         {this.open ? (
           <div class="pop">
-            {this.row("cmd", "clone", `fkit clone ${this.url}`)}
-            {this.row("url", "url", this.url)}
+            <div class="sec">
+              {/* The URL first, because it is the string people came for. The
+                  command is the same URL with four words in front of it, so it
+                  is offered second rather than given equal billing. */}
+              <div class="lbl"><span>clone this repository</span></div>
+              {this.field("url", this.url)}
+              <div class="cmd">{this.field("cmd", `fkit clone ${this.url}`)}</div>
+            </div>
+
             {this.archive ? this.download() : null}
+
             <div class="note">
               {this.visibility === "public"
                 ? "Public — cloning needs no account. Pushing needs a token."

@@ -1,6 +1,7 @@
 /** Create a repository, then show exactly how to push to it. */
 import { LoomElement, component, css, styles, reactive } from "@toyz/loom";
 import { route } from "@toyz/loom/router";
+import { notify } from "../components/fkit-notice";
 import { base } from "../ui";
 import { api, syncUrl, type Repo } from "../api";
 import { go, linkHandler } from "../nav";
@@ -53,7 +54,13 @@ export class PageNewRepo extends LoomElement {
         visibility: this.visibility,
       });
     } catch (err) {
-      this.error = (err as Error).message;
+      // Reported in front of the page: a name already taken is the common
+      // case, and it is the sort of thing people re-press the button over.
+      void notify({
+        title: "Could not create it",
+        body: (err as Error).message,
+        tone: "error",
+      });
     } finally {
       this.busy = false;
     }
@@ -106,7 +113,7 @@ fkit push`}
         <div class="box">
           <div class="panel"><div class="panel-body">
             <h1>new repository</h1>
-            {this.error ? <div class="error">{this.error}</div> : null}
+            {this.error ? <fkit-notice message={this.error}></fkit-notice> : null}
             <form onSubmit={(e: Event) => void this.submit(e)}>
               <div class="field">
                 <label>name</label>

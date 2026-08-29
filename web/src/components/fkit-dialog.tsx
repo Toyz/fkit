@@ -9,6 +9,7 @@
  * same as the `confirm()` they replace.
  */
 import { LoomElement, component, css, styles, reactive } from "@toyz/loom";
+import { hotkey } from "@toyz/loom/element";
 
 export interface ConfirmOptions {
   title: string;
@@ -81,6 +82,25 @@ export class FkitDialog extends LoomElement {
   /** Set by `confirmAction`; resolves the caller's promise. */
   resolve: ((ok: boolean) => void) | null = null;
 
+  /// Bound globally rather than to the box. A handler on the element only
+  /// fires while focus is inside it, so dismissing depended on focus having
+  /// landed there — which is not something a person should have to know.
+  ///
+  /// Not private: the decorator calls these, and nothing in the class does.
+  @hotkey("escape", { global: true })
+  cancelOnEscape() {
+    this.finish(false);
+  }
+
+  /// Enter confirms, but not past a gate that exists precisely to make someone
+  /// stop and type the name of the thing they are about to destroy.
+  @hotkey("enter", { global: true })
+  confirmOnEnter() {
+    const o = this.opts;
+    const ready = !o.typeToConfirm || this.typed === o.typeToConfirm;
+    if (ready) this.finish(true);
+  }
+
   private finish(ok: boolean) {
     this.resolve?.(ok);
     this.resolve = null;
@@ -93,13 +113,7 @@ export class FkitDialog extends LoomElement {
     const ready = !gated || this.typed === o.typeToConfirm;
 
     return (
-      <div
-        onKeyDown={(e: Event) => {
-          const k = e as KeyboardEvent;
-          if (k.key === "Escape") this.finish(false);
-          if (k.key === "Enter" && ready) this.finish(true);
-        }}
-      >
+      <div>
         <div class="scrim" onClick={() => this.finish(false)}></div>
         <div class={`box ${o.danger ? "danger" : ""}`} role="dialog" aria-modal="true">
           <div class="head">{o.title}</div>

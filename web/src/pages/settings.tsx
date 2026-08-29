@@ -13,6 +13,7 @@ import { settingsLayout } from "../ui-settings";
 import { Session } from "../session";
 import { linkHandler, go } from "../nav";
 import { confirmAction } from "../components/fkit-dialog";
+import { notify } from "../components/fkit-notice";
 import "../components/fkit-toggle";
 import {
   api,
@@ -128,7 +129,18 @@ abstract class SettingsBase extends LoomElement {
       await fn();
       if (ok) this.notice = ok;
     } catch (e) {
-      this.error = (e as Error).message;
+      // A failed action is shown in front of the page rather than as a banner
+      // somewhere on it. The person just pressed something and is looking at
+      // where they pressed it — an inline message above the fold they are not
+      // reading is how an action comes to look like it silently did nothing.
+      // Reported once, in front of the page. Setting the inline banner too
+      // would say the same thing twice — that one is for failures nobody
+      // asked for, like a listing that would not load.
+      void notify({
+        title: "That did not happen",
+        body: (e as Error).message,
+        tone: "error",
+      });
     } finally {
       this.busy = false;
     }
@@ -591,7 +603,7 @@ export class PageSettings extends SettingsBase {
   update() {
     return (
       <div class="wrap">
-        {this.error ? <div class="error">{this.error}</div> : null}
+        {this.error ? <fkit-notice message={this.error}></fkit-notice> : null}
         <div class="cols">
           {this.rail()}
           {this.section === "profile"

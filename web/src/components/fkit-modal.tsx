@@ -10,7 +10,8 @@
  * whether the form should be up is the page's own state, and a modal with its
  * own idea of that is a modal that reopens after a successful save.
  */
-import { LoomElement, component, css, styles, prop, on } from "@toyz/loom";
+import { LoomElement, component, css, styles, prop } from "@toyz/loom";
+import { hotkey } from "@toyz/loom/element";
 import { buttons } from "../ui";
 
 const sheet = css`
@@ -73,14 +74,15 @@ export class FkitModal extends LoomElement {
     this.dispatchEvent(new CustomEvent("close", { bubbles: true }));
   }
 
-  /** Escape closes it, wherever the focus happens to be. Not private: the
-   *  decorator is what calls it, and nothing in the class does. */
-  @on(document, "keydown")
-  key(e: KeyboardEvent) {
-    if (this.open && e.key === "Escape") {
-      e.preventDefault();
-      this.close();
-    }
+  /// Escape closes it, wherever the focus happens to be. Not private: the
+  /// decorator is what calls it, and nothing in the class does.
+  ///
+  /// Guarded on `open` because this element stays in the tree while closed —
+  /// unlike the dialogs, which remove themselves — so its binding is live
+  /// either way.
+  @hotkey("escape", { global: true })
+  closeOnEscape() {
+    if (this.open) this.close();
   }
 
   update() {

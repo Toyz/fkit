@@ -91,7 +91,7 @@ export class PageLogin extends AuthPage {
         <div class="box">
           <div class="panel"><div class="panel-body">
             <h1>sign in</h1>
-            {this.error ? <div class="error">{this.error}</div> : null}
+            {this.error ? <fkit-notice message={this.error}></fkit-notice> : null}
             <form
               onSubmit={(e: Event) => {
                 e.preventDefault();
@@ -221,7 +221,7 @@ export class PageRegister extends AuthPage {
                   ? "This server has no accounts yet. This one becomes its administrator, and it is allowed even though registration is closed."
                   : "The first account on a new server becomes its administrator."}
             </div>
-            {this.error ? <div class="error">{this.error}</div> : null}
+            {this.error ? <fkit-notice message={this.error}></fkit-notice> : null}
             <form
               onSubmit={(e: Event) => {
                 e.preventDefault();
@@ -286,7 +286,7 @@ export class PageForgot extends AuthPage {
         <div class="box">
           <div class="panel"><div class="panel-body">
             <h1>reset your password</h1>
-            {this.error ? <div class="error">{this.error}</div> : null}
+            {this.error ? <fkit-notice message={this.error}></fkit-notice> : null}
 
             {this.sent ? (
               <div>
@@ -365,7 +365,7 @@ export class PageReset extends AuthPage {
         <div class="box">
           <div class="panel"><div class="panel-body">
             <h1>choose a new password</h1>
-            {this.error ? <div class="error">{this.error}</div> : null}
+            {this.error ? <fkit-notice message={this.error}></fkit-notice> : null}
             <form
               onSubmit={(e: Event) => {
                 e.preventDefault();
