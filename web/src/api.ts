@@ -58,6 +58,14 @@ export interface Issue {
   comments: number;
 }
 
+export interface CrossRef {
+  kind: "issue" | "merge";
+  number: number;
+  title: string;
+  state: string;
+  author: string | null;
+}
+
 export interface Comment {
   id: string;
   author: string | null;
@@ -376,6 +384,8 @@ export interface MergeRequest {
   merged_at: string | null;
   created_at: string;
   updated_at: string;
+  /** Issues this says it closes; merging it will. */
+  closes: number[];
 }
 
 export interface MergeRequestDetail extends MergeRequest {
@@ -539,6 +549,14 @@ export const api = {
       `/repos/${owner}/${name}/issues/${number}/${open ? "reopen" : "close"}`,
       { method: "POST" },
     ),
+
+  /** What `#4` is, given that issues and merges share one counter. */
+  whatIs: (owner: string, name: string, number: number) =>
+    request<{ kind: "issue" | "merge"; number: number; title: string }>(
+      `/repos/${owner}/${name}/n/${number}`,
+    ),
+  issueRefs: (owner: string, name: string, number: number) =>
+    request<CrossRef[]>(`/repos/${owner}/${name}/issues/${number}/refs`),
 
   issueComments: (owner: string, name: string, number: number) =>
     request<Comment[]>(`/repos/${owner}/${name}/issues/${number}/comments`),

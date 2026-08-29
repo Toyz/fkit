@@ -33,6 +33,7 @@ import {
   type Entry,
   type Collaborator,
   type Comparison,
+  type CrossRef,
   type FileDiff,
   type MergeRequest,
   type MergeRequestDetail,
@@ -64,6 +65,7 @@ type View =
   | { kind: "merges" }
   | { kind: "merge"; number: number; tab: "conversation" | "commits" | "files" }
   | { kind: "issues" }
+  | { kind: "number"; number: number }
   | { kind: "issue"; number: number }
   | { kind: "settings"; section: string }
   | { kind: "unknown" };
@@ -111,6 +113,12 @@ function parse(): { owner: string; name: string; view: View } | null {
     return { owner, name, view: { kind: "settings", section: rest[0] ?? "general" } };
   }
   if (kind === "tags") return { owner, name, view: { kind: "tags" } };
+  // `/owner/repo/n/4` — where a `#4` written in a comment points, before
+  // anyone knows whether 4 is an issue or a merge request.
+  if (kind === "n" && rest[0]) {
+    const n = Number(rest[0]);
+    if (Number.isFinite(n)) return { owner, name, view: { kind: "number", number: n } };
+  }
   if (kind === "issues") {
     const n = rest[0] ? Number(rest[0]) : NaN;
     return {
@@ -646,6 +654,18 @@ const sheet = css`
   .sby .who:hover { color: var(--accent); }
   .sby .ex { color: var(--faint); font-family: var(--mono); font-size: 11.5px; }
 
+  /* What links two numbered things together. Quiet: it is context, not the
+     thing you came to read. */
+  .links {
+    display: flex; align-items: flex-start; gap: 7px;
+    font-size: 12px; color: var(--muted); font-family: var(--sans);
+    margin: 0 0 14px;
+  }
+  .links loom-icon { margin-top: 2px; flex: none; color: var(--faint); }
+  .links a { color: var(--accent); text-decoration: none; }
+  .links a:hover { text-decoration: underline; }
+  .links .st { color: var(--faint); margin-left: 3px; }
+
   /* ---- issues ---- */
   .seg { display: flex; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
   .seg button {
@@ -731,18 +751,39 @@ const sheet = css`
   }
   .mtabs a.on .n { background: var(--accent-weak); color: var(--accent); }
 
-  /* A line comment shown away from its diff: the code it is about, then the
-     comment. Without this a conversation is a list of line numbers. */
-  .snip {
+  /* One line thread: the code, what was said about it, and the controls. It
+     is one card because it is one conversation — three stacked boxes with
+     gaps between them read as three unrelated things. */
+  .tcard {
     border: 1px solid var(--border); border-radius: var(--radius);
-    overflow: hidden; background: var(--bg);
+    overflow: hidden; background: var(--surface);
   }
+  .tcard.done { border-color: color-mix(in srgb, var(--added) 32%, var(--border)); }
+
+  .tcomments > fkit-comment { display: block; }
+  .tcomments > fkit-comment + fkit-comment { border-top: 1px solid var(--border); }
+
+  .treply { padding: 10px 12px; border-top: 1px solid var(--border); }
+
+  .tfoot {
+    display: flex; align-items: center; gap: 7px;
+    padding: 7px 12px; border-top: 1px solid var(--border);
+    background: var(--raised);
+    font-size: 11.5px; color: var(--muted); font-family: var(--sans);
+  }
+  .tfoot .grow { flex: 1; }
+  .tcard.done .tfoot { color: var(--added); }
+  .tfoot .open { color: var(--modified); }
+
+  /* The snippet is the card's head, so it draws no edges of its own. */
+  .snip { background: var(--bg); border-bottom: 1px solid var(--border); }
   .snip-head {
     display: flex; align-items: center; gap: 7px;
     padding: 6px 11px; background: var(--raised);
     border-bottom: 1px solid var(--border);
     font-size: 11.5px; color: var(--muted); text-decoration: none;
   }
+  .tcard .snip-head { border-radius: 0; }
   .snip-head:hover { color: var(--text); text-decoration: none; }
   .snip-head .p { color: var(--text); }
   .snip-head .ln { margin-left: auto; color: var(--faint); }
@@ -1186,6 +1227,9 @@ export class PageRepo extends LoomElement {
   /// Which issues the list is showing. Part of the query URL, so changing it
   /// refetches rather than filtering a list that was never loaded.
   @reactive accessor issueFilter: "open" | "closed" | "all" = "open";
+  /// What mentions the issue being viewed. Reading an issue without knowing a
+  /// change already proposes to fix it is how the same work gets done twice.
+  @reactive accessor issueRefs: CrossRef[] | null = null;
   /// Set while composing a new issue, so the form and the list are one page.
   @reactive accessor newIssue = false;
   /// The comment currently open for editing. One at a time, for the same
@@ -1372,6 +1416,20 @@ export class PageRepo extends LoomElement {
    * comes from them. Subscribing to the query rather than awaiting it is what
    * lets the two above run in parallel.
    */
+  /// The issue's cross-references, fetched when the issue itself arrives.
+  @watch("issueQuery")
+  onIssue() {
+    const v = this.loc?.view;
+    if (v?.kind !== "issue" || !this.issueQuery.ok) return;
+    const at = this.loc!;
+    this.issueRefs = null;
+    void api
+      .issueRefs(at.owner, at.name, v.number)
+      .then((r) => (this.issueRefs = r))
+      // Decoration: an issue is worth reading without it.
+      .catch(() => (this.issueRefs = []));
+  }
+
   @watch("refsQuery")
   onRefs() {
     if (!this.refsQuery.ok) return;
@@ -1426,10 +1484,26 @@ export class PageRepo extends LoomElement {
     return explicit || this.repo?.default_branch || "main";
   }
 
+  /// Send `#4` to whatever #4 turned out to be.
+  private async resolveNumber(n: number) {
+    const at = this.loc!;
+    try {
+      const what = await api.whatIs(at.owner, at.name, n);
+      go(`/${at.owner}/${at.name}/${what.kind === "issue" ? "issues" : "merges"}/${n}`);
+    } catch {
+      this.error = `Nothing is #${n} in this repository.`;
+    }
+  }
+
   private async loadView() {
     const at = this.loc;
     if (!at || !this.repo) return;
     const v = at.view;
+
+    if (v.kind === "number") {
+      void this.resolveNumber(v.number);
+      return;
+    }
 
     this.copied = false;
     this.copiedKey = "";
@@ -2260,7 +2334,12 @@ export class PageRepo extends LoomElement {
   ///
   /// Written once because the merge request conversation, a line thread and an
   /// issue all render the same thing, and three copies is how they drift.
-  private renderComment(c: Comment, refetch: () => Promise<void>, note?: string) {
+  private renderComment(
+    c: Comment,
+    refetch: () => Promise<void>,
+    note?: string,
+    flat = false,
+  ) {
     const at = this.loc!;
     const me = this.session.current?.username;
     const mine = !!me && c.author === me;
@@ -2292,6 +2371,8 @@ export class PageRepo extends LoomElement {
     return (
       <fkit-comment
         loom-key={c.id}
+        flat={flat}
+        repo={`${at.owner}/${at.name}`}
         author={c.author ?? ""}
         when={note ? `${relativeTime(c.created_at)} · ${note}` : relativeTime(c.created_at)}
         body={c.body}
@@ -3010,9 +3091,33 @@ fkit push</pre>
             <span class="sk" style="width:260px"></span>
           ) : (
             <>
+              {this.issueRefs && this.issueRefs.length ? (
+                <div class="links">
+                  <loom-icon name="link" size={12}></loom-icon>
+                  <span>
+                    Referenced by{" "}
+                    {this.issueRefs.map((r, k) => {
+                      const href = `/${at.owner}/${at.name}/${
+                        r.kind === "issue" ? "issues" : "merges"
+                      }/${r.number}`;
+                      return (
+                        <>
+                          {k > 0 ? ", " : ""}
+                          <a href={href} onClick={linkHandler(href)} title={r.title}>
+                            {r.kind === "merge" ? "merge request " : "issue "}#{r.number}
+                          </a>
+                          {r.state !== "open" ? <span class="st">({r.state})</span> : null}
+                        </>
+                      );
+                    })}
+                  </span>
+                </div>
+              ) : null}
+
               <div class="talk">
                 {i.body ? (
                   <fkit-comment
+                    repo={`${at.owner}/${at.name}`}
                     author={i.author ?? ""}
                     when={relativeTime(i.created_at)}
                     body={i.body}
@@ -3183,6 +3288,24 @@ fkit push</pre>
         })}
 
         {m.description ? <div class="sdesc">{m.description}</div> : null}
+
+        {m.closes.length ? (
+          <div class="links">
+            <loom-icon name="link" size={12}></loom-icon>
+            <span>
+              Merging this closes{" "}
+              {m.closes.map((n: number, i: number) => {
+                const href = `/${at.owner}/${at.name}/issues/${n}`;
+                return (
+                  <>
+                    {i > 0 ? ", " : ""}
+                    <a href={href} onClick={linkHandler(href)}>#{n}</a>
+                  </>
+                );
+              })}
+            </span>
+          </div>
+        ) : null}
 
         {!c ? (
           <div class="panel">
@@ -3397,7 +3520,7 @@ fkit push</pre>
       a.created_at < b.created_at ? -1 : a.created_at > b.created_at ? 1 : 0,
     );
 
-    // Threads are collapsed to one entry: the code, then everything said on
+    // Threads collapse to one entry: the code once, then everything said on
     // it. Keyed by anchor, the same way the diff groups them.
     const seen = new Set<string>();
     const items: { key: string; lead: Comment; thread: Comment[] }[] = [];
@@ -3419,20 +3542,15 @@ fkit push</pre>
         ) : items.length === 0 ? (
           <div class="none">Nothing said about this change yet.</div>
         ) : (
-          items.map((it) => (
-            <div class="talk-item" loom-key={it.key}>
-              {it.lead.blob ? this.snippet(it.lead, files) : null}
-              {it.thread.map((c) =>
-                this.renderComment(c, () => this.commentsQuery.refetch()),
-              )}
-              {it.lead.blob && it.thread.every((c) => c.resolved_at) ? (
-                <div class="resolved-note">
-                  <loom-icon name="check" size={11}></loom-icon>
-                  Resolved{it.lead.resolver ? ` by ${it.lead.resolver}` : ""}
-                </div>
-              ) : null}
-            </div>
-          ))
+          items.map((it) =>
+            it.lead.blob
+              ? this.threadCard(it.key, it.lead, it.thread, files, number)
+              : (
+                  <div class="talk-item" loom-key={it.key}>
+                    {this.renderComment(it.lead, () => this.commentsQuery.refetch())}
+                  </div>
+                ),
+          )
         )}
 
         {this.session.isAuthed ? (
@@ -3443,6 +3561,87 @@ fkit push</pre>
             onSend={(e: Event) => void this.postComment((e as CustomEvent<string>).detail)}
           ></fkit-composer>
         ) : null}
+      </div>
+    );
+  }
+
+  /// One line thread as a single card: the code, what was said about it, and
+  /// the two things you can do — answer it, or say it is settled.
+  ///
+  /// Previously these were three separate boxes stacked with a gap, which read
+  /// as three unrelated things rather than one conversation about one line.
+  private threadCard(
+    key: string,
+    lead: Comment,
+    thread: Comment[],
+    files: FileDiff[],
+    number: number,
+  ) {
+    const done = thread.length > 0 && thread.every((x) => x.resolved_at);
+    const replying = this.writingAt === key;
+
+    const anchor = {
+      file_path: lead.file_path!,
+      line: lead.line!,
+      side: lead.side!,
+      blob: lead.blob!,
+    };
+
+    const flip = () =>
+      void this.act(async () => {
+        await api.resolveThread(this.loc!.owner, this.loc!.name, number, anchor, !done);
+        await this.commentsQuery.refetch();
+      });
+
+    return (
+      <div class={`tcard ${done ? "done" : ""}`} loom-key={key}>
+        {this.snippet(lead, files)}
+
+        <div class="tcomments">
+          {thread.map((x) => this.renderComment(x, () => this.commentsQuery.refetch(), "", true))}
+        </div>
+
+        {replying ? (
+          <div class="treply">
+            <fkit-composer
+              compact
+              label="Reply"
+              placeholder="Reply to this thread"
+              busy={this.busy}
+              onSend={(e: Event) =>
+                void this.postComment((e as CustomEvent<string>).detail, anchor)
+              }
+            >
+              <button type="button" slot="extra" class="bare" onClick={() => (this.writingAt = "")}>
+                cancel
+              </button>
+            </fkit-composer>
+          </div>
+        ) : null}
+
+        <div class="tfoot">
+          {done ? (
+            <>
+              <loom-icon name="check" size={11}></loom-icon>
+              <span>Resolved{lead.resolver ? ` by ${lead.resolver}` : ""}</span>
+            </>
+          ) : (
+            <span class="open">Unresolved — this blocks merging</span>
+          )}
+          <span class="grow"></span>
+          {this.session.isAuthed ? (
+            <>
+              {replying ? null : (
+                <button type="button" class="bare" onClick={() => (this.writingAt = key)}>
+                  reply
+                </button>
+              )}
+              <button type="button" class="bare" disabled={this.busy} onClick={flip}>
+                {done ? "unresolve" : "resolve"}
+              </button>
+            </>
+          ) : null}
+        </div>
       </div>
     );
   }

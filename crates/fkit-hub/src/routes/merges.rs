@@ -35,6 +35,53 @@ pub fn routes() -> Router<AppState> {
         .route("/repos/{owner}/{name}/merges/{number}/reopen", post(reopen))
 }
 
+/// Issue numbers a merge request says it closes.
+///
+/// GitHub's spelling, because it is the one people already type: "closes #4",
+/// "fixes #12", "resolved #7", anywhere in the title or the description.
+///
+/// Hand-scanned rather than with a regex, to avoid a dependency for one
+/// pattern this small. The rules are deliberately strict — the keyword must be
+/// a whole word, the `#` must follow it within a space or two, and the number
+/// must be digits to the end of the word — so that prose like "this does not
+/// fix #4" is the only kind of false positive left, and that one needs a human
+/// to read it anyway.
+pub fn closes_issues(text: &str) -> Vec<i32> {
+    const WORDS: [&str; 9] = [
+        "close", "closes", "closed",
+        "fix", "fixes", "fixed",
+        "resolve", "resolves", "resolved",
+    ];
+
+    let lower = text.to_ascii_lowercase();
+    let mut out: Vec<i32> = Vec::new();
+    let mut words = lower.split_whitespace().peekable();
+
+    while let Some(w) = words.next() {
+        // Trim punctuation that commonly sits either side of the keyword.
+        let key = w.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        if !WORDS.contains(&key) {
+            continue;
+        }
+        let Some(next) = words.peek() else { continue };
+        let Some(digits) = next.trim_start_matches(['(', '[']).strip_prefix('#')
+        else {
+            continue;
+        };
+        let digits: String = digits.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            continue;
+        }
+        if let Ok(n) = digits.parse::<i32>()
+            && n > 0
+            && !out.contains(&n)
+        {
+            out.push(n);
+        }
+    }
+    out
+}
+
 #[derive(Debug, sqlx::FromRow)]
 struct MrRow {
     id: Uuid,
@@ -64,10 +111,18 @@ pub struct MrView {
     pub merged_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Issues this request says it closes, which merging it will.
+    pub closes: Vec<i32>,
 }
 
 impl From<MrRow> for MrView {
     fn from(r: MrRow) -> Self {
+        // Computed before the fields are moved into the view below.
+        let closes = closes_issues(&format!(
+            "{} {}",
+            r.title,
+            r.description.as_deref().unwrap_or("")
+        ));
         MrView {
             number: r.number,
             title: r.title,
@@ -81,6 +136,7 @@ impl From<MrRow> for MrView {
                 .and_then(|b| b.try_into().ok())
                 .map(|a: [u8; 32]| Hash(a).to_hex()),
             merged_at: r.merged_at,
+            closes,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }
@@ -469,8 +525,51 @@ async fn finish(
         .execute(&state.db)
         .await?;
 
+    // Close whatever the request said it closes, now that it has landed.
+    //
+    // After the merge rather than inside it: an issue left open because this
+    // failed is a nuisance someone fixes in one click, whereas a merge rolled
+    // back because an issue could not be closed is a far worse trade.
+    let wants = closes_issues(&format!(
+        "{} {}",
+        row.title,
+        row.description.as_deref().unwrap_or("")
+    ));
+    for n in &wants {
+        let closed: Option<(Uuid,)> = sqlx::query_as(
+            "UPDATE issues
+                SET state = 'closed', closed_at = now(), closed_by = $3, updated_at = now()
+              WHERE repo_id = $1 AND number = $2 AND state = 'open'
+              RETURNING id",
+        )
+        .bind(repo.id)
+        .bind(n)
+        .bind(actor)
+        .fetch_optional(&state.db)
+        .await
+        .unwrap_or(None);
+
+        // Say what closed it, on the issue, so the trail reads from either
+        // end rather than only from the merge request.
+        if let Some((issue_id,)) = closed {
+            let _ = sqlx::query(
+                "INSERT INTO comments (id, repo_id, issue_id, author_id, body)
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(repo.id)
+            .bind(issue_id)
+            .bind(actor)
+            .bind(format!("Closed by merge request #{}.", row.number))
+            .execute(&state.db)
+            .await;
+        }
+    }
+
     super::audit(state, Some(actor), Some(repo.id), "merge_request.merge",
-        serde_json::json!({ "number": row.number, "commit": commit.to_hex() })).await;
+        serde_json::json!({
+            "number": row.number, "commit": commit.to_hex(), "closed": wants
+        })).await;
 
     let updated: MrRow = sqlx::query_as(SELECT_BY_ID)
         .bind(row.id)
@@ -524,4 +623,73 @@ async fn reopen(
     Path((owner, name, number)): Path<(String, String, i32)>,
 ) -> AppResult<Json<MrView>> {
     set_state(&state, &viewer, &owner, &name, number, "open", "closed").await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::closes_issues;
+
+    #[test]
+    fn the_three_keywords_and_their_tenses_are_recognised() {
+        for word in [
+            "close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves",
+            "resolved",
+        ] {
+            assert_eq!(
+                closes_issues(&format!("{word} #4")),
+                vec![4],
+                "{word} should link"
+            );
+        }
+    }
+
+    #[test]
+    fn case_and_position_do_not_matter() {
+        assert_eq!(closes_issues("Fixes #12"), vec![12]);
+        assert_eq!(closes_issues("CLOSES #3"), vec![3]);
+        assert_eq!(
+            closes_issues("Rework the parser. Resolves #9 along the way."),
+            vec![9]
+        );
+    }
+
+    #[test]
+    fn several_are_collected_and_repeats_are_not() {
+        assert_eq!(closes_issues("closes #1, fixes #2, closes #1"), vec![1, 2]);
+    }
+
+    #[test]
+    fn punctuation_around_the_reference_is_tolerated() {
+        assert_eq!(closes_issues("(closes #7)"), vec![7]);
+        assert_eq!(closes_issues("closes #7."), vec![7]);
+        assert_eq!(closes_issues("- fixes #7"), vec![7]);
+    }
+
+    #[test]
+    fn a_bare_reference_links_nothing() {
+        // Mentioning an issue is not promising to close it.
+        assert!(closes_issues("see #4 for background").is_empty());
+        assert!(closes_issues("#4").is_empty());
+    }
+
+    #[test]
+    fn the_keyword_must_be_a_whole_word() {
+        // "prefixes" ends in "fixes" and means nothing of the sort.
+        assert!(closes_issues("prefixes #4 are wrong").is_empty());
+        assert!(closes_issues("unfixed #4").is_empty());
+    }
+
+    #[test]
+    fn a_number_is_required() {
+        assert!(closes_issues("fixes #").is_empty());
+        assert!(closes_issues("fixes #abc").is_empty());
+        assert!(closes_issues("fixes the parser").is_empty());
+        assert!(closes_issues("fixes #0").is_empty());
+    }
+
+    #[test]
+    fn the_keyword_and_the_number_must_be_adjacent() {
+        // Otherwise any description containing both words anywhere would link.
+        assert!(closes_issues("fixes the thing described in #4").is_empty());
+    }
 }

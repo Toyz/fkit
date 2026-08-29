@@ -41,6 +41,8 @@ pub fn routes() -> Router<AppState> {
             "/repos/{owner}/{name}/merges/{number}/resolve",
             post(resolve_thread),
         )
+        .route("/repos/{owner}/{name}/n/{number}", get(what_is))
+        .route("/repos/{owner}/{name}/issues/{number}/refs", get(issue_refs))
 }
 
 // ---- issues -------------------------------------------------------------
@@ -379,6 +381,111 @@ async fn reopen(
     Path((owner, name, number)): Path<(String, String, i32)>,
 ) -> AppResult<Json<IssueView>> {
     set_state(&state, &viewer, &owner, &name, number, true).await
+}
+
+/// What `#4` is.
+///
+/// Issues and merge requests share one counter so that a number names one
+/// thing; this is the lookup that turns the number back into which thing. It
+/// exists so a `#4` written in a comment can be a link without whoever wrote
+/// it having to know or say which kind they meant.
+async fn what_is(
+    State(state): State<AppState>,
+    viewer: Viewer,
+    Path((owner, name, number)): Path<(String, String, i32)>,
+) -> AppResult<Json<serde_json::Value>> {
+    let (repo, access, _) = super::load_repo(&state, &viewer, &owner, &name).await?;
+    require_read(access, &owner, &name)?;
+
+    let issue: Option<(String,)> =
+        sqlx::query_as("SELECT title FROM issues WHERE repo_id = $1 AND number = $2")
+            .bind(repo.id)
+            .bind(number)
+            .fetch_optional(&state.db)
+            .await?;
+    if let Some((title,)) = issue {
+        return Ok(Json(
+            serde_json::json!({ "kind": "issue", "number": number, "title": title }),
+        ));
+    }
+
+    let mr: Option<(String,)> =
+        sqlx::query_as("SELECT title FROM merge_requests WHERE repo_id = $1 AND number = $2")
+            .bind(repo.id)
+            .bind(number)
+            .fetch_optional(&state.db)
+            .await?;
+    if let Some((title,)) = mr {
+        return Ok(Json(
+            serde_json::json!({ "kind": "merge", "number": number, "title": title }),
+        ));
+    }
+
+    Err(AppError::not_found(format!("nothing is #{number} here")))
+}
+
+#[derive(Serialize)]
+pub struct RefView {
+    pub kind: &'static str,
+    pub number: i32,
+    pub title: String,
+    pub state: String,
+    pub author: Option<String>,
+}
+
+/// What mentions this issue.
+///
+/// The link a person cares about most is the merge request that will close
+/// it, but any mention is worth showing: reading an issue and not knowing a
+/// change already proposes to fix it is how the same work gets done twice.
+///
+/// Matched with a word-boundary regex rather than LIKE, so `#4` does not also
+/// match `#41`.
+async fn issue_refs(
+    State(state): State<AppState>,
+    viewer: Viewer,
+    Path((owner, name, number)): Path<(String, String, i32)>,
+) -> AppResult<Json<Vec<RefView>>> {
+    let (repo, access, _) = super::load_repo(&state, &viewer, &owner, &name).await?;
+    require_read(access, &owner, &name)?;
+
+    let pattern = format!("(^|[^0-9a-zA-Z_])#{number}([^0-9]|$)");
+
+    let rows: Vec<(String, i32, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT 'merge', m.number, m.title, m.state, u.username
+           FROM merge_requests m
+           LEFT JOIN users u ON u.id = m.author_id
+          WHERE m.repo_id = $1
+            AND (m.title ~ $2 OR COALESCE(m.description, '') ~ $2
+                 OR EXISTS (SELECT 1 FROM comments c
+                             WHERE c.merge_request_id = m.id AND c.body ~ $2))
+          UNION ALL
+         SELECT 'issue', i.number, i.title, i.state, u.username
+           FROM issues i
+           LEFT JOIN users u ON u.id = i.author_id
+          WHERE i.repo_id = $1 AND i.number <> $3
+            AND (i.title ~ $2 OR COALESCE(i.body, '') ~ $2
+                 OR EXISTS (SELECT 1 FROM comments c
+                             WHERE c.issue_id = i.id AND c.body ~ $2))
+          ORDER BY 2",
+    )
+    .bind(repo.id)
+    .bind(&pattern)
+    .bind(number)
+    .fetch_all(&state.db)
+    .await?;
+
+    Ok(Json(
+        rows.into_iter()
+            .map(|(kind, number, title, state, author)| RefView {
+                kind: if kind == "merge" { "merge" } else { "issue" },
+                number,
+                title,
+                state,
+                author,
+            })
+            .collect(),
+    ))
 }
 
 // ---- comments -----------------------------------------------------------

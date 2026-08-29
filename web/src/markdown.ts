@@ -33,6 +33,15 @@ export interface MarkdownContext {
   raw: (path: string) => string;
   /** A path a reader should be *taken to*: links. */
   page: (path: string) => string;
+  /**
+   * Where `#4` should go, when the document is somewhere `#4` means
+   * something — a comment on a repository, rather than a README.
+   *
+   * Issues and merge requests share one counter precisely so that a number
+   * names one thing, which is what makes this link possible to build without
+   * knowing which of the two it is.
+   */
+  ref?: (n: number) => string;
 }
 
 /** Is this URL relative to the document, rather than absolute or an anchor? */
@@ -58,6 +67,12 @@ function inline(text: string, ctx?: MarkdownContext): string {
         const to = ctx && isRelative(href) ? ctx.page(href) : href;
         return `<a href="${to}" rel="noopener noreferrer">${label}</a>`;
       })
+      // `#4` links to whatever #4 is. Only where a context says numbers mean
+      // something here, and never inside a word, so `a#4` and `#4` in a URL
+      // fragment are left alone.
+      .replace(/(^|[\s(\[])#(\d+)\b/g, (m, lead: string, n: string) =>
+        ctx?.ref ? `${lead}<a href="${ctx.ref(Number(n))}">#${n}</a>` : m,
+      )
       .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
       .replace(/(^|\W)_([^_]+)_(?=\W|$)/g, "$1<em>$2</em>")
       .replace(/\*([^*]+)\*/g, "<em>$1</em>")

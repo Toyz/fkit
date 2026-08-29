@@ -23,6 +23,15 @@ const commentSheet = css`
   }
   :host([mine]) .box { border-color: color-mix(in srgb, var(--accent) 35%, var(--border)); }
 
+  /* Inside a thread card the surrounding box already draws the edges; a
+     second one around every comment turns a conversation into a stack of
+     boxes in boxes. */
+  :host([flat]) .box,
+  :host([flat][mine]) .box {
+    border: 0; border-radius: 0; background: transparent;
+  }
+  :host([flat]) header { background: transparent; }
+
   header {
     display: flex; align-items: center; gap: 8px;
     padding: 7px 12px; background: var(--raised);
@@ -80,6 +89,10 @@ export class FkitComment extends LoomElement {
   @prop accessor edited = false;
   /** Written by the person reading it — worth a quieter mark than a badge. */
   @prop accessor mine = false;
+  /** Drop the border, for a comment that sits inside a card of its own. */
+  @prop accessor flat = false;
+  /** `owner/repo`, so `#4` in the body can link to whatever #4 is. */
+  @prop accessor repo = "";
 
   update() {
     return (
@@ -94,7 +107,19 @@ export class FkitComment extends LoomElement {
         </header>
         {/* The renderer escapes what it does not recognise, which is what
             makes it safe to hand a comment straight to it. */}
-        <div class="body" innerHTML={renderMarkdown(this.body)}></div>
+        <div
+          class="body"
+          innerHTML={renderMarkdown(
+            this.body,
+            this.repo
+              ? {
+                  raw: (x: string) => x,
+                  page: (x: string) => x,
+                  ref: (n: number) => `/${this.repo}/n/${n}`,
+                }
+              : undefined,
+          )}
+        ></div>
       </div>
     );
   }
