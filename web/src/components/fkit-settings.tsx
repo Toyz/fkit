@@ -51,6 +51,9 @@ const heading = css`
     height: 1px; background: var(--accent);
   }
   .fill { flex: 1; }
+  /* A control that belongs to the section rather than to any one field —
+     a filter over the list below it, say — rides the heading line. */
+  ::slotted([slot="action"]) { align-self: center; }
   .v {
     font-family: var(--mono); font-size: 11.5px; font-weight: 400;
     color: var(--faint); white-space: nowrap;
@@ -118,6 +121,7 @@ export class FkitSection extends LoomElement {
           <h2 class="h">
             <span class="t">{this.heading}</span>
             <span class="fill"></span>
+            <slot name="action"></slot>
             {this.value ? <span class="v">{this.value}</span> : null}
           </h2>
         ) : null}
