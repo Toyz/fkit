@@ -8,9 +8,9 @@ a file is a Merkle tree over content-defined chunks, not one opaque blob. Point
 it at a 154 GiB tree of build output and disk images and it stores **1.2 GB**,
 128× smaller, almost entirely from noticing the same bytes twice.
 
-It is honest about the other direction too: for ordinary source history, git's
-delta compression still wins, and by how much is [measured
-below](#not-done-yet).
+For ordinary source history git is smaller, by 3.7×, because it deltas versions
+against each other and this does not. That is a [deliberate
+trade](#not-done-yet) with the arithmetic written out, not an oversight.
 
 ```
 fkit init                 fkit commit -m "..."      fkit push
@@ -494,8 +494,8 @@ set only, so `--force` cannot eat a file fkit has never seen.
   bases. fkit picks one and reports the ambiguity rather than merging them into a
   virtual base the way git does.
 - **TLS.** Both servers speak plain `ws://`. Terminate TLS in front.
-- **Delta compression.** Objects are stored whole. Replaying this repository's
-  own history makes the gap concrete:
+- **Delta compression, deliberately not done.** Objects are stored whole. On
+  source history that costs real space, and the measurement is not close:
 
   | 61 commits of fkit itself | on disk |
   |---|---|
@@ -506,11 +506,31 @@ set only, so `--force` cannot eat a file fkit has never seen.
   collapses to 5.3 MiB unique and 2.2 MiB stored, 30× — but 62% of the source
   files here are smaller than the 8 KiB average chunk, so a one-line edit
   rewrites the whole file as a new chunk. Content-defined chunking pays off on
-  large files with localized edits, which is the opposite of source code. Two
-  obvious levers were measured and neither is one: zstd 1→9 gives 2.2 → 2.0
-  MiB, and a 2 KiB average chunk cuts unique bytes 23% while leaving the disk
-  total unchanged, because smaller frames compress worse and the extra index
-  entries eat the rest. Closing it needs deltas between versions of a chunk.
+  large files with localized edits, which is the opposite of source code.
+
+  Neither obvious lever is one: zstd 1→9 gives 2.2 → 2.0 MiB, and a 2 KiB
+  average chunk cuts unique bytes 23% while leaving the disk total unchanged,
+  because smaller frames compress worse and the extra index entries eat the
+  rest. The gap is deltas, and it is possible to say exactly how much: chaining
+  every version of every file in this history as a patch against the previous
+  one costs 621 KiB against 3275 KiB stored whole — **5.3×**, and within 9% of
+  what git's pack actually achieves. So the whole difference is delta
+  compression and nothing else.
+
+  It is still the wrong trade here. Reconstructing an object from a chain of
+  four deltas measured **8.4× slower** than reading it whole, and that scales
+  with chain depth — git caps chains at 50 for this reason. Taking it would
+  cost three properties this design is built on: one seek per object, `fsck`
+  verifying each object without needing another, and an object cache whose
+  misses are cheap. In exchange for 2.6 MiB on a repository where storage is
+  the cheapest thing involved.
+
+  And it buys nothing where fkit is actually pointed. A 12 MB file with one
+  byte changed is already 4 objects; there is no redundancy left for a delta to
+  find. The entire win is on small source text, which is both trivial in
+  absolute terms and exactly the workload git already handles well. Being
+  larger there is the price of an object that can be read in one seek and
+  checked on its own.
 
 - **Cross-repo dedup beyond a fork network.** Forks share one store, so a
   repository and its forks deduplicate against each other. Two *unrelated*
