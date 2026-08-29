@@ -11,9 +11,29 @@
 import { LoomElement, component, css, styles, reactive } from "@toyz/loom";
 import { hotkey } from "@toyz/loom/element";
 
+/** One consequence of going ahead. */
+export interface Effect {
+  text: string;
+  /**
+   * What this line costs. `loss` is something that breaks or goes away,
+   * `safe` is a reassurance — the thing people most want to know before a
+   * destructive-sounding action is what it does *not* touch.
+   */
+  tone?: "loss" | "safe";
+}
+
 export interface ConfirmOptions {
   title: string;
   body?: string;
+  /**
+   * What will happen, one item per consequence.
+   *
+   * Preferred over `body` for anything destructive. The same facts written as
+   * a paragraph have to be read start to finish to find the one that matters;
+   * as a list they can be counted at a glance, which is the whole job of the
+   * moment before someone commits to something.
+   */
+  effects?: Effect[];
   /** Label on the confirming button. */
   confirm?: string;
   /** Style the action as destructive. */
@@ -51,6 +71,25 @@ const sheet = css`
     color: var(--muted); line-height: 1.55;
   }
   .body code { font-family: var(--mono); font-size: 12px; color: var(--text); }
+
+  /* One consequence per line, each opening with the same mark in the same
+     column, so the list can be counted without being read. */
+  .fx { list-style: none; margin: 0; padding: 0; }
+  .fx + input { margin-top: 12px; }
+  .fx li {
+    display: grid; grid-template-columns: 14px minmax(0, 1fr);
+    gap: 8px; align-items: baseline;
+    padding: 3px 0; font-size: 12.5px; line-height: 1.5;
+  }
+  .fx .mk {
+    font-family: var(--mono); font-size: 13px; text-align: center;
+    /* Not a colour on its own: the marks differ in shape too, so the
+       distinction survives being unable to tell the red from the green. */
+  }
+  .fx li.loss { color: var(--text); }
+  .fx li.loss .mk { color: var(--removed); }
+  .fx li.safe { color: var(--muted); }
+  .fx li.safe .mk { color: var(--accent); }
   .body input {
     width: 100%; margin-top: 10px; font: inherit; font-family: var(--mono); font-size: 12px;
     padding: 6px 9px; border: 1px solid var(--border-hi); border-radius: var(--radius);
@@ -117,9 +156,21 @@ export class FkitDialog extends LoomElement {
         <div class="scrim" onClick={() => this.finish(false)}></div>
         <div class={`box ${o.danger ? "danger" : ""}`} role="dialog" aria-modal="true">
           <div class="head">{o.title}</div>
-          {o.body || gated ? (
+          {o.body || o.effects?.length || gated ? (
             <div class="body">
               {o.body}
+              {o.effects?.length ? (
+                <ul class="fx">
+                  {o.effects.map((e) => (
+                    <li class={e.tone ?? "loss"}>
+                      <span class="mk" aria-hidden="true">
+                        {e.tone === "safe" ? "+" : "−"}
+                      </span>
+                      <span>{e.text}</span>
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
               {gated ? (
                 <input
                   autofocus

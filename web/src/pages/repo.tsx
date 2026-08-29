@@ -3769,8 +3769,11 @@ export class PageRepo extends LoomElement {
                 void (async () => {
                   const ok = await confirmAction({
                     title: "Delete this comment?",
-                    body: "It is removed for everyone. This cannot be undone.",
-                    confirm: "Delete",
+                    effects: [
+                      { text: "Removed for everyone" },
+                      { text: "Cannot be undone" },
+                    ],
+                    confirm: "delete",
                     danger: true,
                   });
                   if (!ok) return;
@@ -5988,7 +5991,10 @@ fkit push</pre>
                     onClick={async () => {
                       const ok = await confirmAction({
                         title: `Delete the "${l.name}" label?`,
-                        body: "It is removed from every issue carrying it. The issues themselves are untouched.",
+                        effects: [
+                          { text: "Removed from every issue carrying it" },
+                          { text: "The issues themselves are untouched", tone: "safe" },
+                        ],
                         confirm: "Delete label",
                         danger: true,
                       });
@@ -6107,8 +6113,12 @@ fkit push</pre>
                     onClick={async () => {
                       const ok = await confirmAction({
                         title: `Remove ${c.username}?`,
-                        body: `They lose access to ${r.full_name} immediately. Anything already cloned stays on their machine.`,
-                        confirm: "Remove",
+                        effects: [
+                          { text: `Loses access to ${r.full_name}, immediately` },
+                          { text: "Anything already cloned stays on their machine", tone: "safe" },
+                          { text: "Their account and their own repositories are untouched", tone: "safe" },
+                        ],
+                        confirm: "remove",
                         danger: true,
                       });
                       if (!ok) return;
@@ -6202,8 +6212,13 @@ fkit push</pre>
                 onClick={async () => {
                   const ok = await confirmAction({
                     title: `Delete ${r.full_name}?`,
-                    body: "This cannot be undone. Type the repository name to confirm.",
-                    confirm: "Delete repository",
+                    effects: [
+                      { text: "Every commit, branch and tag" },
+                      { text: "Its issues, merge requests and comments" },
+                      { text: "Cannot be undone" },
+                      { text: "Clones already on other machines are untouched", tone: "safe" },
+                    ],
+                    confirm: "delete repository",
                     danger: true,
                     typeToConfirm: r.name,
                   });

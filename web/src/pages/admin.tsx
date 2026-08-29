@@ -1034,7 +1034,12 @@ export class PageAdmin extends LoomElement {
               if (u.is_active) {
                 const ok = await confirmAction({
                   title: `Disable ${u.username}?`,
-                  body: "They are signed out everywhere immediately and their access tokens stop working, so anything of theirs that pushes — a laptop, a CI job — fails until you enable them again. Nothing is deleted.",
+                  effects: [
+                    { text: "Signed out everywhere, immediately" },
+                    { text: "Access tokens stop working — a laptop or CI job that pushes will fail" },
+                    { text: "Nothing is deleted", tone: "safe" },
+                    { text: "Undone whenever you enable them again", tone: "safe" },
+                  ],
                   confirm: "disable account",
                 });
                 if (!ok) return;
@@ -1054,7 +1059,21 @@ export class PageAdmin extends LoomElement {
             onClick={async () => {
               const ok = await confirmAction({
                 title: `Delete ${u.username}?`,
-                body: `This permanently removes their account and all ${u.repo_count} of their repositories, including every object stored for them. It cannot be undone.`,
+                effects: [
+                  { text: "Their account, permanently" },
+                  // Omitted at zero: "all 0 of their repositories" is a line
+                  // that makes someone stop and re-read to learn nothing.
+                  ...(u.repo_count > 0
+                    ? [
+                        {
+                          text: `All ${u.repo_count} of their ${
+                            u.repo_count === 1 ? "repository" : "repositories"
+                          }, and every object stored for them`,
+                        },
+                      ]
+                    : []),
+                  { text: "Cannot be undone" },
+                ],
                 confirm: "delete account",
                 danger: true,
                 typeToConfirm: u.username,

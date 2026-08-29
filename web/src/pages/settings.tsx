@@ -618,8 +618,12 @@ export class PageSettings extends SettingsBase {
                       onClick={async () => {
                         const ok = await confirmAction({
                           title: `Revoke "${t.name}"?`,
-                          body: "Anything using this token stops working immediately. This cannot be undone — you would need to create a new one.",
-                          confirm: "Revoke token",
+                          effects: [
+                            { text: "Anything using this token stops working, immediately" },
+                            { text: "Cannot be undone — you would generate a new one" },
+                            { text: "Your other tokens are unaffected", tone: "safe" },
+                          ],
+                          confirm: "revoke token",
                           danger: true,
                         });
                         if (!ok) return;
@@ -689,7 +693,15 @@ export class PageSettings extends SettingsBase {
               onClick={async () => {
                 const ok = await confirmAction({
                   title: "Sign out everywhere else?",
-                  body: `${others.length} other ${others.length === 1 ? "session" : "sessions"} will be signed out. This browser stays signed in.`,
+                  effects: [
+                    {
+                      text: `${others.length} other ${
+                        others.length === 1 ? "session is" : "sessions are"
+                      } signed out`,
+                    },
+                    { text: "This browser stays signed in", tone: "safe" },
+                    { text: "Access tokens are unaffected", tone: "safe" },
+                  ],
                   confirm: "Sign out everywhere else",
                   danger: true,
                 });
