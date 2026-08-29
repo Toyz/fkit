@@ -67,7 +67,15 @@ jobs:
           # the same crates, and a tag push should not start cold.
           shared-key: image
 
-      - run: cargo build --release --workspace --target ${{ env.TARGET }}
+      # `redis-cache` is off by default because most servers should not use a
+      # shared tier — but that is a decision for whoever runs the server, made
+      # in hub.toml, and it cannot be made at all if the client is not in the
+      # binary. Compiling it in costs a few pure-Rust crates and no C
+      # dependency, so the published image can do either.
+      - run: |
+          cargo build --release --workspace \
+            --features fkit-hub/redis-cache \
+            --target ${{ env.TARGET }}
 
       - name: Assemble the build context
         run: |

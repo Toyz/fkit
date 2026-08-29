@@ -37,9 +37,14 @@ struct FileConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CacheSection {
-    /// How much object data to hold in this process, in mebibytes.
+    /// How much object data to hold in this process: `"64MB"`, `"512kb"`,
+    /// `"2GB"`, or a plain number of bytes.
+    memory: Option<String>,
+    /// How long an untouched entry may stay: `"30m"`, `"1800s"`, `"2h"`.
+    ttl: Option<String>,
+    /// The units-in-the-name spellings this replaced. Still read, so a
+    /// configuration file that predates the change keeps working.
     memory_mb: Option<usize>,
-    /// How long an untouched entry may stay, in seconds.
     ttl_secs: Option<u64>,
     /// A Valkey or Redis URL to share a second tier through.
     ///
@@ -49,6 +54,46 @@ struct CacheSection {
     /// it would sit in front of, which is why memory is always the first tier
     /// and this is only ever the second.
     redis_url: Option<String>,
+}
+
+/// A size written the way everyone writes sizes.
+///
+/// `64MB`, `512kb`, `2G`, or a bare number of bytes. The suffixes are binary —
+/// `MB` is 1024², not 1000² — because this bounds a memory allocation, and
+/// every other tool that bounds one does the same.
+fn parse_size(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let digits = s.trim_end_matches(|c: char| c.is_ascii_alphabetic() || c.is_whitespace());
+    let unit = s[digits.len()..].trim().to_ascii_lowercase();
+    let n: u64 = digits.trim().parse().ok()?;
+
+    let scale: u64 = match unit.as_str() {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024 * 1024,
+        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+        _ => return None,
+    };
+    n.checked_mul(scale)
+}
+
+/// A duration written the way everyone writes durations: `30m`, `2h`, `1d`.
+///
+/// A bare number is seconds, which is what the key it replaced meant.
+fn parse_duration(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let digits = s.trim_end_matches(|c: char| c.is_ascii_alphabetic() || c.is_whitespace());
+    let unit = s[digits.len()..].trim().to_ascii_lowercase();
+    let n: u64 = digits.trim().parse().ok()?;
+
+    let scale: u64 = match unit.as_str() {
+        "" | "s" | "sec" | "secs" => 1,
+        "m" | "min" | "mins" => 60,
+        "h" | "hr" | "hrs" => 3600,
+        "d" | "day" | "days" => 86_400,
+        _ => return None,
+    };
+    n.checked_mul(scale)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -250,7 +295,22 @@ impl Config {
         if let Some(v) = f.server.web_dir { self.web_dir = v }
         if let Some(v) = f.server.secure_cookies { self.secure_cookies = v }
         if let Some(v) = f.server.trust_proxy { self.trust_proxy = v }
-        if let Some(v) = f.cache.memory_mb { self.cache_memory_bytes = v * 1024 * 1024 }
+        // The old spelling first, so the new one wins if somehow both are set.
+        if let Some(v) = f.cache.memory_mb {
+            self.cache_memory_bytes = v * 1024 * 1024;
+        }
+        if let Some(v) = &f.cache.memory {
+            self.cache_memory_bytes = parse_size(v)
+                .ok_or_else(|| anyhow::anyhow!(
+                    "[cache] memory: {v:?} is not a size — try \"64MB\", \"512kb\" or a number of bytes"
+                ))? as usize;
+        }
+        if let Some(v) = &f.cache.ttl {
+            self.cache_ttl_secs = parse_duration(v)
+                .ok_or_else(|| anyhow::anyhow!(
+                    "[cache] ttl: {v:?} is not a duration — try \"30m\", \"1800s\" or \"2h\""
+                ))?;
+        }
         if let Some(v) = f.cache.ttl_secs { self.cache_ttl_secs = v }
         if let Some(v) = f.cache.redis_url { self.cache_redis_url = Some(v) }
         if let Some(v) = f.server.open_registration { self.open_registration = v }
@@ -447,8 +507,8 @@ default_repo_visibility = "private"
 [cache]
 # Object bytes held in this process. The store is content-addressed, so a
 # cached object can never be stale — only unwanted.
-memory_mb = 64
-ttl_secs = 1800
+memory = "64MB"
+ttl = "30m"
 # A shared second tier. Leave unset on a single host with local storage: a
 # round trip to Redis costs more than reading the object off disk, so it only
 # pays when a miss is expensive — several hub processes, or slow storage.
@@ -490,6 +550,58 @@ max_push_bytes = 0
 # only errors. 0 disables the limit. Default 1 GiB.
 max_archive_bytes = 1073741824
 "#;
+
+#[cfg(test)]
+mod unit_tests {
+    use super::{parse_duration, parse_size};
+
+    #[test]
+    fn a_size_reads_the_way_it_is_written() {
+        assert_eq!(parse_size("64MB"), Some(64 * 1024 * 1024));
+        assert_eq!(parse_size("64mb"), Some(64 * 1024 * 1024));
+        assert_eq!(parse_size("64 MiB"), Some(64 * 1024 * 1024));
+        assert_eq!(parse_size("64M"), Some(64 * 1024 * 1024));
+        assert_eq!(parse_size("512kb"), Some(512 * 1024));
+        assert_eq!(parse_size("2GB"), Some(2 * 1024 * 1024 * 1024));
+        // A bare number is bytes, and 0 disables the cache rather than failing.
+        assert_eq!(parse_size("4096"), Some(4096));
+        assert_eq!(parse_size("0"), Some(0));
+    }
+
+    #[test]
+    fn a_size_that_is_not_one_is_refused_rather_than_guessed() {
+        // Silently reading "64" out of "64tb" would size the cache at 64 bytes
+        // and look like it worked.
+        for bad in ["64tb", "sixty", "", "MB", "64 MB extra", "-1", "1.5MB"] {
+            assert_eq!(parse_size(bad), None, "{bad:?} should not parse");
+        }
+    }
+
+    #[test]
+    fn a_duration_reads_the_way_it_is_written() {
+        assert_eq!(parse_duration("30m"), Some(1800));
+        assert_eq!(parse_duration("1800s"), Some(1800));
+        assert_eq!(parse_duration("2h"), Some(7200));
+        assert_eq!(parse_duration("1d"), Some(86_400));
+        // A bare number is seconds — what the key this replaced meant.
+        assert_eq!(parse_duration("1800"), Some(1800));
+    }
+
+    #[test]
+    fn a_duration_that_is_not_one_is_refused() {
+        for bad in ["30 years", "soon", "", "m", "1.5h"] {
+            assert_eq!(parse_duration(bad), None, "{bad:?} should not parse");
+        }
+    }
+
+    #[test]
+    fn the_units_are_binary_and_that_is_stated() {
+        // 1 MB here is 1024 squared, like every tool that bounds memory. The
+        // test exists so the choice cannot drift into decimal unnoticed.
+        assert_eq!(parse_size("1MB"), Some(1_048_576));
+        assert_ne!(parse_size("1MB"), Some(1_000_000));
+    }
+}
 
 #[cfg(test)]
 mod tests {

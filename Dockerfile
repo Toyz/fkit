@@ -37,13 +37,13 @@ RUN mkdir -p crates/fkit-core/src crates/fkit-cli/src crates/fkit-server/src cra
  && echo 'fn main(){}'  > crates/fkit-server/src/main.rs \
  && echo 'fn main(){}'  > crates/fkit-hub/src/main.rs \
  && touch crates/fkit-core/src/lib.rs crates/fkit-server/src/lib.rs \
- && cargo build --release --workspace 2>/dev/null || true
+ && cargo build --release --workspace --features fkit-hub/redis-cache 2>/dev/null || true
 
 # Now the real sources.
 COPY crates/ crates/
 # Bust the stub fingerprints so cargo rebuilds these crates with real code.
 RUN find crates -name '*.rs' -exec touch {} + \
- && cargo build --release --workspace \
+ && cargo build --release --workspace --features fkit-hub/redis-cache \
  && strip target/release/fkit target/release/fkitd target/release/fkit-hub
 
 

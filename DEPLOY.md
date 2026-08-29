@@ -1,7 +1,7 @@
 # Deploying fkit hub
 
 The server runs a published image. It never needs the source tree, a Rust
-toolchain, or Node — you build once and the server pulls.
+toolchain, or Node.
 
 ## 1. Publish an image
 
@@ -9,9 +9,8 @@ toolchain, or Node — you build once and the server pulls.
 make push TAG=v1
 ```
 
-Builds for `linux/amd64` (override with `PLATFORMS=linux/arm64`) and pushes
-`ghcr.io/toyz/fkit-hub:v1` and `:latest`. A registry login with package-write
-rights is needed once:
+Builds `linux/amd64` (override with `PLATFORMS=linux/arm64`) and pushes
+`ghcr.io/toyz/fkit-hub:v1` and `:latest`. Registry login, once:
 
 ```sh
 gh auth refresh -s write:packages          # the default token cannot push
@@ -19,38 +18,29 @@ gh auth token | docker login ghcr.io -u Toyz --password-stdin
 ```
 
 GHCR packages are private by default, so the server needs its own login — a
-classic PAT with `read:packages` is enough.
+classic PAT with `read:packages`.
 
-Once this repository is on GitHub, `.github/workflows/image.yml` does this on
-every tag push and it is much faster than the local path: it compiles natively
-with a warm cargo cache and assembles the image from the finished binaries via
-`Dockerfile.dist`, so a source-only change rebuilds four crates rather than the
-whole dependency tree, and the image build itself takes about a second. The
-local `make image` keeps the self-contained `Dockerfile` — one command, no
-toolchain assumptions — at the cost of a cold build under QEMU.
+`.github/workflows/image.yml` does all of this on a tag push, and is much
+faster: it compiles natively with a warm cache and assembles from finished
+binaries via `Dockerfile.dist`. `make image` uses the self-contained
+`Dockerfile` instead — one command, no toolchain assumptions, cold build under
+QEMU.
 
-## 2. Put the deployment files on the server
+## 2. Put the files on the server
 
 ```sh
 scp docker-compose.prod.yml deploy/hub.toml .env.prod.example server:/opt/fkit/
 ssh server 'cd /opt/fkit && mv .env.prod.example .env.prod'
 ```
 
-Settings live in **`hub.toml`**, mounted at `/etc/fkit/hub.toml`. Secrets live
-in **`.env.prod`** — a connection string and an API key have no business in a
-file that gets committed. Note the environment overrides the file, so the
-compose passes only those two through and nothing else.
-
-Fill in `.env.prod`:
+Settings go in **`hub.toml`** (mounted at `/etc/fkit/hub.toml`), secrets in
+**`.env.prod`**. The environment overrides the file.
 
 ```sh
 POSTGRES_PASSWORD=$(openssl rand -base64 24)   # with --profile bundled-db
 # or DATABASE_URL=postgres://...               # and drop that profile
 RESEND_API_KEY=                                # optional
 ```
-
-Migrations run on boot either way — the hub needs a database it can create
-tables in, not a specific one.
 
 ## 3. Start it
 
@@ -61,50 +51,32 @@ docker compose --env-file .env.prod -f docker-compose.prod.yml \
 docker compose -f docker-compose.prod.yml logs -f hub
 ```
 
-The hub listens on `BIND_ADDR:HUB_PORT` (`127.0.0.1:7500` by default), which is
-local-only until you deliberately expose it. Migrations run on boot.
+Listens on `BIND_ADDR:HUB_PORT` (`127.0.0.1:7500`), local-only until you expose
+it. Migrations run on boot.
 
-### Claim the administrator account before you expose it
+### Claim the admin account before you expose it
 
-An empty server lets the *first* registration through even with
-`open_registration = false` — otherwise an instance shipped with registration
-closed could never be set up. That account becomes the administrator.
-
-Which means the order matters, and it is the reverse of what feels natural:
+An empty server lets the **first** registration through even with
+`open_registration = false`, and that account becomes the administrator. So
+register *before* the proxy goes live, not after:
 
 ```sh
-# 1. still on 127.0.0.1, from the server itself
-ssh -L 7500:127.0.0.1:7500 server      # or curl it locally
-#    register your account at http://127.0.0.1:7500
-# 2. only then point the proxy at it
+ssh -L 7500:127.0.0.1:7500 server      # then register at http://127.0.0.1:7500
 ```
 
-Expose it first and there is a window between the proxy going live and you
-signing up in which whoever finds the host becomes its administrator. The
-default `BIND_ADDR` protects you right up until the moment you put a proxy in
-front, and that is exactly the step this guide is about.
-
-Then close registration in **admin → instance** and bring people in from
+Otherwise there is a window in which whoever finds the host becomes its admin.
+Then close registration in **admin → instance** and invite people from
 **admin → invites**.
 
 ### The proxy
 
-It must pass WebSocket upgrades through: the sync protocol is WebSocket end to
-end, so a proxy that mangles `Upgrade` breaks push and clone while leaving the
-web UI looking perfectly healthy.
+| requirement | why it bites |
+|---|---|
+| pass WebSocket upgrades through | sync is WebSocket end to end; mangling `Upgrade` breaks push and clone while the web UI still looks fine |
+| set `X-Forwarded-For`, and `trust_proxy = true` | rate limits count per client address; without it the whole instance shares one bucket |
 
-It must also set `X-Forwarded-For`, and `hub.toml` must say `trust_proxy = true`
-to believe it. Rate limits are counted per client address; behind a proxy every
-request appears to come from the proxy, so with `trust_proxy` off the whole
-instance shares a single bucket — ten sign-ins a minute between everyone, and
-the symptom is your users being told to try again later because somebody else
-just logged in.
-
-Leave `trust_proxy` **off** if the hub is reachable directly. The header is
-client-supplied there, so believing it lets anyone present a new address per
-request and skip the limits entirely.
-
-Then:
+**Leave `trust_proxy` off if the hub is reachable directly.** The header is
+client-supplied, so believing it there lets anyone skip the limits entirely.
 
 ```
 https://fkit.work
@@ -113,109 +85,81 @@ fkit clone wss://fkit.work/helba/fkit
 
 ### Cookies and TLS
 
-`secure_cookies` in `hub.toml` is the one to get right. Leave it `true` when
-something terminates TLS in front. Set it `false` if you reach the hub over
-plain `http://` — a `Secure` cookie sent over http is discarded by the browser,
-and the symptom is a login that appears to succeed and then isn't.
+`secure_cookies = true` when something terminates TLS in front, `false` over
+plain `http://` — a `Secure` cookie on http is dropped by the browser, and the
+symptom is a login that appears to work and doesn't.
 
-For a private CA or a certificate minted for a name that only exists on an
-overlay network, point clients at the root:
+For a private CA:
 
 ```sh
 export FKIT_CA_BUNDLE=/etc/fkit/internal-ca.crt
 fkit clone wss://hub.internal/helba/fkit
 ```
 
-There is deliberately no `--insecure`. Adding a root is a decision about who you
-trust; skipping verification is a decision to trust the network, and the sync
-protocol sends your access token in its opening frame.
+There is deliberately no `--insecure`: the sync protocol sends your access
+token in its opening frame.
 
 ## The object cache
 
-The hub holds decompressed objects in memory so a hot one is not read and
-inflated twice. **This is on by default and needs no setup**, and it is why a
-busy server settles well above its idle size — 64 MiB of cache by default, on
-top of the process itself. Admin → Overview reports what it is holding and its
-hit rate, so you can tell a working cache from a leak without guessing.
-
-Content addressing is what makes this simple: a key is a digest of its value,
-so a cached object can never be stale. There is no invalidation, only eviction,
-which is a size and an age:
+On by default, no setup. It is why the process settles above its idle size —
+64 MiB of held objects by default. **Admin → Overview** shows what it holds and
+its hit rate, which is how you tell a working cache from a leak.
 
 ```toml
 [cache]
-memory_mb = 64      # 0 disables the cache entirely
-ttl_secs  = 1800
+memory = "64MB"     # or "512kb", "2GB", bytes; 0 disables it
+ttl    = "30m"      # or "1800s", "2h", "1d"
 ```
 
-### A shared tier, when it is worth one
+Sizes are binary (`MB` is 1024²). A value that is not a size is refused at
+startup rather than guessed at.
 
-Several hub processes each keep their own memory cache, and each pays its own
-misses. A shared tier in Valkey or Redis lets them answer each other's.
+### A shared tier
 
-**Most servers should not do this.** On one host with local storage, a round
-trip to Redis costs more than the disk read it would replace — measured at
-7 µs to read and inflate an object locally against 100–500 µs for the round
-trip. It pays when a miss is genuinely expensive: several processes, or object
-storage slower than a local disk. Memory is always the near tier either way, so
-a shared one only ever answers what memory missed.
+Several hub processes each pay their own misses; a shared tier in Valkey lets
+them answer each other's. **Most servers should not.** On one host with local
+storage a round trip costs more than the disk read it replaces — 7 µs local
+against 100–500 µs. It pays with several processes, or storage slower than a
+local disk.
 
-It is **off at compile time**, so the client is not linked into a binary that
-will not use it:
+The published image includes the client. Building it yourself needs the
+feature:
 
 ```sh
 cargo build --release -p fkit-hub --features redis-cache
 ```
 
-Then point it at one:
-
 ```toml
 [cache]
-memory_mb = 64
-ttl_secs  = 1800
+memory    = "64MB"
 redis_url = "redis://valkey:6379"
 ```
-
-With `docker-compose`, that is one more service:
 
 ```yaml
   valkey:
     image: valkey/valkey:8-alpine
     restart: unless-stopped
-    # No volume: everything in here is a cache of content that is already on
-    # disk, so losing it costs one slow request and nothing else.
+    # No volume: this caches content that is already on disk.
     command: ["valkey-server", "--save", "", "--maxmemory", "512mb",
               "--maxmemory-policy", "allkeys-lru"]
 ```
 
-`--save ""` turns off persistence and `allkeys-lru` lets it evict under
-pressure. Both are right for a cache and wrong for a database — nothing here is
-the only copy of anything.
-
-The startup log says which tier it got, and the admin panel says it too:
-
-```
-INFO fkit_hub: object cache: memory + shared at redis://valkey:6379
-```
-
-If the server cannot reach it, that is a warning and not a failure — the hub
-starts on memory alone. A cache that is unavailable should never be the reason
-a repository cannot be read.
+Memory is always the near tier. If Valkey is unreachable the hub logs a warning
+and runs on memory alone — a cache should never be why a repository cannot be
+read.
 
 ## Mirroring this repository into fkit
 
 `.github/workflows/mirror-to-fkit.yml` pushes every update to `main` into the
-hub, so fkit hosts its own source. It needs two repository secrets:
+hub. Two repository secrets:
 
 ```
 FKIT_REMOTE   wss://fkit.work/helba/fkit
-FKIT_TOKEN    an access token with write access (Settings → access tokens)
+FKIT_TOKEN    an access token with write access
 ```
 
-It clones the hub repository first so each run's commit has a parent, replaces
-the working tree, and commits once per push to main. It is not a git history
-translation — it is a record of what `main` looked like, in fkit's own object
-model, with real diffs between snapshots.
+It records what `main` looked like in fkit's object model, with real diffs
+between snapshots — not a git history translation.
 
 ## Updating
 
@@ -228,6 +172,5 @@ docker compose --env-file .env.prod -f docker-compose.prod.yml \
 ```
 
 Data lives in the `pgdata` and `repodata` volumes and survives an image swap.
-Back both up together: the object store alone is repositories with no accounts
-or permissions attached, and the database alone is accounts pointing at objects
-that are gone.
+**Back both up together** — the object store alone is repositories with no
+accounts, and the database alone is accounts pointing at objects that are gone.
