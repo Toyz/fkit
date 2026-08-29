@@ -718,6 +718,7 @@ mod tests {
             &Sink::writing(&f.store),
             &work,
             &crate::ingest::Ignore::empty(),
+            &Default::default(),
         )
         .unwrap();
 

@@ -335,7 +335,7 @@ impl Repo {
     /// walk and diff it even though nothing was persisted.
     pub fn snapshot(&self) -> Result<Snapshot> {
         let sink = Sink::dry(&self.store);
-        let ing = ingest_dir(&sink, &self.root, &self.ignore())?;
+        let ing = ingest_dir(&sink, &self.root, &self.ignore(), &self.mounts()?)?;
         Ok(Snapshot {
             hash: ing.hash,
             size: ing.size,
@@ -346,7 +346,19 @@ impl Repo {
 
     /// Hash the working tree and persist every object.
     pub fn snapshot_writing(&self) -> Result<crate::ingest::Ingested> {
-        ingest_dir(&Sink::writing(&self.store), &self.root, &self.ignore())
+        ingest_dir(&Sink::writing(&self.store), &self.root, &self.ignore(), &self.mounts()?)
+    }
+
+    /// Submodule pins as currently recorded beside this repository.
+    ///
+    /// This is what a new commit will pin. The tree of an *existing* commit is
+    /// the authority on what that commit pinned; the two are compared by
+    /// `status`, which is how a submodule that moved shows up as a change.
+    pub fn mounts(&self) -> Result<crate::ingest::Mounts> {
+        Ok(crate::submodule::list(self)?
+            .into_iter()
+            .map(|(path, m)| (path, m.pin))
+            .collect())
     }
 
     /// A read view over the store alone.
@@ -445,6 +457,12 @@ impl Repo {
     }
 }
 
+/// Trees nest, and submodules nest through them. Content addressing rules out a
+/// real cycle, since a tree would have to contain its own hash to make one, but
+/// a damaged store can return anything and blowing the stack is a poor way to
+/// discover that.
+const MAX_TREE_DEPTH: usize = 100;
+
 /// A read-only view of objects: an in-memory overlay checked first, then the
 /// on-disk store. This is what lets `status` diff a snapshot that was never
 /// written to disk.
@@ -481,10 +499,70 @@ impl<'a> View<'a> {
         }
     }
 
+    /// Every path in a tree, with submodules expanded into their content.
+    ///
+    /// Expanding here is the reason nothing downstream needs to know that
+    /// submodules exist. `checkout`, `archive` and `diff` all read a tree
+    /// through this function, so a pinned submodule is ordinary content to
+    /// them and cannot be half-applied by a caller that forgot to recurse.
+    /// Use [`View::submodules`] when the boundary is what you actually want.
     pub fn walk_tree(&self, tree: Hash) -> Result<BTreeMap<String, TreeEntry>> {
         let mut out = BTreeMap::new();
-        self.walk_tree_into(tree, "", &mut out)?;
+        self.walk_tree_into(tree, "", &mut out, 0)?;
         Ok(out)
+    }
+
+    /// The submodule pins declared directly by a tree, keyed by path.
+    ///
+    /// Deliberately does not descend through a pin: a submodule's own
+    /// submodules belong to it, not to this repository.
+    pub fn submodules(&self, tree: Hash) -> Result<BTreeMap<String, Hash>> {
+        let mut out = BTreeMap::new();
+        self.submodules_into(tree, "", &mut out, 0)?;
+        Ok(out)
+    }
+
+    fn submodules_into(
+        &self,
+        tree: Hash,
+        prefix: &str,
+        out: &mut BTreeMap<String, Hash>,
+        depth: usize,
+    ) -> Result<()> {
+        if depth > MAX_TREE_DEPTH {
+            bail!("directory nesting deeper than {MAX_TREE_DEPTH}");
+        }
+        for e in self.read_entries(tree)? {
+            let path =
+                if prefix.is_empty() { e.name.clone() } else { format!("{prefix}/{}", e.name) };
+            match e.kind {
+                EntryKind::Dir => self.submodules_into(e.hash, &path, out, depth + 1)?,
+                EntryKind::Submodule => {
+                    out.insert(path, e.hash);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// The tree a submodule pin resolves to.
+    ///
+    /// A pin names a commit rather than a tree, so that what is recorded is a
+    /// point in the submodule's history and not merely a bag of files: the
+    /// message, author and parents come with it.
+    pub fn submodule_tree(&self, pin: Hash, path: &str) -> Result<Hash> {
+        match self.get(pin) {
+            Ok(Object::Commit(c)) => Ok(c.tree),
+            Ok(other) => bail!(
+                "submodule {path} is pinned at {pin}, which is a {} and not a commit",
+                other.kind().name()
+            ),
+            Err(_) => bail!(
+                "submodule {path} is pinned at {pin}, which this store does not have\n\
+                 run `fkit submodule fetch` to bring it in"
+            ),
+        }
     }
 
     fn walk_tree_into(
@@ -492,7 +570,11 @@ impl<'a> View<'a> {
         tree: Hash,
         prefix: &str,
         out: &mut BTreeMap<String, TreeEntry>,
+        depth: usize,
     ) -> Result<()> {
+        if depth > MAX_TREE_DEPTH {
+            bail!("directory nesting deeper than {MAX_TREE_DEPTH}");
+        }
         // A directory is a Merkle tree over entry runs, so this walks levels
         // and runs before it ever sees a name. `read_entries_via` flattens that.
         let entries = self.read_entries(tree)?;
@@ -502,10 +584,15 @@ impl<'a> View<'a> {
             } else {
                 format!("{prefix}/{}", e.name)
             };
-            if e.kind == EntryKind::Dir {
-                self.walk_tree_into(e.hash, &path, out)?;
-            } else {
-                out.insert(path, e);
+            match e.kind {
+                EntryKind::Dir => self.walk_tree_into(e.hash, &path, out, depth + 1)?,
+                EntryKind::Submodule => {
+                    let tree = self.submodule_tree(e.hash, &path)?;
+                    self.walk_tree_into(tree, &path, out, depth + 1)?;
+                }
+                _ => {
+                    out.insert(path, e);
+                }
             }
         }
         Ok(())

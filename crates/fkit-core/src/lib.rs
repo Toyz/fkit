@@ -25,6 +25,7 @@ pub mod proto;
 pub mod repo;
 pub mod session;
 pub mod store;
+pub mod submodule;
 pub mod ws;
 
 pub use hash::Hash;

@@ -97,6 +97,26 @@ fn walk(store: &Store, tree: Hash, prefix: &str, out: &mut Plan, depth: usize) -
                 out.items.push(Item { path: path.clone(), hash: e.hash, size: 0, kind: e.kind });
                 walk(store, e.hash, &path, out, depth + 1)?;
             }
+            EntryKind::Submodule => {
+                // A submodule archives as an ordinary directory. The content is
+                // already in this store, so unlike `git archive` — which writes
+                // an empty directory and leaves you to notice — the tarball is
+                // the whole tree.
+                let tree = match store.get(e.hash) {
+                    Ok(crate::object::Object::Commit(c)) => c.tree,
+                    _ => bail!(
+                        "submodule {path} is pinned at {}, which this store does not have",
+                        e.hash
+                    ),
+                };
+                out.items.push(Item {
+                    path: path.clone(),
+                    hash: tree,
+                    size: 0,
+                    kind: EntryKind::Dir,
+                });
+                walk(store, tree, &path, out, depth + 1)?;
+            }
             _ => {
                 out.bytes += e.size;
                 out.items.push(Item { path, hash: e.hash, size: e.size, kind: e.kind });
@@ -140,6 +160,7 @@ pub fn write_tar<W: Write>(
                 let target = String::from_utf8_lossy(&target).to_string();
                 w.write_all(&tar_header(&name, 0, 0o777, b'2', &target, mtime)?)?;
             }
+            EntryKind::Submodule => unreachable!("plan records submodules as directories"),
             EntryKind::File { exec } => {
                 let mode = if exec { 0o755 } else { 0o644 };
                 w.write_all(&tar_header(&name, it.size, mode, b'0', "", mtime)?)?;
@@ -414,6 +435,7 @@ fn central_entry(
         EntryKind::Symlink => 0o120777,
         EntryKind::File { exec: true } => 0o100755,
         EntryKind::File { exec: false } => 0o100644,
+        EntryKind::Submodule => unreachable!("plan records submodules as directories"),
     };
     let external = (mode << 16) | if matches!(kind, EntryKind::Dir) { 0x10 } else { 0 };
 

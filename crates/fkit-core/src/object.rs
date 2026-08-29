@@ -70,6 +70,20 @@ pub enum EntryKind {
     Dir,
     /// A symlink -> points at a FileNode whose bytes are the link target.
     Symlink,
+    /// A pinned submodule -> points at a Commit in this same store.
+    ///
+    /// The pin lives in the tree rather than in local configuration, which is
+    /// the whole difference between this and git's submodules. A commit hash
+    /// has to name one complete state; if the revision of a nested repository
+    /// were kept beside the repository instead of inside the hash, checking out
+    /// an old commit would hand you today's submodule, and the same hash would
+    /// mean two different things on two different days.
+    ///
+    /// Because the pin is an ordinary link in the object graph, everything that
+    /// walks links already handles it: `gc` keeps the content alive, `push`
+    /// sends it, and `fsck` checks it. None of those needed a special case,
+    /// which is exactly why they cannot drift out of step with each other.
+    Submodule,
 }
 
 impl EntryKind {
@@ -79,6 +93,7 @@ impl EntryKind {
             EntryKind::File { exec: true } => 1,
             EntryKind::Dir => 2,
             EntryKind::Symlink => 3,
+            EntryKind::Submodule => 4,
         }
     }
     fn from_code(c: u8) -> Result<EntryKind> {
@@ -87,6 +102,7 @@ impl EntryKind {
             1 => EntryKind::File { exec: true },
             2 => EntryKind::Dir,
             3 => EntryKind::Symlink,
+            4 => EntryKind::Submodule,
             _ => bail!("unknown entry kind code {c}"),
         })
     }

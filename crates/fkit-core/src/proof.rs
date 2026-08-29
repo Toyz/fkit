@@ -290,7 +290,7 @@ mod tests {
         }
         let store = Store::open(dir.join("objects")).unwrap();
         let sink = Sink::writing(&store);
-        let ing = ingest_dir(&sink, &work, &Ignore::empty()).unwrap();
+        let ing = ingest_dir(&sink, &work, &Ignore::empty(), &Default::default()).unwrap();
         let (commit, _) = store
             .put(&Object::Commit(Commit {
                 tree: ing.hash,

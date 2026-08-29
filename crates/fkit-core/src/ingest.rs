@@ -229,6 +229,9 @@ struct Skeleton {
     jobs: Vec<Job>,
     /// Every directory, so empty ones survive the round trip.
     dirs: Vec<String>,
+    /// Mounted submodule paths found during the walk. Recorded rather than
+    /// descended into: their content is already named by the pin.
+    subs: Vec<String>,
 }
 
 struct Job {
@@ -243,9 +246,9 @@ enum JobKind {
     Symlink,
 }
 
-fn enumerate(root: &Path, ignore: &Ignore) -> Result<Skeleton> {
-    let mut sk = Skeleton { jobs: Vec::new(), dirs: Vec::new() };
-    walk(root, "", ignore, &mut sk)?;
+fn enumerate(root: &Path, ignore: &Ignore, mounts: &Mounts) -> Result<Skeleton> {
+    let mut sk = Skeleton { jobs: Vec::new(), dirs: Vec::new(), subs: Vec::new() };
+    walk(root, "", ignore, mounts, &mut sk)?;
     // Largest first: with a few very large files among many small ones, feeding
     // the big ones out first stops one thread finishing last on a 1 GB image
     // while the rest idle.
@@ -256,7 +259,13 @@ fn enumerate(root: &Path, ignore: &Ignore) -> Result<Skeleton> {
     Ok(sk)
 }
 
-fn walk(dir: &Path, prefix: &str, ignore: &Ignore, out: &mut Skeleton) -> Result<()> {
+fn walk(
+    dir: &Path,
+    prefix: &str,
+    ignore: &Ignore,
+    mounts: &Mounts,
+    out: &mut Skeleton,
+) -> Result<()> {
     let read = fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))?;
     for entry in read {
         let entry = entry?;
@@ -271,8 +280,16 @@ fn walk(dir: &Path, prefix: &str, ignore: &Ignore, out: &mut Skeleton) -> Result
         if ft.is_symlink() {
             out.jobs.push(Job { rel, abs, kind: JobKind::Symlink });
         } else if ft.is_dir() {
+            // A submodule is a boundary. Its files are already content in this
+            // store, named by the pin, so walking into them would store a
+            // second copy under this repository's own paths and quietly turn a
+            // reference into a fork.
+            if mounts.contains_key(&rel) {
+                out.subs.push(rel);
+                continue;
+            }
             out.dirs.push(rel.clone());
-            walk(&abs, &rel, ignore, out)?;
+            walk(&abs, &rel, ignore, mounts, out)?;
         } else {
             let exec = is_executable(&entry.metadata()?);
             out.jobs.push(Job { rel, abs, kind: JobKind::File { exec } });
@@ -301,8 +318,16 @@ fn run_job(sink: &Sink, job: &Job) -> Result<(String, TreeEntry, WriteStats)> {
 }
 
 /// Snapshot a directory into a `Tree`, reading files on every available core.
-pub fn ingest_dir(sink: &Sink, dir: &Path, ignore: &Ignore) -> Result<Ingested> {
-    let sk = enumerate(dir, ignore)?;
+/// Submodule pins, by path relative to the repository root.
+pub type Mounts = std::collections::BTreeMap<String, Hash>;
+
+pub fn ingest_dir(
+    sink: &Sink,
+    dir: &Path,
+    ignore: &Ignore,
+    mounts: &Mounts,
+) -> Result<Ingested> {
+    let sk = enumerate(dir, ignore, mounts)?;
 
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -340,6 +365,23 @@ pub fn ingest_dir(sink: &Sink, dir: &Path, ignore: &Ignore) -> Result<Ingested> 
             stats.merge(st);
             files.insert(rel, entry);
         }
+    }
+
+    // Submodules join the flat path map as ordinary entries, so tree building
+    // below needs no notion of them at all.
+    for rel in &sk.subs {
+        let pin = mounts[rel];
+        let size = crate::submodule::pinned_size(sink.store(), pin).with_context(|| {
+            format!(
+                "submodule {rel} is pinned at {pin}, which is not in this store — \
+                 committing it would record a revision nobody else could check out"
+            )
+        })?;
+        let name = rel.rsplit('/').next().unwrap_or(rel).to_string();
+        files.insert(
+            rel.clone(),
+            TreeEntry { name, kind: EntryKind::Submodule, hash: pin, size },
+        );
     }
 
     // Tree building is serial and deterministic: identical contents must give an
@@ -598,8 +640,8 @@ mod tests {
         }
         fs::write(b.join("file-00007-inserted.txt"), "new\n").unwrap();
 
-        let first = ingest_dir(&Sink::writing(&s), &a, &Ignore::empty()).unwrap();
-        let second = ingest_dir(&Sink::writing(&s), &b, &Ignore::empty()).unwrap();
+        let first = ingest_dir(&Sink::writing(&s), &a, &Ignore::empty(), &Default::default()).unwrap();
+        let second = ingest_dir(&Sink::writing(&s), &b, &Ignore::empty(), &Default::default()).unwrap();
         assert_ne!(first.hash, second.hash);
 
         // Only the run containing the insertion (plus the spine above it) should
@@ -619,7 +661,7 @@ mod tests {
         for i in 0..3000 {
             fs::write(d.join(format!("f-{i:05}")), "x").unwrap();
         }
-        let ing = ingest_dir(&Sink::writing(&s), &d, &Ignore::empty()).unwrap();
+        let ing = ingest_dir(&Sink::writing(&s), &d, &Ignore::empty(), &Default::default()).unwrap();
 
         match s.get(ing.hash).unwrap() {
             Object::Tree { children, .. } => assert!(
@@ -640,7 +682,7 @@ mod tests {
         for i in 0..5 {
             fs::write(d.join(format!("f{i}")), "x").unwrap();
         }
-        let ing = ingest_dir(&Sink::writing(&s), &d, &Ignore::empty()).unwrap();
+        let ing = ingest_dir(&Sink::writing(&s), &d, &Ignore::empty(), &Default::default()).unwrap();
         match s.get(ing.hash).unwrap() {
             Object::Tree { level, children } => {
                 assert_eq!(level, 0);
@@ -667,8 +709,8 @@ mod tests {
         fs::write(b.join("sub/nested"), b"three").unwrap();
         fs::write(b.join("alpha.txt"), b"one").unwrap();
 
-        let ha = ingest_dir(&Sink::writing(&s), &a, &Ignore::empty()).unwrap().hash;
-        let hb = ingest_dir(&Sink::writing(&s), &b, &Ignore::empty()).unwrap().hash;
+        let ha = ingest_dir(&Sink::writing(&s), &a, &Ignore::empty(), &Default::default()).unwrap().hash;
+        let hb = ingest_dir(&Sink::writing(&s), &b, &Ignore::empty(), &Default::default()).unwrap().hash;
         assert_eq!(ha, hb, "identical trees must hash identically");
         let _ = fs::remove_dir_all(dir);
     }

@@ -69,6 +69,7 @@ pub fn list_dir(store: &Store, tree: Hash, path: &str) -> AppResult<Vec<EntryVie
                 EntryKind::Symlink => "symlink",
                 EntryKind::File { exec: true } => "exec",
                 EntryKind::File { exec: false } => "file",
+                EntryKind::Submodule => "submodule",
             },
             hash: e.hash.to_hex(),
             size: e.size,

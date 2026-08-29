@@ -52,6 +52,16 @@ BRANCHES
     checkout <commit>        move HEAD to a specific commit (detached)
         --force              discard uncommitted changes
 
+SUBMODULES
+    submodule                list mounted submodules and their state
+    submodule add <url> <path> [--branch <b>]
+                             mount another repository at <path>
+    submodule update [<path>] move the pin to the remote's current tip
+    submodule fetch [<path>]  retrieve content for a pin this store lacks
+    submodule rm <path>      unmount; the next commit will not carry it
+    submodule set-remote <path> <url>
+                             fetch this submodule from somewhere else
+
 REMOTES
     remote [<url>]           show or set the remote (ws://host:7420/repo)
     clone <url> [<dir>]      copy a remote repository
@@ -148,6 +158,7 @@ fn run() -> Result<()> {
         "verify-tree" => cmd_verify_tree(rest),
         "fsck" => cmd_fsck(),
         "stats" => cmd_stats(),
+        "submodule" => cmd_submodule(rest),
         other => bail!("unknown command '{other}'\n\n{USAGE}"),
     }
 }
@@ -934,6 +945,7 @@ fn cmd_show(args: &[String]) -> Result<()> {
                     EntryKind::Symlink => "link",
                     EntryKind::File { exec: true } => "exec",
                     EntryKind::File { exec: false } => "file",
+                    EntryKind::Submodule => "sub ",
                 };
                 println!("  {k} {}  {:>9}  {}", e.hash.short(), human(e.size), e.name);
             }
@@ -946,6 +958,7 @@ fn cmd_show(args: &[String]) -> Result<()> {
                     EntryKind::Symlink => "link",
                     EntryKind::File { exec: true } => "exec",
                     EntryKind::File { exec: false } => "file",
+                    EntryKind::Submodule => "sub ",
                 };
                 println!("  {k} {}  {:>9}  {}", e.hash.short(), human(e.size), e.name);
             }
@@ -1323,6 +1336,279 @@ fn pull_branch(
     // Drain the server's trailing Ok.
     let _ = recv(ws);
     Ok(stats)
+}
+
+
+// ---- submodules ---------------------------------------------------------
+//
+// A submodule is a commit of another repository, pinned by a tree entry in
+// this one. Everything below is a thin layer over that: the interesting work
+// is done by `walk_tree`, which expands a pin into content, and by
+// `checkout_tree`, which keeps `.fkit/submodules/` in step with whatever tree
+// it just wrote. Neither needed to be taught what a submodule is.
+
+fn cmd_submodule(args: &[String]) -> Result<()> {
+    let repo = Repo::discover(&std::env::current_dir()?)?;
+    match args.first().map(|s| s.as_str()) {
+        None | Some("list") => sub_list(&repo),
+        Some("add") => sub_add(&repo, &args[1..]),
+        Some("update") => sub_update(&repo, &args[1..]),
+        Some("fetch") => sub_fetch(&repo, &args[1..]),
+        Some("rm") | Some("remove") => sub_rm(&repo, &args[1..]),
+        Some("set-remote") => sub_set_remote(&repo, &args[1..]),
+        Some(other) => bail!(
+            "unknown submodule command '{other}'\n\
+             try: list, add, update, fetch, rm"
+        ),
+    }
+}
+
+/// The pin recorded by HEAD, if there is a HEAD.
+fn head_pins(repo: &Repo) -> Result<std::collections::BTreeMap<String, Hash>> {
+    match repo.head_tree()? {
+        Some(t) => repo.view().submodules(t),
+        None => Ok(Default::default()),
+    }
+}
+
+fn sub_list(repo: &Repo) -> Result<()> {
+    let mounts = fkit_core::submodule::list(repo)?;
+    if mounts.is_empty() {
+        println!("no submodules");
+        return Ok(());
+    }
+    let committed = head_pins(repo)?;
+
+    for (path, m) in &mounts {
+        // Three things can be true of a submodule, and they are worth keeping
+        // apart: what the last commit pinned, what is recorded here, and
+        // whether the content is actually present to check out.
+        let state = if !repo.store.has(m.pin) {
+            "missing — run `fkit submodule fetch`"
+        } else {
+            match committed.get(path) {
+                Some(c) if *c == m.pin => "clean",
+                Some(_) => "moved — commit to record it",
+                None => "new — commit to record it",
+            }
+        };
+        println!("{}  {}  {}", m.pin.short(), path, state);
+        if !m.remote.is_empty() {
+            println!("    from {}", m.remote);
+        }
+    }
+    Ok(())
+}
+
+fn sub_add(repo: &Repo, args: &[String]) -> Result<()> {
+    let branch_flag = flag_value(args, "--branch");
+    let pos: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+    let (url, path) = match (pos.first(), pos.get(1)) {
+        (Some(u), Some(p)) => (u.as_str(), p.as_str()),
+        _ => bail!("usage: fkit submodule add <wss://host/owner/repo> <path> [--branch <b>]"),
+    };
+    // `--branch main` leaves "main" in the positional list unless it is taken
+    // out, which would otherwise be read as the path.
+    let path = if Some(path.to_string()) == branch_flag {
+        pos.get(2).map(|p| p.as_str()).context("usage: fkit submodule add <url> <path>")?
+    } else {
+        path
+    };
+
+    fkit_core::submodule::valid_path(path)?;
+    if fkit_core::submodule::read(repo, path)?.is_some() {
+        bail!("{path} is already a submodule");
+    }
+    let dest = repo.root.join(path);
+    if dest.exists() && std::fs::read_dir(&dest)?.next().is_some() {
+        bail!("{path} already exists and is not empty");
+    }
+
+    let (mut ws, refs) = connect(url, None)?;
+    let branch = pick_branch(&refs, branch_flag.as_deref())?;
+    println!("mounting {url} ({branch}) at {path}");
+
+    // Objects land in *this* repository's store. There is no second store and
+    // no nested repository: the submodule's content is this repository's
+    // content, which is what makes checkout of it local and immediate.
+    let tip = fetch_ref(repo, &mut ws, &branch)?;
+    let stats = fkit_core::proto::fetch_closure(&repo.store, &mut ws, &[tip])?;
+    fkit_core::proto::verify_closure(&repo.store, tip)?;
+    let _ = send(&mut ws, &Msg::Done);
+
+    fkit_core::submodule::write(repo, &fkit_core::submodule::Mount {
+        path: path.to_string(),
+        remote: url.to_string(),
+        pin: tip,
+    })?;
+
+    // Prefer a relative suggestion when the submodule lives beside its parent:
+    // that is the form a fork of this repository can carry unchanged.
+    let hint = repo
+        .config_get("remote")
+        .and_then(|parent| fkit_core::submodule::relative_to(&parent, url))
+        .unwrap_or_else(|| url.to_string());
+    fkit_core::submodule::set_hint(repo, path, Some(&hint))?;
+
+    let n = fkit_core::checkout::materialize(repo, tree_of(repo, tip)?, &dest)?;
+    println!("  {} object(s), {n} file(s) at {}", stats.objects, tip.short());
+    println!("commit to record the pin");
+    Ok(())
+}
+
+fn sub_update(repo: &Repo, args: &[String]) -> Result<()> {
+    let branch_flag = flag_value(args, "--branch");
+    let only = args.iter().find(|a| !a.starts_with('-')).cloned();
+    let mounts = fkit_core::submodule::list(repo)?;
+    if mounts.is_empty() {
+        bail!("no submodules to update");
+    }
+
+    let targets: Vec<_> = match &only {
+        Some(p) => vec![mounts.get(p).cloned().with_context(|| format!("{p} is not a submodule"))?],
+        None => mounts.values().cloned().collect(),
+    };
+
+    for m in targets {
+        if m.remote.is_empty() {
+            println!("{}: no remote recorded, skipping", m.path);
+            continue;
+        }
+        let (mut ws, refs) = connect(&m.remote, None)?;
+        let branch = pick_branch(&refs, branch_flag.as_deref())?;
+        let tip = fetch_ref(repo, &mut ws, &branch)?;
+        if tip == m.pin {
+            println!("{}: already at {}", m.path, tip.short());
+            let _ = send(&mut ws, &Msg::Done);
+            continue;
+        }
+        let stats = fkit_core::proto::fetch_closure(&repo.store, &mut ws, &[tip])?;
+        fkit_core::proto::verify_closure(&repo.store, tip)?;
+        let _ = send(&mut ws, &Msg::Done);
+
+        fkit_core::submodule::set_pin(repo, &m.path, tip)?;
+        println!(
+            "{}: {} -> {} ({} object(s))",
+            m.path,
+            m.pin.short(),
+            tip.short(),
+            stats.objects
+        );
+    }
+    println!("commit to record the new pin(s)");
+    Ok(())
+}
+
+fn sub_fetch(repo: &Repo, args: &[String]) -> Result<()> {
+    let only = args.iter().find(|a| !a.starts_with('-')).cloned();
+    let mounts = fkit_core::submodule::list(repo)?;
+    let mut missing = 0;
+    for (path, m) in &mounts {
+        if only.as_ref().is_some_and(|p| p != path) {
+            continue;
+        }
+        if repo.store.has(m.pin) {
+            continue;
+        }
+        missing += 1;
+        if m.remote.is_empty() {
+            println!("{path}: pinned at {} with no remote recorded", m.pin.short());
+            continue;
+        }
+        // Ask for the pinned commit by hash. A branch would be the wrong
+        // question: the pin may be an older commit, or on no branch at all.
+        let (mut ws, _) = connect(&m.remote, None)?;
+        let stats = fkit_core::proto::fetch_closure(&repo.store, &mut ws, &[m.pin])?;
+        fkit_core::proto::verify_closure(&repo.store, m.pin)?;
+        let _ = send(&mut ws, &Msg::Done);
+        fkit_core::submodule::set_pin(repo, path, m.pin)?;
+        println!("{path}: {} object(s) at {}", stats.objects, m.pin.short());
+    }
+    if missing == 0 {
+        println!("every submodule's content is already here");
+    }
+    Ok(())
+}
+
+fn sub_rm(repo: &Repo, args: &[String]) -> Result<()> {
+    let path = args.first().context("usage: fkit submodule rm <path>")?;
+    let m = fkit_core::submodule::read(repo, path)?
+        .with_context(|| format!("{path} is not a submodule"))?;
+
+    // Take the files away as well as the record. Leaving them would make the
+    // next commit ingest the submodule's content as this repository's own,
+    // which is the quiet way a reference turns into a fork.
+    let dest = repo.root.join(&m.path);
+    if repo.store.has(m.pin) {
+        for rel in repo.view().walk_tree(tree_of(repo, m.pin)?)?.keys() {
+            let _ = std::fs::remove_file(dest.join(rel));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dest);
+    fkit_core::submodule::remove(repo, &m.path)?;
+    fkit_core::submodule::set_hint(repo, &m.path, None)?;
+    println!("unmounted {}", m.path);
+    println!("commit to record the removal");
+    Ok(())
+}
+
+/// Point one submodule at a different remote, for this machine only.
+///
+/// The project's suggestion in `.fkit-submodules` is left alone: this is the
+/// override, and overrides that edit the thing they override are how you end
+/// up needing a command like `git submodule sync`.
+fn sub_set_remote(repo: &Repo, args: &[String]) -> Result<()> {
+    let (path, url) = match (args.first(), args.get(1)) {
+        (Some(p), Some(u)) => (p, u),
+        _ => bail!("usage: fkit submodule set-remote <path> <url>"),
+    };
+    let m = fkit_core::submodule::read(repo, path)?
+        .with_context(|| format!("{path} is not a submodule"))?;
+    fkit_core::submodule::write(repo, &fkit_core::submodule::Mount {
+        remote: url.to_string(),
+        ..m
+    })?;
+    println!("{path} now fetches from {url}");
+    Ok(())
+}
+
+/// Which branch of the remote to pin. `main` unless told otherwise, because
+/// guessing from ref order would make the result depend on map iteration.
+fn pick_branch(refs: &[(String, Hash)], want: Option<&str>) -> Result<String> {
+    if let Some(b) = want {
+        return Ok(b.to_string());
+    }
+    let branches: Vec<&String> =
+        refs.iter().map(|(n, _)| n).filter(|n| !n.starts_with(Repo::TAG_PREFIX)).collect();
+    if branches.iter().any(|n| n.as_str() == "main") {
+        return Ok("main".to_string());
+    }
+    match branches.as_slice() {
+        [one] => Ok((*one).clone()),
+        [] => bail!("remote has no branches"),
+        many => bail!(
+            "remote has no 'main' branch — pick one with --branch: {}",
+            many.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+        ),
+    }
+}
+
+/// Ask the remote what a branch points at, without touching local refs.
+///
+/// A submodule's branches are not this repository's branches, so `pull_branch`
+/// would be wrong here: it writes the name into our own ref namespace.
+fn fetch_ref(_repo: &Repo, ws: &mut WebSocket, branch: &str) -> Result<Hash> {
+    send(ws, &Msg::PullRef { branch: branch.to_string() })?;
+    match recv(ws)? {
+        Msg::RefIs { tip: Some(t), .. } => Ok(t),
+        Msg::RefIs { tip: None, .. } => bail!("remote has no branch '{branch}'"),
+        other => bail!("unexpected reply: {other:?}"),
+    }
+}
+
+fn flag_value(args: &[String], name: &str) -> Option<String> {
+    let i = args.iter().position(|a| a == name)?;
+    args.get(i + 1).cloned()
 }
 
 fn cmd_clone(args: &[String]) -> Result<()> {

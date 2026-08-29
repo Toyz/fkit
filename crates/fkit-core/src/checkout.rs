@@ -62,7 +62,21 @@ pub fn checkout_tree(
         None => Default::default(),
     };
     let target_files = repo.walk_tree(target)?;
-    let disk_files = repo.view_with(&snap).walk_tree(snap.hash)?;
+    let mut disk_files = repo.view_with(&snap).walk_tree(snap.hash)?;
+
+    // The snapshot describes a submodule's content from the *recorded* pin, not
+    // from the files themselves — ingest deliberately does not descend into a
+    // submodule, so it has nothing else to go on. Wherever that record
+    // disagrees with the tree being checked out, it is not evidence about what
+    // is on disk, and believing it would skip writing the very files that need
+    // to change. Drop those paths so they are written afresh.
+    let recorded = crate::submodule::list(repo)?;
+    for (path, pin) in repo.view().submodules(target)? {
+        if recorded.get(&path).map(|m| m.pin) != Some(pin) {
+            let under = format!("{path}/");
+            disk_files.retain(|p, _| !p.starts_with(&under));
+        }
+    }
 
     let mut plan = CheckoutPlan::default();
 
@@ -107,12 +121,106 @@ pub fn checkout_tree(
                 set_exec(&full, exec)?;
             }
             EntryKind::Dir => unreachable!("walk_tree flattens directories away"),
+            EntryKind::Submodule => {
+                unreachable!("walk_tree expands submodules into their content")
+            }
         }
         plan.written += 1;
     }
 
     prune_empty_dirs(&repo.root, &repo.root)?;
+    reconcile_mounts(repo, target)?;
     Ok(plan)
+}
+
+/// Bring `.fkit/submodules/` into line with the tree that was just written.
+///
+/// This lives inside `checkout_tree` rather than in its callers on purpose. It
+/// is the single reason `clone`, `pull`, `switch`, `checkout` and `merge` all
+/// handle submodules correctly without any of them mentioning submodules: by
+/// the time any of them returns, what is on disk and what is recorded agree.
+///
+/// Git makes this the caller's job — `--recurse-submodules`, and a separate
+/// `git submodule update` when you forget — which is why a checkout there can
+/// leave you with the superproject at one revision and its submodules at
+/// another, with nothing saying so.
+///
+/// The remote is deliberately carried over from any existing record. It is not
+/// part of the tree, so a checkout has nothing to say about it, and discarding
+/// it here would break the next fetch.
+fn reconcile_mounts(repo: &Repo, tree: Hash) -> Result<()> {
+    use crate::submodule::{self, Mount};
+
+    let want = repo.view().submodules(tree)?;
+    let have = submodule::list(repo)?;
+    // Read after the files are written, so a clone picks up the suggestions
+    // that arrived with this very checkout.
+    // Resolved against *this* clone's own remote, so a fork picks up the
+    // fork's host rather than whichever one the suggestion was written beside.
+    let parent_remote = repo.config_get("remote").unwrap_or_default();
+    let hints = submodule::hints(repo);
+
+    for (path, pin) in &want {
+        // An existing local remote is never written over: it may be a mirror,
+        // and the project's suggestion has no business overruling it.
+        let remote = match have.get(path) {
+            Some(m) if !m.remote.is_empty() => m.remote.clone(),
+            _ => hints
+                .get(path)
+                .map(|h| submodule::resolve_remote(&parent_remote, h))
+                .unwrap_or_default(),
+        };
+        // Compare the whole record, not just the pin: a suggestion that only
+        // became available with this checkout should be picked up even when
+        // the revision itself did not move.
+        let next = Mount { path: path.clone(), remote, pin: *pin };
+        if have.get(path) != Some(&next) {
+            submodule::write(repo, &next)?;
+        }
+    }
+    for path in have.keys() {
+        if !want.contains_key(path) {
+            submodule::remove(repo, path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Write a tree's content into `dest`, which need not be the repository root.
+///
+/// Used when a submodule is first mounted, before it is part of any commit and
+/// so before `checkout_tree` would know to write it.
+pub fn materialize(repo: &Repo, tree: Hash, dest: &Path) -> Result<usize> {
+    let files = repo.view().walk_tree(tree)?;
+    let mut n = 0;
+    for (path, entry) in &files {
+        let full = dest.join(path);
+        if let Some(parent) = full.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        match entry.kind {
+            EntryKind::Symlink => {
+                let mut buf = Vec::new();
+                read_file(&repo.store, entry.hash, &mut buf)?;
+                let target = String::from_utf8(buf)?;
+                let _ = fs::remove_file(&full);
+                symlink(&target, &full)?;
+            }
+            EntryKind::File { exec } => {
+                let _ = fs::remove_file(&full);
+                let mut f = std::io::BufWriter::new(fs::File::create(&full)?);
+                read_file(&repo.store, entry.hash, &mut f)?;
+                std::io::Write::flush(&mut f)?;
+                drop(f);
+                set_exec(&full, exec)?;
+            }
+            EntryKind::Dir | EntryKind::Submodule => {
+                unreachable!("walk_tree flattens directories and expands submodules")
+            }
+        }
+        n += 1;
+    }
+    Ok(n)
 }
 
 /// Remove directories left empty by deletions. Never removes the repo root or
