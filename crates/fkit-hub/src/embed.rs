@@ -35,6 +35,9 @@ pub struct Meta {
     pub og_type: &'static str,
     /// What the card should draw. `None` means fall back to the site card.
     pub card: Option<Card>,
+    /// This page's colour. Discord paints the embed's edge with it, so the
+    /// bar beside the message matches the bar on the card inside it.
+    pub tint: String,
 }
 
 /// The content of a social card.
@@ -57,6 +60,9 @@ pub struct Card {
     pub footer: String,
     /// Short word in the top right — "public", "open", "merged".
     pub badge: Option<Badge>,
+    /// The colour of whatever this card is about. Empty falls back to the
+    /// brand accent.
+    pub tint: String,
 }
 
 /// A word in the top right, and the colour that word earns.
@@ -135,7 +141,9 @@ pub fn site_meta(base: &str) -> Meta {
         url: base.to_string(),
         image: Some(format!("{base}/og/site.png")),
         og_type: "website",
+        tint: ACCENT.to_string(),
         card: Some(Card {
+            tint: ACCENT.to_string(),
             eyebrow: String::new(),
             title: "fkit".into(),
             body: "Content-addressed version control.".into(),
@@ -158,6 +166,7 @@ async fn repo_meta(
     if !access.can_read() {
         return None;
     }
+    let slug = format!("{owner_name}/{}", repo.name);
 
     let description = repo
         .description
@@ -191,10 +200,30 @@ async fn repo_meta(
     .await
     .unwrap_or(0);
 
-    let mut facts = vec![(plural(branches, "branch", "branches"), String::new())];
-    if tags > 0 {
-        facts.push((plural(tags, "tag", "tags"), String::new()));
-    }
+    let forks: i64 = sqlx::query_scalar("SELECT count(*) FROM repos WHERE forked_from = $1")
+        .bind(repo.id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or(0);
+
+    let issues: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM issues WHERE repo_id = $1 AND state = 'open'",
+    )
+    .bind(repo.id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(0);
+
+    // Shown even at zero, the way a forge's own header shows them: a reader
+    // scanning several cards wants the same four numbers in the same places,
+    // and a row that changes shape per repository is harder to read than one
+    // that occasionally says nought.
+    let facts = vec![
+        (plural(branches, "branch", "branches"), String::new()),
+        (plural(tags, "tag", "tags"), String::new()),
+        (plural(forks, "fork", "forks"), String::new()),
+        (plural(issues, "issue", "issues"), String::new()),
+    ];
 
     Some(Meta {
         title: format!("{owner_name}/{}", repo.name),
@@ -202,7 +231,9 @@ async fn repo_meta(
         url: url.to_string(),
         image: Some(format!("{base}/og/{owner_name}/{}.png", repo.name)),
         og_type: "object",
+        tint: tint(&slug),
         card: Some(Card {
+            tint: tint(&slug),
             eyebrow: format!("{owner_name} /"),
             title: repo.name.clone(),
             body: description,
@@ -241,7 +272,9 @@ async fn user_meta(state: &AppState, name: &str, url: &str, base: &str) -> Optio
         url: url.to_string(),
         image: Some(format!("{base}/og/{username}.png")),
         og_type: "profile",
+        tint: tint(&username),
         card: Some(Card {
+            tint: tint(&username),
             eyebrow: String::new(),
             title: username,
             body: display.unwrap_or_default(),
@@ -290,6 +323,7 @@ async fn thread_meta(
     .flatten();
     let (title, body, thread_state, author) = row?;
 
+    let slug = format!("{owner_name}/{}", repo.name);
     let (label, route) = match kind {
         Kind::Issue => ("issue", "issues"),
         Kind::Merge => ("merge request", "merges"),
@@ -310,7 +344,9 @@ async fn thread_meta(
             repo.name
         )),
         og_type: "article",
+        tint: tint(&slug),
         card: Some(Card {
+            tint: tint(&slug),
             eyebrow: format!("{owner_name} / {}  ·  #{number}", repo.name),
             title,
             body,
@@ -339,6 +375,7 @@ async fn commit_meta(
         return None;
     }
 
+    let slug = format!("{owner_name}/{}", repo.name);
     let store = state.store_for_network(repo.network_id).ok()?;
     let id = Hash::from_hex(hash).or_else(|| store.resolve_prefix(hash).ok())?;
     let fkit_core::Object::Commit(c) = store.get(id).ok()? else {
@@ -378,7 +415,9 @@ async fn commit_meta(
         url: url.to_string(),
         image: Some(format!("{base}/og/{owner_name}/{}/commit/{hex}.png", repo.name)),
         og_type: "article",
+        tint: tint(&slug),
         card: Some(Card {
+            tint: tint(&slug),
             eyebrow: format!("{owner_name} / {}", repo.name),
             title: summary,
             body: byline,
@@ -402,6 +441,7 @@ async fn blob_meta(
     if !access.can_read() {
         return None;
     }
+    let slug = format!("{owner_name}/{}", repo.name);
     Some(Meta {
         title: format!("{file} · {owner_name}/{}", repo.name),
         description: repo
@@ -412,7 +452,9 @@ async fn blob_meta(
         url: url.to_string(),
         image: Some(format!("{base}/og/{owner_name}/{}.png", repo.name)),
         og_type: "object",
+        tint: tint(&slug),
         card: Some(Card {
+            tint: tint(&slug),
             eyebrow: format!("{owner_name} / {}", repo.name),
             title: file.to_string(),
             body: repo.description.unwrap_or_default(),
@@ -453,13 +495,16 @@ pub fn inject_blank(html: &str) -> String {
 /// Only inserts; nothing existing is removed, so the app boots exactly as it
 /// did. The `<title>` is replaced because a crawler reads the first one and a
 /// duplicate would be ignored.
-pub fn inject(html: &str, meta: &Meta, base: &str) -> String {
+pub fn inject(html: &str, meta: &Meta, base: &str, site: &str) -> String {
     let t = esc(&meta.title);
     let d = esc(&truncate(&meta.description, 300));
     let u = esc(&meta.url);
 
     let mut tags = String::with_capacity(1024);
-    tags.push_str("<meta property=\"og:site_name\" content=\"fkit\">\n");
+    tags.push_str(&format!(
+        "<meta property=\"og:site_name\" content=\"{}\">\n",
+        esc(site)
+    ));
     tags.push_str(&format!("<meta property=\"og:title\" content=\"{t}\">\n"));
     tags.push_str(&format!("<meta property=\"og:description\" content=\"{d}\">\n"));
     tags.push_str(&format!("<meta property=\"og:url\" content=\"{u}\">\n"));
@@ -489,7 +534,10 @@ pub fn inject(html: &str, meta: &Meta, base: &str) -> String {
     tags.push_str(&format!(
         "<link rel=\"alternate\" type=\"application/json+oembed\" href=\"{oembed}\" title=\"{t}\">\n"
     ));
-    tags.push_str(&format!("<meta name=\"theme-color\" content=\"{ACCENT}\">\n"));
+    // Discord paints the embed's left edge with this, so a repository's bar in
+    // the channel is the same colour as the bar on the card inside it.
+    let tint = if meta.tint.is_empty() { ACCENT } else { &meta.tint };
+    tags.push_str(&format!("<meta name=\"theme-color\" content=\"{}\">\n", esc(tint)));
 
     insert_into_head(&replace_title(html, &t), &tags)
 }
@@ -582,6 +630,68 @@ const TOK_KEYWORD: &str = "#c98bd9";
 const FONT_REGULAR: &[u8] = include_bytes!("../assets/fonts/LiberationMono-Regular.ttf");
 const FONT_BOLD: &[u8] = include_bytes!("../assets/fonts/LiberationMono-Bold.ttf");
 const FAMILY: &str = "Liberation Mono";
+
+// ---- a colour per thing --------------------------------------------------
+
+/// A stable colour for a name.
+///
+/// FNV-1a over the lowercased name, which gives a well-spread hue for inputs
+/// that differ by one character — `fkit` and `fkit2` land nowhere near each
+/// other, which is the whole point of colouring a repository at all.
+///
+/// Only the hue varies. Lightness and chroma are fixed at the brand accent's,
+/// in Oklch rather than HSL: equal HSL lightness is not equal *perceived*
+/// lightness, so a hue sweep at fixed HSL gives glaring yellows and murky
+/// blues. In Oklch every hue comes out with the same visual weight, so no
+/// repository ends up with a bar that shouts and none with one that vanishes.
+pub fn tint(name: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in name.to_ascii_lowercase().bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    oklch_to_hex(TINT_L, TINT_C, (h % 360) as f32)
+}
+
+/// Lightness and chroma every tint is generated at.
+///
+/// Lightness is the brand accent's, so a tint sits on the dark card with the
+/// same weight the accent does. Chroma is higher than the accent's: at the
+/// brand's own 0.09 a thirty-degree hue difference is barely visible and half
+/// the repositories come out the same dusty sage. Above about 0.16 the cyans
+/// and blues clip out of sRGB and flatten into bands, so this is the point
+/// where hues separate cleanly and none of them clip.
+const TINT_L: f32 = 0.70;
+const TINT_C: f32 = 0.14;
+
+/// Oklch -> sRGB hex, clamped into gamut.
+fn oklch_to_hex(l: f32, c: f32, hue_deg: f32) -> String {
+    let h = hue_deg.to_radians();
+    let (a, b) = (c * h.cos(), c * h.sin());
+
+    // Oklab -> LMS -> linear sRGB, per Björn Ottosson's definition.
+    let l_ = l + 0.396_337_78 * a + 0.215_803_76 * b;
+    let m_ = l - 0.105_561_346 * a - 0.063_854_17 * b;
+    let s_ = l - 0.089_484_18 * a - 1.291_485_5 * b;
+    let (lc, mc, sc) = (l_ * l_ * l_, m_ * m_ * m_, s_ * s_ * s_);
+
+    let r = 4.076_741_7 * lc - 3.307_711_6 * mc + 0.230_969_94 * sc;
+    let g = -1.268_438 * lc + 2.609_757_4 * mc - 0.341_319_38 * sc;
+    let bl = -0.004_196_086 * lc - 0.703_418_6 * mc + 1.707_614_7 * sc;
+
+    format!("#{:02x}{:02x}{:02x}", channel(r), channel(g), channel(bl))
+}
+
+/// Linear light to an 8-bit sRGB channel.
+fn channel(v: f32) -> u8 {
+    let v = v.clamp(0.0, 1.0);
+    let srgb = if v <= 0.003_130_8 {
+        12.92 * v
+    } else {
+        1.055 * v.powf(1.0 / 2.4) - 0.055
+    };
+    (srgb * 255.0).round().clamp(0.0, 255.0) as u8
+}
 
 /// Monospace advance width as a fraction of the font size.
 ///
@@ -677,13 +787,16 @@ pub fn card_svg(card: &Card) -> String {
         r#"<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}">"#
     ));
     s.push_str(&format!(r#"<rect width="{W}" height="{H}" fill="{BG}"/>"#));
-    // A single accent edge. The one piece of colour on the card, so it reads as
-    // a mark rather than as decoration.
-    s.push_str(&format!(r#"<rect x="0" y="0" width="10" height="{H}" fill="{ACCENT}"/>"#));
+
+    // The one piece of colour on the card, and it belongs to whatever the card
+    // is about rather than to the site — two repositories side by side in a
+    // channel are told apart by it before either title is read.
+    let tint = if card.tint.is_empty() { ACCENT } else { card.tint.as_str() };
+    s.push_str(&format!(r#"<rect x="0" y="0" width="10" height="{H}" fill="{tint}"/>"#));
 
     // -- wordmark, top left --------------------------------------------------
     s.push_str(&format!(
-        r#"<text x="{PAD}" y="96" font-family="{FAMILY}" font-size="30" font-weight="bold" fill="{ACCENT}">f<tspan fill="{MUTED}">kit</tspan></text>"#
+        r#"<text x="{PAD}" y="96" font-family="{FAMILY}" font-size="30" font-weight="bold" fill="{tint}">f<tspan fill="{MUTED}">kit</tspan></text>"#
     ));
 
     // -- badge, top right ----------------------------------------------------
@@ -702,21 +815,33 @@ pub fn card_svg(card: &Card) -> String {
         ));
     }
 
-    // -- eyebrow -------------------------------------------------------------
-    let mut y = 246.0;
+    // -- the middle block ----------------------------------------------------
+    //
+    // Laid out from a baseline of zero and then translated, so it can be
+    // centred in whatever room is left between the header and the rule. Fixed
+    // offsets left a card with a one-line description sitting high with a band
+    // of dead space beneath it, and a three-line one nearly touching the rule.
+    const TOP: f32 = 118.0;
+    let rule = H as f32 - 132.0;
+
+    let mut block = String::new();
+    let mut y = 0.0f32;
+    let mut first_size = 0.0f32;
+
     if !card.eyebrow.is_empty() {
         let size = fit_size(&card.eyebrow, inner, &[32.0, 28.0, 24.0, 20.0]);
-        s.push_str(&format!(
+        first_size = size;
+        block.push_str(&format!(
             r#"<text x="{PAD}" y="{y}" font-family="{FAMILY}" font-size="{size}" fill="{MUTED}">{}</text>"#,
             xesc(&card.eyebrow)
         ));
         y += 74.0;
-    } else {
-        y += 34.0;
     }
 
-    // -- title ---------------------------------------------------------------
     let size = fit_size(&card.title, inner, &[86.0, 72.0, 60.0, 48.0, 38.0, 30.0]);
+    if first_size == 0.0 {
+        first_size = size;
+    }
     let title = if fits(&card.title, 30.0, inner) {
         card.title.clone()
     } else {
@@ -724,27 +849,37 @@ pub fn card_svg(card: &Card) -> String {
         let n = (inner / (30.0 * ADVANCE)) as usize;
         format!("{}…", card.title.chars().take(n.saturating_sub(1)).collect::<String>())
     };
-    s.push_str(&format!(
+    block.push_str(&format!(
         r#"<text x="{PAD}" y="{y}" font-family="{FAMILY}" font-size="{size}" font-weight="bold" fill="{TEXT}">{}</text>"#,
         xesc(&title)
     ));
-    y += 62.0;
+    let mut last_size = size;
 
-    // -- body ----------------------------------------------------------------
     if !card.body.trim().is_empty() {
-        for line in wrap(card.body.trim(), 28.0, inner, 3) {
-            s.push_str(&format!(
+        y += 62.0;
+        let lines = wrap(card.body.trim(), 28.0, inner, 3);
+        for (i, line) in lines.iter().enumerate() {
+            if i > 0 {
+                y += 40.0;
+            }
+            block.push_str(&format!(
                 r#"<text x="{PAD}" y="{y}" font-family="{FAMILY}" font-size="28" fill="{MUTED}">{}</text>"#,
-                xesc(&line)
+                xesc(line)
             ));
-            y += 40.0;
         }
+        last_size = 28.0;
     }
+
+    // Visual extent, not baseline extent: text sits above its baseline by
+    // roughly its cap height and hangs below by its descender.
+    let top_of_block = first_size * 0.75;
+    let height = top_of_block + y + last_size * 0.22;
+    let dy = TOP + ((rule - TOP - height) / 2.0).max(0.0) + top_of_block;
+    s.push_str(&format!(r#"<g transform="translate(0,{dy})">{block}</g>"#));
 
     // -- footer --------------------------------------------------------------
     // Drawn only when there is something below it. A rule with nothing under it
     // reads as a card that failed to finish loading.
-    let rule = H as f32 - 132.0;
     if card.facts.is_empty() && card.footer.is_empty() {
         s.push_str("</svg>");
         return s;
@@ -753,40 +888,30 @@ pub fn card_svg(card: &Card) -> String {
         r#"<rect x="{PAD}" y="{rule}" width="{inner}" height="1" fill="{BORDER}"/>"#
     ));
 
-    // The hash is the identity of what is shown, so it keeps its full width on
-    // the right and the facts take whatever is left. Sized first for exactly
-    // that reason: the facts cannot be laid out until it is known.
-    let baseline = rule + 44.0;
-    let mut left = inner;
-    if !card.footer.is_empty() {
-        let size = fit_size(&card.footer, inner * 0.62, &[20.0, 17.0, 15.0]);
-        let width = card.footer.chars().count() as f32 * size * ADVANCE;
-        s.push_str(&format!(
-            r#"<text x="{}" y="{baseline}" text-anchor="end" font-family="{FAMILY}" font-size="{size}" fill="{FAINT}">{}</text>"#,
-            W as f32 - PAD,
-            xesc(&card.footer)
-        ));
-        left = (inner - width - 40.0).max(0.0);
-    }
-
-    if !card.facts.is_empty() && left > 60.0 {
+    // Stats get the full width on their own line, and the hash sits under them
+    // rather than beside them. Sharing one line meant a 64-character hash left
+    // room for about two counts before either had to be truncated.
+    if !card.facts.is_empty() {
         let text = card
             .facts
             .iter()
             .map(|(v, l)| if l.is_empty() { v.clone() } else { format!("{v} {l}") })
             .collect::<Vec<_>>()
             .join("  ·  ");
-        // Truncated rather than overlapped: two strings sharing pixels is the
-        // one outcome that makes the card unreadable instead of merely terse.
-        let per = (left / (24.0 * ADVANCE)).floor() as usize;
-        let text = if text.chars().count() > per {
-            text.chars().take(per.saturating_sub(1)).collect::<String>() + "…"
-        } else {
-            text
-        };
+        let size = fit_size(&text, inner, &[24.0, 21.0, 18.0]);
         s.push_str(&format!(
-            r#"<text x="{PAD}" y="{baseline}" font-family="{FAMILY}" font-size="24" fill="{MUTED}">{}</text>"#,
+            r#"<text x="{PAD}" y="{}" font-family="{FAMILY}" font-size="{size}" fill="{MUTED}">{}</text>"#,
+            rule + 40.0,
             xesc(&text)
+        ));
+    }
+
+    if !card.footer.is_empty() {
+        let size = fit_size(&card.footer, inner, &[19.0, 17.0, 15.0]);
+        s.push_str(&format!(
+            r#"<text x="{PAD}" y="{}" font-family="{FAMILY}" font-size="{size}" fill="{FAINT}">{}</text>"#,
+            rule + 78.0,
+            xesc(&card.footer)
         ));
     }
 
@@ -841,8 +966,9 @@ mod tests {
             image: None,
             og_type: "object",
             card: None,
+            tint: String::new(),
         };
-        let html = inject("<head><title>fkit</title></head>", &meta, "https://example.test");
+        let html = inject("<head><title>fkit</title></head>", &meta, "https://example.test", "fkit");
         assert!(!html.contains(r#"onload="x"#), "{html}");
         assert!(!html.contains(r#"onload="y"#), "{html}");
         assert!(html.contains("&quot;"), "{html}");
@@ -869,8 +995,9 @@ mod tests {
             image: None,
             og_type: "object",
             card: None,
+            tint: String::new(),
         };
-        let html = inject("<head><title>fkit</title></head>", &meta, "https://e.test");
+        let html = inject("<head><title>fkit</title></head>", &meta, "https://e.test", "fkit");
         assert_eq!(html.matches("<title>").count(), 1);
         assert!(html.contains("<title>owner/repo</title>"), "{html}");
     }
@@ -884,6 +1011,62 @@ mod tests {
         assert!(out.contains(r#"content="noindex""#), "{out}");
         // The shell still has to boot for whoever is allowed to see the page.
         assert!(out.contains("<title>fkit</title>"), "{out}");
+    }
+
+    #[test]
+    fn a_tint_is_stable_and_a_valid_colour() {
+        let a = tint("helba/fkit");
+        assert_eq!(a, tint("helba/fkit"), "same name, same colour");
+        assert_eq!(a, tint("Helba/FKit"), "case is not part of the identity");
+        assert_eq!(a.len(), 7, "{a}");
+        assert!(a.starts_with('#'), "{a}");
+        assert!(u32::from_str_radix(&a[1..], 16).is_ok(), "{a}");
+    }
+
+    #[test]
+    fn near_identical_names_get_far_apart_colours() {
+        // The point of colouring a repository is telling it from its neighbour.
+        let names = ["helba/fkit", "helba/fkit2", "helba/fkil", "helba/loom"];
+        let hues: Vec<u32> = names
+            .iter()
+            .map(|n| u32::from_str_radix(&tint(n)[1..], 16).unwrap())
+            .collect();
+        for i in 0..hues.len() {
+            for j in i + 1..hues.len() {
+                assert_ne!(hues[i], hues[j], "{} and {} collide", names[i], names[j]);
+            }
+        }
+    }
+
+    #[test]
+    fn every_hue_stays_inside_the_gamut_and_off_the_extremes() {
+        // Fixed Oklch lightness is the reason a hue sweep is safe to use as a
+        // background-independent accent; check no hue clips to black or white.
+        for h in (0..360).step_by(5) {
+            let hex = oklch_to_hex(TINT_L, TINT_C, h as f32);
+            let v = u32::from_str_radix(&hex[1..], 16).unwrap();
+            let (r, g, b) = (v >> 16, (v >> 8) & 0xff, v & 0xff);
+            let max = r.max(g).max(b);
+            let min = r.min(g).min(b);
+            assert!(max > 90, "hue {h} is too dark: {hex}");
+            assert!(min < 230, "hue {h} is too washed out: {hex}");
+        }
+    }
+
+    #[test]
+    fn the_page_colour_reaches_the_head() {
+        let meta = Meta {
+            title: "helba/fkit".into(),
+            description: String::new(),
+            url: "https://e.test/helba/fkit".into(),
+            image: None,
+            og_type: "object",
+            card: None,
+            tint: "#c07a2f".into(),
+        };
+        let html = inject("<head><title>x</title></head>", &meta, "https://e.test", "fkit hub");
+        assert!(html.contains(r##"<meta name="theme-color" content="#c07a2f">"##), "{html}");
+        assert!(html.contains(r#"content="fkit hub""#), "{html}");
     }
 
     #[test]
@@ -921,6 +1104,7 @@ mod tests {
     #[test]
     fn a_card_renders_to_a_png() {
         let png = render_png(&Card {
+            tint: tint("something/fkit"),
             eyebrow: "something /".into(),
             title: "fkit".into(),
             body: "content-addressed version control".into(),

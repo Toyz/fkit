@@ -312,7 +312,7 @@ async fn index_html(state: &AppState, path: &str, headers: &HeaderMap) -> Respon
             // what a crawler is told.
             let base = routes::social::base_url(state, headers);
             let html = match embed::describe(state, path, &base).await {
-                Some(meta) => embed::inject(&html, &meta, &base),
+                Some(meta) => embed::inject(&html, &meta, &base, &state.policy().site_name),
                 None => embed::inject_blank(&html),
             };
             (
