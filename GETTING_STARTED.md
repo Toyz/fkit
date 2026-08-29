@@ -145,8 +145,37 @@ fkit tag                   # list
 fkit tag -f v1.0.0 <hash>  # move one anyway, when you mean it
 ```
 
+### Moving one that is already published
+
+Two commands, and neither of them touches anything you did not name:
+
+```sh
+fkit tag -f v1.0.0 <hash>           # move it here
+fkit push --tag v1.0.0 --force      # move it on the server
+```
+
+`--tag` sends that tag and no branch, so repointing a label never means
+force-pushing your work as well. Without `--force` the server refuses and says
+so, because moving a published tag changes what a name means for everyone who
+already has it.
+
+They find out on their next `fkit pull`, which brings tags into line with the
+server and prints what changed:
+
+```
+  tag v1.0.0 moved 8770ed31f9 -> 8f42675eb3
+```
+
+This is the part git leaves out: `git fetch` will not update a tag it already
+has, so everyone who cloned before the move keeps resolving the name to the old
+commit and nothing tells them. Pass `--no-tags` to opt out. A tag that exists
+only on your machine is yours and is never touched.
+
 If your project is a Go module, tags are what `go get` reads — see
-[Go modules](#go-modules) below.
+[Go modules](#go-modules) below. Moving a published one there is worth thinking
+twice about: the Go module proxy records a checksum per version, and a version
+that changes underneath it is a verification failure for anyone who fetched the
+old one.
 
 ## Putting it on a server
 

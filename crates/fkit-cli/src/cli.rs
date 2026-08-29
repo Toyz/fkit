@@ -230,12 +230,20 @@ pub enum Command {
         #[arg(short, long)]
         force: bool,
         /// Send commits only.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "tag")]
         no_tags: bool,
+        /// Push only this tag, and no branch. Repeatable.
+        #[arg(long = "tag", value_name = "NAME")]
+        tag: Vec<String>,
     },
 
     /// Fetch commits from the remote and update.
-    Pull { branch: Option<String> },
+    Pull {
+        branch: Option<String>,
+        /// Leave local tags alone, even where the remote's have moved.
+        #[arg(long)]
+        no_tags: bool,
+    },
 
     /// Emit a proof that a path is in a commit.
     Prove {

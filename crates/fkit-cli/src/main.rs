@@ -83,8 +83,8 @@ fn run() -> Result<()> {
         C::Merkle { hash } => cmd_merkle(&hash),
         C::Remote { url } => cmd_remote(url.as_deref()),
         C::Clone { url, dir, no_checkout } => cmd_clone(&url, dir.as_deref(), no_checkout),
-        C::Push { branch, force, no_tags } => cmd_push(branch.as_deref(), force, no_tags),
-        C::Pull { branch } => cmd_pull(branch.as_deref()),
+        C::Push { branch, force, no_tags, tag } => cmd_push(branch.as_deref(), force, no_tags, &tag),
+        C::Pull { branch, no_tags } => cmd_pull(branch.as_deref(), no_tags),
         C::Prove { path, commit, output } => cmd_prove(&path, commit.as_deref(), output.as_deref()),
         C::Verify { file, root } => cmd_verify(&file, &root),
         C::Pack => cmd_pack(),
@@ -1033,11 +1033,19 @@ fn cmd_remote(url: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_push(branch: Option<&str>, force: bool, no_tags: bool) -> Result<()> {
+fn cmd_push(branch: Option<&str>, force: bool, no_tags: bool, only: &[String]) -> Result<()> {
     let repo = here()?;
     // Tags ride along by default: a release tag left behind on the machine
     // that made it is a tag nobody else can act on.
     let with_tags = !no_tags;
+
+    // `--tag` on its own sends that tag and nothing else. Moving a published
+    // tag otherwise means force-pushing, and a force that also covers the
+    // branch is a much bigger thing to agree to than repointing one label.
+    if !only.is_empty() {
+        return push_only_tags(&repo, only, force);
+    }
+
     let branch = match branch.map(str::to_string) {
         Some(b) => b,
         None => match repo.head()? {
@@ -1052,7 +1060,7 @@ fn cmd_push(branch: Option<&str>, force: bool, no_tags: bool) -> Result<()> {
     let url = remote_url(&repo)?;
     println!("pushing {branch} ({}) to {url}", tip.short());
 
-    let (mut ws, _refs) = connect(&url, Some(&repo))?;
+    let (mut ws, refs) = connect(&url, Some(&repo))?;
     send(&mut ws, &Msg::PushRef { branch: branch.clone(), tip, force })?;
 
     // The server drives: it asks for what it lacks, we answer.
@@ -1070,7 +1078,7 @@ fn cmd_push(branch: Option<&str>, force: bool, no_tags: bool) -> Result<()> {
     }
 
     if with_tags {
-        push_tags(&repo, &mut ws)?;
+        push_tags(&repo, &mut ws, force, &refs)?;
     }
     ws.close();
     Ok(())
@@ -1087,36 +1095,88 @@ fn first_line(e: &anyhow::Error) -> String {
 /// Done after the branch, on the same connection, so the commits a tag names
 /// are already there. A tag whose commit is not reachable from any branch is
 /// still sent — the server asks for what it lacks either way.
-fn push_tags(repo: &Repo, ws: &mut WebSocket) -> Result<()> {
-    let tags = repo.list_tags()?;
+/// Push a named set of tags over a connection of their own, and nothing else.
+fn push_only_tags(repo: &Repo, names: &[String], force: bool) -> Result<()> {
+    let known = repo.list_tags()?;
+    let mut chosen = Vec::new();
+    for want in names {
+        match known.get(want) {
+            Some(tip) => chosen.push((want.clone(), *tip)),
+            None => bail!("no such tag: {want}"),
+        }
+    }
+
+    let url = remote_url(repo)?;
+    println!("pushing {} tag(s) to {url}", chosen.len());
+    let (mut ws, refs) = connect(&url, Some(repo))?;
+    send_tags(repo, &mut ws, &chosen, force, &refs)
+}
+
+fn push_tags(
+    repo: &Repo,
+    ws: &mut WebSocket,
+    force: bool,
+    remote: &[(String, fkit_core::Hash)],
+) -> Result<()> {
+    let tags: Vec<(String, fkit_core::Hash)> = repo.list_tags()?.into_iter().collect();
     if tags.is_empty() {
         return Ok(());
     }
+    send_tags(repo, ws, &tags, force, remote)
+}
 
-    let mut sent = 0usize;
-    let mut objects = 0usize;
+fn send_tags(
+    repo: &Repo,
+    ws: &mut WebSocket,
+    tags: &[(String, fkit_core::Hash)],
+    force: bool,
+    remote: &[(String, fkit_core::Hash)],
+) -> Result<()> {
+    // What the server said it had when we said hello. A tag push moves no
+    // objects when the commit is already there, so object count says nothing
+    // about whether anything changed — this does.
+    let had = |full: &str| remote.iter().find(|(n, _)| n == full).map(|(_, h)| *h);
+
+    let (mut created, mut moved, mut current) = (0usize, 0usize, 0usize);
     let mut skipped = Vec::new();
-    for (name, tip) in &tags {
+    for (name, tip) in tags {
         let remote_name = format!("{}{name}", Repo::TAG_PREFIX);
-        send(ws, &Msg::PushRef { branch: remote_name, tip: *tip, force: false })?;
+        let before = had(&remote_name);
+        send(ws, &Msg::PushRef { branch: remote_name, tip: *tip, force })?;
 
         // A rejection arrives as an Error, which `recv` raises rather than
         // returns — so a conflicting tag would otherwise abort the whole push
         // and take the tags after it with it. The server stays in its command
         // loop after refusing, so the connection is fine to keep using.
-        match serve_wants(&repo.store, ws).and_then(|stats| {
-            objects += stats.objects as usize;
-            recv(ws)
-        }) {
-            Ok(Msg::Ok { .. }) => sent += 1,
+        match serve_wants(&repo.store, ws).and_then(|_| recv(ws)) {
+            Ok(Msg::Ok { .. }) => match before {
+                None => {
+                    created += 1;
+                    println!("  tag {name} -> {}", tip.short());
+                }
+                Some(was) if was != *tip => {
+                    moved += 1;
+                    println!("  tag {name} moved {} -> {}", was.short(), tip.short());
+                }
+                Some(_) => current += 1,
+            },
             Ok(other) => bail!("unexpected reply pushing tag {name}: {other:?}"),
             Err(e) => skipped.push(format!("{name}: {}", first_line(&e))),
         }
     }
 
-    match objects {
-        0 => println!("  {sent} tag(s) already current"),
-        n => println!("  {sent} tag(s), {n} new object(s)"),
+    let mut parts = Vec::new();
+    if created > 0 {
+        parts.push(format!("{created} new"));
+    }
+    if moved > 0 {
+        parts.push(format!("{moved} moved"));
+    }
+    if current > 0 {
+        parts.push(format!("{current} already current"));
+    }
+    if !parts.is_empty() {
+        println!("  {} tag(s): {}", tags.len(), parts.join(", "));
     }
     for s in &skipped {
         println!("  tag not pushed — {s}");
@@ -1124,7 +1184,7 @@ fn push_tags(repo: &Repo, ws: &mut WebSocket) -> Result<()> {
     Ok(())
 }
 
-fn cmd_pull(branch: Option<&str>) -> Result<()> {
+fn cmd_pull(branch: Option<&str>, no_tags: bool) -> Result<()> {
     let repo = here()?;
     let branch = match branch {
         Some(b) => b.to_string(),
@@ -1140,8 +1200,9 @@ fn cmd_pull(branch: Option<&str>) -> Result<()> {
     // pull_branch advances the ref out from under us.
     let before = repo.head_tree()?;
 
-    let (mut ws, _) = connect(&url, Some(&repo))?;
+    let (mut ws, refs) = connect(&url, Some(&repo))?;
     let stats = pull_branch(&repo, &mut ws, &branch)?;
+    let tags = if no_tags { Ok(Vec::new()) } else { sync_tags(&repo, &mut ws, &refs) };
     ws.close();
 
     let tip = repo.read_ref(&branch)?.context("pull produced no tip")?;
@@ -1157,8 +1218,67 @@ fn cmd_pull(branch: Option<&str>) -> Result<()> {
             Err(e) => println!("  note: working tree not updated — {e}"),
         }
     }
+    match tags {
+        Ok(changes) => {
+            for c in &changes {
+                println!("  {c}");
+            }
+        }
+        // The branch has already landed; failing to reconcile tags should not
+        // undo that or make the command look like it did nothing.
+        Err(e) => println!("  note: tags not updated — {}", first_line(&e)),
+    }
+
     println!("{branch} is now at {}", tip.short());
     Ok(())
+}
+
+/// Bring local tags into line with the remote's.
+///
+/// A tag that has moved on the server is the case git gets wrong: `fetch`
+/// leaves the old one in place, so everyone who cloned before the move keeps
+/// resolving the name to the wrong commit and nothing ever tells them. The
+/// server is the authority for a repository you cloned, so its answer wins —
+/// and every change is printed, because a name quietly meaning something new
+/// is exactly what made this worth fixing.
+///
+/// Only names the remote actually has are touched. A tag that exists solely
+/// here is yours and is left alone.
+fn sync_tags(
+    repo: &Repo,
+    ws: &mut WebSocket,
+    refs: &[(String, fkit_core::Hash)],
+) -> Result<Vec<String>> {
+    let mut changes = Vec::new();
+    for (name, tip) in refs {
+        let Some(tag) = name.strip_prefix(Repo::TAG_PREFIX) else { continue };
+        let local = repo.read_tag(tag)?;
+        if local == Some(*tip) {
+            continue;
+        }
+
+        // The commit may not be here — a tag can point outside the branch that
+        // was just pulled — so make sure of it before writing the name.
+        if repo.store.get(*tip).is_err() {
+            send(ws, &Msg::PullRef { branch: name.clone() })?;
+            match recv(ws)? {
+                Msg::RefIs { tip: Some(t), .. } if t == *tip => {
+                    fetch_closure(&repo.store, ws, &[t])?;
+                    verify_closure(&repo.store, t)?;
+                    let _ = recv(ws);
+                }
+                // Moved again between the greeting and now, or withdrawn.
+                _ => continue,
+            }
+        }
+
+        repo.write_tag(tag, *tip, true)?;
+        changes.push(match local {
+            Some(old) => format!("tag {tag} moved {} -> {}", old.short(), tip.short()),
+            None => format!("tag {tag} -> {}", tip.short()),
+        });
+    }
+    Ok(changes)
 }
 
 /// Fetch one branch into `repo`, enforcing fast-forward on the local ref.

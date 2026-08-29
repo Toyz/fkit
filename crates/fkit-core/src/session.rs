@@ -172,7 +172,8 @@ pub fn serve_session<T: Transport + ?Sized, H: RepoHost + ?Sized>(
                         let message = match branch.strip_prefix(TAG_PREFIX) {
                             Some(tag) => format!(
                                 "rejected: tag {tag} already exists on the server at a \
-                                 different commit (delete it there, or push with --force)"
+                                 different commit — move it with \
+                                 `fkit push --tag {tag} --force`, which touches nothing else"
                             ),
                             None => format!(
                                 "rejected: {branch} on the server is not an ancestor of your \
