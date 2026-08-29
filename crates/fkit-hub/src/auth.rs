@@ -296,8 +296,11 @@ pub async fn lookup_session(db: &sqlx::PgPool, cookie: &str) -> Option<(UserRow,
     // The session id travels with the viewer so the sessions list can mark
     // which row is the browser asking — revoking your own session by accident
     // because every row looks alike is a small disaster.
+    // Filtered here rather than only at login, so disabling an account ends
+    // the sessions it already has instead of waiting for them to expire.
     let user = sqlx::query_as::<_, UserRow>(
-        "SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.id = $1",
+        "SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id
+          WHERE s.id = $1 AND u.is_active",
     )
     .bind(row.0)
     .fetch_optional(db)
@@ -379,7 +382,9 @@ pub async fn lookup_token(db: &sqlx::PgPool, presented: &str) -> Option<TokenAut
         .execute(db)
         .await;
 
-    let user = sqlx::query_as::<_, UserRow>("SELECT * FROM users WHERE id = $1")
+    // Same for a token: a disabled account's credentials stop working at once,
+    // which is what an administrator pressing "disable" is asking for.
+    let user = sqlx::query_as::<_, UserRow>("SELECT * FROM users WHERE id = $1 AND is_active")
         .bind(row.1)
         .fetch_optional(db)
         .await

@@ -20,6 +20,10 @@ pub struct UserRow {
     /// What this account may do to the instance. `is_admin` is a database
     /// view of this and stays in step by construction.
     pub site_role: String,
+    /// False once an administrator has disabled the account. Every credential
+    /// path checks it, so disabling ends existing sessions and tokens rather
+    /// than only blocking the next login.
+    pub is_active: bool,
     pub created_at: DateTime<Utc>,
 }
 

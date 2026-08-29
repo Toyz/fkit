@@ -341,6 +341,17 @@ async fn login(
     }
     let user = user.expect("verified above");
 
+    // Checked after the password, deliberately. Refusing earlier would let
+    // anyone with a username discover whether the account is disabled; here
+    // the person has already proved the account is theirs, so telling them why
+    // they cannot get in is owed to them rather than leaked. A bare
+    // "wrong password" would have them resetting it forever.
+    if !user.is_active {
+        return Err(AppError::Forbidden(
+            "This account has been disabled. Ask an administrator to restore it.".into(),
+        ));
+    }
+
     // Proving you own the account clears its failure count, so an attacker
     // guessing at someone else's username cannot lock them out of their own.
     state.limiter.reset(&format!("login-user:{username}")).await;

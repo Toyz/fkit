@@ -920,7 +920,7 @@ export class PageAdmin extends LoomElement {
             : ""
         }
       >
-        <fkit-section blurb="The last active administrator cannot be demoted, disabled or deleted — a server with no administrator cannot be recovered from the web.">
+        <fkit-section blurb="Disabling signs someone out everywhere and stops their access tokens at once; it is undone by enabling them again. The last active administrator cannot be demoted, disabled or deleted — a server with no administrator cannot be recovered from the web.">
           {rows.length > 6 ? (
             <div class="ufilter">
               <input
@@ -1021,15 +1021,29 @@ export class PageAdmin extends LoomElement {
           ></fkit-select>
         </span>
         <span class="acts">
+          {/* Disabling asks, enabling does not. The ladder is what it costs to
+              be wrong, not whether it writes to the database: enabling only
+              restores access, disabling signs someone out of everything they
+              are in the middle of, and deleting cannot be undone at all — so
+              they get nothing, a question, and a question you have to type an
+              answer to. */}
           <button
             disabled={self || this.busy}
             title={u.is_active ? `Disable ${u.username}` : `Enable ${u.username}`}
-            onClick={() =>
-              void this.act(async () => {
+            onClick={async () => {
+              if (u.is_active) {
+                const ok = await confirmAction({
+                  title: `Disable ${u.username}?`,
+                  body: "They are signed out everywhere immediately and their access tokens stop working, so anything of theirs that pushes — a laptop, a CI job — fails until you enable them again. Nothing is deleted.",
+                  confirm: "disable account",
+                });
+                if (!ok) return;
+              }
+              await this.act(async () => {
                 await api.updateAdminUser(u.id, { is_active: !u.is_active });
                 this.users = await api.adminUsers();
-              })
-            }
+              });
+            }}
           >
             {u.is_active ? "disable" : "enable"}
           </button>
