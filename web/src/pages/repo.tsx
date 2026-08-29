@@ -1327,7 +1327,7 @@ const sheet = css`
     z-index: 40;
     display: flex; align-items: center; gap: 4px;
     padding: 6px 6px 6px 12px;
-    border: 1px solid var(--border-hi); border-radius: var(--radius-lg);
+    border: 1px solid var(--border-hi); border-radius: var(--radius);
     background: color-mix(in srgb, var(--raised) 92%, var(--bg));
     backdrop-filter: blur(8px);
     box-shadow: 0 10px 30px rgb(0 0 0 / .5), 0 0 0 1px rgb(0 0 0 / .25);
@@ -1345,7 +1345,7 @@ const sheet = css`
   .selbar .cas {
     font-family: var(--mono); font-size: 10.5px; color: var(--faint);
     padding: 2px 6px; margin-left: 4px;
-    border: 1px solid var(--border); border-radius: var(--radius-md);
+    border: 1px solid var(--border); border-radius: var(--radius-sm);
     background: var(--bg);
   }
   .selbar .sep {
@@ -1355,7 +1355,7 @@ const sheet = css`
   .selbar .act {
     display: inline-flex; align-items: center; gap: 6px;
     height: 26px; padding: 0 10px;
-    border: 1px solid transparent; border-radius: var(--radius-md);
+    border: 1px solid transparent; border-radius: var(--radius);
     background: transparent; color: var(--muted);
     font: inherit; font-size: 11.5px; cursor: pointer;
   }
@@ -1372,7 +1372,7 @@ const sheet = css`
   .selbar .shut {
     display: inline-flex; align-items: center; justify-content: center;
     width: 26px; height: 26px; margin-left: 2px;
-    border: 0; border-radius: var(--radius-md);
+    border: 0; border-radius: var(--radius);
     background: transparent; color: var(--faint); cursor: pointer;
   }
   .selbar .shut:hover { background: var(--bg); color: var(--text); }

@@ -35,7 +35,7 @@ const sheet = css`
        happened to fit today. */
     min-width: 232px; padding: 5px;
     background: var(--surface); border: 1px solid var(--border-hi);
-    border-radius: var(--radius-lg);
+    border-radius: var(--radius);
     box-shadow: 0 12px 32px rgb(0 0 0 / .5), 0 0 0 1px rgb(0 0 0 / .2);
   }
   @media (prefers-reduced-motion: no-preference) {
@@ -68,7 +68,7 @@ const sheet = css`
   }
   .role {
     flex: none; font-size: 9.5px; letter-spacing: .06em; text-transform: uppercase;
-    padding: 1px 5px; border-radius: var(--radius-md);
+    padding: 1px 5px; border-radius: var(--radius-sm);
     color: var(--accent);
     background: color-mix(in srgb, var(--accent) 15%, transparent);
     border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
@@ -83,7 +83,7 @@ const sheet = css`
 
   a.item, button.item {
     display: flex; align-items: center; gap: 10px; width: 100%;
-    padding: 7px 9px; border-radius: var(--radius-md);
+    padding: 7px 9px; border-radius: var(--radius);
     font: inherit; font-size: 12px; text-align: left; white-space: nowrap;
     color: var(--muted); background: transparent; border: 0; cursor: pointer;
     text-decoration: none;

@@ -61,18 +61,17 @@
   --gutter-bg: #0c1211;
   --gutter-fg: #46534f;
 
-  /* Four radii and no more. This had grown to seven — 2, 3, 4, 5, 7, 10 and
+  /* Three radii and no more. This had grown to seven — 2, 3, 4, 5, 7, 10 and
      11 pixels — each picked in isolation for one component, which is how a UI
      stops looking like one thing.
 
-     The scale is by *elevation*, not by size: something sitting flat in the
-     page takes `--radius`, something floating above it takes `--radius-lg`,
-     and a control nested inside that floating thing takes `--radius-md` so its
-     corner sits concentric with the one around it rather than fighting it. */
+     There is no separate radius for things that float. A softer corner on a
+     popover is the convention elsewhere, and it looked borrowed here: this
+     interface is built out of tight corners and hairline rules, so a 10px
+     overlay read as though it had come from another application. A menu gets
+     the same corner as the rows behind it. */
   --radius-sm: 2px;
   --radius: 3px;
-  --radius-md: 6px;
-  --radius-lg: 10px;
   --radius-pill: 999px;
 
   --mono: ui-monospace, "SF Mono", SFMono-Regular, "JetBrains Mono", "Cascadia Mono", Menlo, Consolas, monospace;
