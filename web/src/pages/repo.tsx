@@ -686,6 +686,61 @@ const sheet = css`
     background: var(--surface);
   }
 
+  /* An issue: the conversation, and a sidebar of what is true about it. */
+  .icols {
+    display: grid; grid-template-columns: minmax(0, 1fr) 220px;
+    gap: 30px; align-items: start;
+  }
+  @media (max-width: 900px) {
+    .icols { grid-template-columns: 1fr; gap: 20px; }
+    .iside { order: -1; }
+  }
+
+  /* The line down the left is what makes a column of boxes read as one
+     conversation rather than a stack of unrelated notes. */
+  .thread-col { position: relative; }
+  .tl { position: relative; padding-left: 20px; padding-bottom: 14px; }
+  .tl::before {
+    content: ""; position: absolute; left: 5px; top: 0; bottom: 0;
+    width: 1px; background: var(--border);
+  }
+  .tl::after {
+    content: ""; position: absolute; left: 2px; top: 15px;
+    width: 7px; height: 7px; border-radius: 999px;
+    background: var(--border-hi);
+  }
+  .tl.last { padding-bottom: 0; }
+  .tl.last::before { bottom: auto; height: 15px; }
+
+  .iside { display: flex; flex-direction: column; gap: 18px; position: sticky; top: 52px; }
+  .iside .sec { display: flex; flex-direction: column; gap: 8px; }
+  .iside .shead {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 10px; text-transform: uppercase; letter-spacing: .09em;
+    color: var(--faint);
+    padding-bottom: 6px; border-bottom: 1px solid var(--border);
+  }
+  .iside .shead span { flex: 1; }
+  .iside .shead button { font-size: 10.5px; padding: 1px 5px; }
+  .iside .sbody { font-size: 12px; }
+  .iside .sbody.wrapz { display: flex; flex-wrap: wrap; gap: 5px; }
+  .iside .sbody.col { display: flex; flex-direction: column; gap: 6px; }
+  .iside .none { color: var(--faint); font-family: var(--sans); }
+  .iside .facts { color: var(--muted); font-family: var(--sans); font-size: 11.5px; }
+  .iside .facts .mono { font-family: var(--mono); color: var(--text); }
+
+  .xref {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 11.5px; color: var(--muted); text-decoration: none; min-width: 0;
+  }
+  .xref:hover { color: var(--text); text-decoration: none; }
+  .xref loom-icon { flex: none; color: var(--faint); }
+  .xref .n { color: var(--accent); flex: none; }
+  .xref .t {
+    font-family: var(--sans);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+
   /* Labels: the strip that narrows the list, and the row that shows them. */
   .lfilter {
     display: flex; align-items: center; flex-wrap: wrap; gap: 6px;
@@ -987,14 +1042,28 @@ const sheet = css`
 
   /* State is the first thing scanned in a list of requests, so it gets a solid
      chip rather than the hairline tag used elsewhere. */
+  /* Filled rather than outlined: this is the one thing on the page a reader
+     should be able to find without looking for it. */
   .mstate {
-    font-size: 10px; text-transform: uppercase; letter-spacing: .07em;
-    padding: 2px 7px; border-radius: 2px; white-space: nowrap;
-    border: 1px solid transparent;
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 11px; padding: 3px 10px; border-radius: 999px;
+    white-space: nowrap; font-family: var(--sans);
   }
-  .mstate.open   { color: var(--added);    border-color: var(--added); }
-  .mstate.merged { color: var(--bg);       background: var(--accent); border-color: var(--accent); }
-  .mstate.closed { color: var(--muted);    border-color: var(--border-hi); }
+  .mstate.open {
+    color: var(--added);
+    background: color-mix(in srgb, var(--added) 14%, transparent);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--added) 40%, transparent);
+  }
+  .mstate.merged {
+    color: var(--accent);
+    background: var(--accent-weak);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent);
+  }
+  .mstate.closed {
+    color: var(--muted);
+    background: var(--raised);
+    box-shadow: inset 0 0 0 1px var(--border-hi);
+  }
 
   /* ---- patch ----
      Two gutters, old line and new line, because a single number cannot tell you
@@ -1361,6 +1430,8 @@ export class PageRepo extends LoomElement {
       return (
         v.kind === "issues" ||
         v.kind === "issue" ||
+        v.kind === "merges" ||
+        v.kind === "merge" ||
         (v.kind === "settings" && v.section === "labels")
       );
     },
@@ -2876,8 +2947,26 @@ export class PageRepo extends LoomElement {
     );
   }
 
+  /// The state of a numbered thing, as one mark.
+  ///
+  /// Colour and shape together rather than colour alone: open and closed are
+  /// the two facts a tracker is read for, and someone who cannot tell the
+  /// greens from the reds should not have to read the word to know which.
   private stateTag(state: string) {
-    return <span class={`mstate ${state}`}>{state}</span>;
+    const icon =
+      state === "open"
+        ? "alert"
+        : state === "merged"
+          ? "merge"
+          : state === "closed"
+            ? "check"
+            : "commit";
+    return (
+      <span class={`mstate ${state}`}>
+        <loom-icon name={icon} size={11}></loom-icon>
+        {state}
+      </span>
+    );
   }
 
   /**
@@ -3094,7 +3183,7 @@ fkit push</pre>
                   <fkit-row
                     loom-key={i.number}
                     icon={i.state === "open" ? "alert" : "check"}
-                    current={i.state === "open"}
+                    tone={i.state === "open" ? "open" : "off"}
                     name=""
                     meta=""
                   >
@@ -3138,6 +3227,11 @@ fkit push</pre>
   }
 
   /// One issue: what it says, and everything said about it.
+  ///
+  /// Two columns. The conversation is the page and gets the width; the
+  /// metadata — labels, what references it — is a sidebar, because it is
+  /// looked at rather than read, and threading it through the top of the
+  /// thread pushed the actual content down the screen.
   private renderIssue(number: number) {
     const at = this.loc!;
     const i = this.issueQuery.data ?? null;
@@ -3152,69 +3246,112 @@ fkit push</pre>
       );
     }
 
+    if (i === null) {
+      return (
+        <div class="wrap">
+          <span class="sk tall" style="width:min(50%,420px)"></span>
+        </div>
+      );
+    }
+
+    const all = this.labelsQuery.data ?? [];
+
     return (
       <div class="wrap">
-        {i ? (
-          this.subjectHead({
-            kind: "issues",
-            number: i.number,
-            title: i.title,
-            state: i.state,
-            author: i.author,
-            created_at: i.created_at,
-            extra: i.state === "closed" && i.closed_at
-              ? `closed ${relativeTime(i.closed_at)}`
-              : "",
-          })
-        ) : null}
+        {this.subjectHead({
+          kind: "issues",
+          number: i.number,
+          title: i.title,
+          state: i.state,
+          author: i.author,
+          created_at: i.created_at,
+          extra:
+            i.state === "closed" && i.closed_at ? `closed ${relativeTime(i.closed_at)}` : "",
+        })}
 
-        <fkit-section heading="" value="">
-          {i && this.session.isAuthed ? (
-            <span slot="action" class="head-acts">
-              <button
-                type="button"
-                disabled={this.busy}
-                onClick={() =>
-                  void this.act(async () => {
-                    await api.setIssueState(at.owner, at.name, i.number, i.state === "closed");
-                    await this.issueQuery.refetch();
-                  })
-                }
-              >
-                {i.state === "open" ? "Close issue" : "Reopen"}
-              </button>
-            </span>
-          ) : null}
+        <div class="icols">
+          <div class="thread-col">
+            {/* The line down the left is what makes a column of boxes read as
+                one conversation rather than a stack of unrelated notes. */}
+            {i.body ? (
+              <div class="tl">
+                <fkit-comment
+                  repo={`${at.owner}/${at.name}`}
+                  author={i.author ?? ""}
+                  when={relativeTime(i.created_at)}
+                  body={i.body}
+                  mine={i.author === me}
+                ></fkit-comment>
+              </div>
+            ) : null}
 
-          {i === null ? (
-            <span class="sk" style="width:260px"></span>
-          ) : (
-            <>
-              {/* The labels on this issue, and the way to change them. Every
-                  label the repository has is offered, drained until applied,
-                  so choosing is one click rather than a search. */}
-              <div class="ilabels">
-                {i.labels.map((l) => (
-                  <fkit-label loom-key={l.id} name={l.name} hue={l.hue}
-                    title={l.description ?? l.name}></fkit-label>
-                ))}
-                {i.labels.length === 0 && !this.pickingLabels ? (
-                  <span class="none">No labels</span>
-                ) : null}
-                {this.session.isAuthed && (this.labelsQuery.data ?? []).length ? (
+            {talk === null ? (
+              <div class="tl"><span class="sk" style="width:200px"></span></div>
+            ) : (
+              talk.map((c) => (
+                <div class="tl" loom-key={c.id}>
+                  {this.renderComment(c, () => this.issueTalkQuery.refetch())}
+                </div>
+              ))
+            )}
+
+            {this.session.isAuthed ? (
+              <div class="tl last">
+                <fkit-composer
+                  label="Comment"
+                  placeholder="Add to this issue"
+                  busy={this.busy}
+                  onSend={(e: Event) => {
+                    const body = (e as CustomEvent<string>).detail;
+                    void this.act(async () => {
+                      await api.commentOnIssue(at.owner, at.name, number, { body });
+                      await this.issueTalkQuery.refetch();
+                      for (const el of this.shadowRoot?.querySelectorAll("fkit-composer") ?? []) {
+                        (el as HTMLElement & { clear(): void }).clear();
+                      }
+                    });
+                  }}
+                >
+                  {/* Closing with a remark is one action, not two, and it is
+                      the one people actually take. */}
+                  <button
+                    type="button"
+                    slot="extra"
+                    disabled={this.busy}
+                    onClick={() =>
+                      void this.act(async () => {
+                        await api.setIssueState(
+                          at.owner, at.name, i.number, i.state === "closed",
+                        );
+                        await this.issueQuery.refetch();
+                      })
+                    }
+                  >
+                    {i.state === "open" ? "Close issue" : "Reopen"}
+                  </button>
+                </fkit-composer>
+              </div>
+            ) : null}
+          </div>
+
+          <aside class="iside">
+            <div class="sec">
+              <div class="shead">
+                <span>Labels</span>
+                {this.session.isAuthed && all.length ? (
                   <button
                     type="button"
                     class="bare"
                     onClick={() => (this.pickingLabels = !this.pickingLabels)}
                   >
-                    {this.pickingLabels ? "done" : "edit labels"}
+                    {this.pickingLabels ? "done" : "edit"}
                   </button>
                 ) : null}
               </div>
 
               {this.pickingLabels ? (
-                <div class="lpick">
-                  {(this.labelsQuery.data ?? []).map((l) => {
+                <div class="sbody wrapz">
+                  {all.map((l) => {
                     const on = i.labels.some((x) => x.id === l.id);
                     return (
                       <fkit-label
@@ -3237,71 +3374,60 @@ fkit push</pre>
                     );
                   })}
                 </div>
-              ) : null}
-
-              {this.issueRefs && this.issueRefs.length ? (
-                <div class="links">
-                  <loom-icon name="link" size={12}></loom-icon>
-                  <span>
-                    Referenced by{" "}
-                    {this.issueRefs.map((r, k) => {
-                      const href = `/${at.owner}/${at.name}/${
-                        r.kind === "issue" ? "issues" : "merges"
-                      }/${r.number}`;
-                      return (
-                        <>
-                          {k > 0 ? ", " : ""}
-                          <a href={href} onClick={linkHandler(href)} title={r.title}>
-                            {r.kind === "merge" ? "merge request " : "issue "}#{r.number}
-                          </a>
-                          {r.state !== "open" ? <span class="st">({r.state})</span> : null}
-                        </>
-                      );
-                    })}
-                  </span>
+              ) : i.labels.length ? (
+                <div class="sbody wrapz">
+                  {i.labels.map((l) => (
+                    <fkit-label
+                      loom-key={l.id}
+                      name={l.name}
+                      hue={l.hue}
+                      title={l.description ?? l.name}
+                    ></fkit-label>
+                  ))}
                 </div>
-              ) : null}
+              ) : (
+                <div class="sbody none">None yet</div>
+              )}
+            </div>
 
-              <div class="talk">
-                {i.body ? (
-                  <fkit-comment
-                    repo={`${at.owner}/${at.name}`}
-                    author={i.author ?? ""}
-                    when={relativeTime(i.created_at)}
-                    body={i.body}
-                    mine={i.author === me}
-                  ></fkit-comment>
-                ) : null}
+            {this.issueRefs && this.issueRefs.length ? (
+              <div class="sec">
+                <div class="shead"><span>Referenced by</span></div>
+                <div class="sbody col">
+                  {this.issueRefs.map((r) => {
+                    const href = `/${at.owner}/${at.name}/${
+                      r.kind === "issue" ? "issues" : "merges"
+                    }/${r.number}`;
+                    return (
+                      <a class="xref" loom-key={`${r.kind}${r.number}`} href={href}
+                         onClick={linkHandler(href)} title={r.title}>
+                        <loom-icon
+                          name={r.kind === "merge" ? "merge" : "alert"}
+                          size={12}
+                        ></loom-icon>
+                        <span class="n">#{r.number}</span>
+                        <span class="t">{r.title}</span>
+                      </a>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : null}
 
-                {talk === null ? (
-                  <span class="sk" style="width:200px"></span>
-                ) : (
-                  talk.map((c) =>
-                    this.renderComment(c, () => this.issueTalkQuery.refetch()),
-                  )
-                )}
-
-                {this.session.isAuthed ? (
-                  <fkit-composer
-                    label="Comment"
-                    placeholder="Add to this issue"
-                    busy={this.busy}
-                    onSend={(e: Event) => {
-                      const body = (e as CustomEvent<string>).detail;
-                      void this.act(async () => {
-                        await api.commentOnIssue(at.owner, at.name, number, { body });
-                        await this.issueTalkQuery.refetch();
-                        for (const el of this.shadowRoot?.querySelectorAll("fkit-composer") ?? []) {
-                          (el as HTMLElement & { clear(): void }).clear();
-                        }
-                      });
-                    }}
-                  ></fkit-composer>
+            <div class="sec">
+              <div class="shead"><span>Activity</span></div>
+              <div class="sbody col facts">
+                <span>
+                  {talk ? `${talk.length} ${talk.length === 1 ? "comment" : "comments"}` : "—"}
+                </span>
+                <span>opened {relativeTime(i.created_at)}</span>
+                {i.state === "closed" && i.closed_at ? (
+                  <span>closed {relativeTime(i.closed_at)}</span>
                 ) : null}
               </div>
-            </>
-          )}
-        </fkit-section>
+            </div>
+          </aside>
+        </div>
       </div>
     );
   }
@@ -3361,7 +3487,7 @@ fkit push</pre>
                 <fkit-row
                   loom-key={m.number}
                   icon={m.state === "merged" ? "check" : m.state === "closed" ? "x" : "merge"}
-                  current={m.state === "open"}
+                  tone={m.state === "open" ? "open" : m.state === "merged" ? "done" : "off"}
                   name=""
                   meta=""
                 >
@@ -3370,7 +3496,17 @@ fkit push</pre>
                       decides whether you are the person who should look at
                       it, and this list did not say. */}
                   <span slot="main" class="issue-line">
-                    <a class="t" href={href} onClick={linkHandler(href)}>{m.title}</a>
+                    <span class="tline">
+                      <a class="t" href={href} onClick={linkHandler(href)}>{m.title}</a>
+                      {m.labels.map((l) => (
+                        <fkit-label
+                          loom-key={l.id}
+                          name={l.name}
+                          hue={l.hue}
+                          title={l.description ?? l.name}
+                        ></fkit-label>
+                      ))}
+                    </span>
                     <span class="sub">
                       #{m.number} opened {relativeTime(m.created_at)}
                       {m.author ? ` by ${m.author}` : ""} · {m.source_branch} into{" "}
@@ -3449,25 +3585,7 @@ fkit push</pre>
           ),
         })}
 
-        {m.description ? <div class="sdesc">{m.description}</div> : null}
 
-        {m.closes.length ? (
-          <div class="links">
-            <loom-icon name="link" size={12}></loom-icon>
-            <span>
-              Merging this closes{" "}
-              {m.closes.map((n: number, i: number) => {
-                const href = `/${at.owner}/${at.name}/issues/${n}`;
-                return (
-                  <>
-                    {i > 0 ? ", " : ""}
-                    <a href={href} onClick={linkHandler(href)}>#{n}</a>
-                  </>
-                );
-              })}
-            </span>
-          </div>
-        ) : null}
 
         {!c ? (
           <div class="panel">
@@ -3577,6 +3695,9 @@ fkit push</pre>
 
             {this.mergeTabs(m.number, tab, c)}
 
+            <div class={tab === "files" ? "" : "icols"}>
+              <div>
+
             {tab === "commits" ? (
               c.commits.length === 0 ? (
                 <div class="panel"><div class="empty">No commits on this branch.</div></div>
@@ -3630,7 +3751,107 @@ fkit push</pre>
               )
             ) : null}
 
-            {tab === "conversation" ? this.renderConversation(m.number, c) : null}
+            {tab === "conversation" ? (
+              <div class="talk">
+                {/* The request itself, rendered like any other remark, so a
+                    `#4` in its description is a link the same as one in a
+                    comment. It was plain text before, which is why the
+                    references in it never resolved. */}
+                {m.description ? (
+                  <fkit-comment
+                    repo={`${at.owner}/${at.name}`}
+                    author={m.author ?? ""}
+                    when={relativeTime(m.created_at)}
+                    body={m.description}
+                    mine={m.author === this.session.current?.username}
+                  ></fkit-comment>
+                ) : null}
+                {this.renderConversation(m.number, c)}
+              </div>
+            ) : null}
+              </div>
+
+              {tab === "files" ? null : (
+                <aside class="iside">
+                  <div class="sec">
+                    <div class="shead">
+                      <span>Labels</span>
+                      {this.session.isAuthed && (this.labelsQuery.data ?? []).length ? (
+                        <button
+                          type="button"
+                          class="bare"
+                          onClick={() => (this.pickingLabels = !this.pickingLabels)}
+                        >
+                          {this.pickingLabels ? "done" : "edit"}
+                        </button>
+                      ) : null}
+                    </div>
+                    {this.pickingLabels ? (
+                      <div class="sbody wrapz">
+                        {(this.labelsQuery.data ?? []).map((l) => {
+                          const on = m.labels.some((x) => x.id === l.id);
+                          return (
+                            <fkit-label
+                              loom-key={l.id}
+                              clickable
+                              off={!on}
+                              name={l.name}
+                              hue={l.hue}
+                              title={l.description ?? l.name}
+                              onClick={() =>
+                                void this.act(async () => {
+                                  const next = on
+                                    ? m.labels.filter((x) => x.id !== l.id).map((x) => x.id)
+                                    : [...m.labels.map((x) => x.id), l.id];
+                                  await api.setMergeLabels(at.owner, at.name, m.number, next);
+                                  await this.mrQuery.refetch();
+                                })
+                              }
+                            ></fkit-label>
+                          );
+                        })}
+                      </div>
+                    ) : m.labels.length ? (
+                      <div class="sbody wrapz">
+                        {m.labels.map((l) => (
+                          <fkit-label loom-key={l.id} name={l.name} hue={l.hue}
+                            title={l.description ?? l.name}></fkit-label>
+                        ))}
+                      </div>
+                    ) : (
+                      <div class="sbody none">None yet</div>
+                    )}
+                  </div>
+
+                  {m.closes.length ? (
+                    <div class="sec">
+                      <div class="shead"><span>Closes on merge</span></div>
+                      <div class="sbody col">
+                        {m.closes.map((n: number) => {
+                          const href = `/${at.owner}/${at.name}/issues/${n}`;
+                          return (
+                            <a class="xref" loom-key={n} href={href} onClick={linkHandler(href)}>
+                              <loom-icon name="alert" size={12}></loom-icon>
+                              <span class="n">#{n}</span>
+                            </a>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ) : null}
+
+                  <div class="sec">
+                    <div class="shead"><span>Branches</span></div>
+                    <div class="sbody col facts">
+                      <span class="mono">{m.source_branch}</span>
+                      <span>into</span>
+                      <span class="mono">{m.target_branch}</span>
+                      {c ? <span>{c.ahead} ahead, {c.behind} behind</span> : null}
+                    </div>
+                  </div>
+                </aside>
+              )}
+            </div>
           </div>
         )}
       </div>

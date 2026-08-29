@@ -395,6 +395,7 @@ export interface MergeRequest {
   updated_at: string;
   /** Issues this says it closes; merging it will. */
   closes: number[];
+  labels: Label[];
 }
 
 export interface MergeRequestDetail extends MergeRequest {
@@ -567,6 +568,12 @@ export const api = {
     }),
   deleteLabel: (owner: string, name: string, id: string) =>
     request<{ ok: boolean }>(`/repos/${owner}/${name}/labels/${id}`, { method: "DELETE" }),
+  setMergeLabels: (owner: string, name: string, number: number, labels: string[]) =>
+    request<Label[]>(`/repos/${owner}/${name}/merges/${number}/labels`, {
+      method: "POST",
+      body: body({ labels }),
+    }),
+
   /** The complete set, not a delta. */
   setIssueLabels: (owner: string, name: string, number: number, labels: string[]) =>
     request<Label[]>(`/repos/${owner}/${name}/issues/${number}/labels`, {

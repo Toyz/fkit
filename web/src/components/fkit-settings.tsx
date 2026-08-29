@@ -257,6 +257,12 @@ const itemSheet = css`
 
   .ic { color: var(--faint); display: flex; flex: none; }
   :host([current]) .ic { color: var(--accent); }
+  /* A row whose icon carries a state rather than a kind. Colour and shape
+     together: someone who cannot tell the greens from the greys still has the
+     glyph. */
+  :host([tone="open"]) .ic { color: var(--added); }
+  :host([tone="done"]) .ic { color: var(--accent); }
+  :host([tone="off"]) .ic { color: var(--muted); }
   /* Stacked, not inline: as plain spans these ran together into
      "ChromeSigned in just now". */
   .main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
@@ -276,6 +282,8 @@ export class FkitRow extends LoomElement {
   @prop accessor name = "";
   @prop accessor meta = "";
   @prop accessor current = false;
+  /** "" | open | done | off — what the icon's colour should say. */
+  @prop accessor tone = "";
 
   update() {
     return (

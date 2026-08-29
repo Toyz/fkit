@@ -50,6 +50,10 @@ pub fn routes() -> Router<AppState> {
             "/repos/{owner}/{name}/issues/{number}/labels",
             post(set_issue_labels),
         )
+        .route(
+            "/repos/{owner}/{name}/merges/{number}/labels",
+            post(set_merge_labels),
+        )
         .route("/repos/{owner}/{name}/n/{number}", get(what_is))
         .route("/repos/{owner}/{name}/issues/{number}/refs", get(issue_refs))
 }
@@ -258,6 +262,54 @@ async fn set_issue_labels(
     Ok(Json(labels_of(&state, id).await?))
 }
 
+async fn set_merge_labels(
+    State(state): State<AppState>,
+    viewer: Viewer,
+    Path((owner, name, number)): Path<(String, String, i32)>,
+    Json(input): Json<IssueLabels>,
+) -> AppResult<Json<Vec<LabelView>>> {
+    let (repo_id, id) = load_merge(&state, &viewer, &owner, &name, number).await?;
+    writer(&viewer)?;
+
+    let mut tx = state.db.begin().await?;
+    sqlx::query("DELETE FROM merge_labels WHERE merge_request_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    for label in &input.labels {
+        sqlx::query(
+            "INSERT INTO merge_labels (merge_request_id, label_id)
+             SELECT $1, id FROM labels WHERE id = $2 AND repo_id = $3
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(id)
+        .bind(label)
+        .bind(repo_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query("UPDATE merge_requests SET updated_at = now() WHERE id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
+    Ok(Json(merge_labels_of(&state, id).await?))
+}
+
+/// The labels on one merge request.
+pub async fn merge_labels_of(state: &AppState, mr: Uuid) -> AppResult<Vec<LabelView>> {
+    Ok(sqlx::query_as(
+        "SELECT l.id, l.name, l.hue, l.description
+           FROM merge_labels ml JOIN labels l ON l.id = ml.label_id
+          WHERE ml.merge_request_id = $1
+          ORDER BY lower(l.name)",
+    )
+    .bind(mr)
+    .fetch_all(&state.db)
+    .await?)
+}
+
 /// The labels on one issue.
 async fn labels_of(state: &AppState, issue: Uuid) -> AppResult<Vec<LabelView>> {
     Ok(sqlx::query_as(
@@ -321,6 +373,9 @@ impl From<IssueRow> for IssueView {
 
 /// One row of the bulk label join: which issue, and the label's own columns.
 type LabelRow = (i32, Uuid, String, i32, Option<String>);
+
+/// The same, keyed by merge request id rather than issue number.
+pub type MergeLabelRow = (Uuid, Uuid, String, i32, Option<String>);
 
 /// Attach each issue's labels in one query rather than one per row.
 async fn attach_labels(state: &AppState, views: &mut [IssueView], repo: Uuid) {

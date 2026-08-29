@@ -113,6 +113,8 @@ pub struct MrView {
     pub updated_at: DateTime<Utc>,
     /// Issues this request says it closes, which merging it will.
     pub closes: Vec<i32>,
+    /// Filled after the row is fetched, the same way an issue's are.
+    pub labels: Vec<super::issues::LabelView>,
 }
 
 impl From<MrRow> for MrView {
@@ -137,6 +139,7 @@ impl From<MrRow> for MrView {
                 .map(|a: [u8; 32]| Hash(a).to_hex()),
             merged_at: r.merged_at,
             closes,
+            labels: Vec::new(),
             created_at: r.created_at,
             updated_at: r.updated_at,
         }
@@ -196,7 +199,39 @@ async fn list(
         .bind(&want)
         .fetch_all(&state.db)
         .await?;
-    Ok(Json(rows.into_iter().map(MrView::from).collect()))
+    // One query for every row's labels rather than one per row.
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+    let mut by: std::collections::HashMap<Uuid, Vec<super::issues::LabelView>> =
+        std::collections::HashMap::new();
+    let joined: Result<Vec<super::issues::MergeLabelRow>, _> = sqlx::query_as(
+        "SELECT ml.merge_request_id, l.id, l.name, l.hue, l.description
+           FROM merge_labels ml JOIN labels l ON l.id = ml.label_id
+          WHERE ml.merge_request_id = ANY($1)
+          ORDER BY lower(l.name)",
+    )
+    .bind(&ids)
+    .fetch_all(&state.db)
+    .await;
+    if let Ok(joined) = joined {
+        for (mr, id, name, hue, description) in joined {
+            by.entry(mr)
+                .or_default()
+                .push(super::issues::LabelView { id, name, hue, description });
+        }
+    }
+
+    Ok(Json(
+        rows.into_iter()
+            .map(|r| {
+                let id = r.id;
+                let mut v = MrView::from(r);
+                if let Some(ls) = by.remove(&id) {
+                    v.labels = ls;
+                }
+                v
+            })
+            .collect(),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -319,7 +354,10 @@ async fn detail(
     };
 
     let can_merge = access.can_write() && row.state == "open";
-    Ok(Json(MrDetail { request: MrView::from(row), comparison, can_merge }))
+    let id = row.id;
+    let mut request = MrView::from(row);
+    request.labels = super::issues::merge_labels_of(&state, id).await?;
+    Ok(Json(MrDetail { request, comparison, can_merge }))
 }
 
 async fn load(state: &AppState, repo_id: Uuid, number: i32) -> AppResult<MrRow> {
