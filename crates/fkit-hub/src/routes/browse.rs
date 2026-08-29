@@ -38,6 +38,27 @@ pub fn routes() -> Router<AppState> {
 ///
 /// Branch names are tried first: if someone names a branch after a valid hex
 /// string, the branch is what they meant.
+/// Look a ref name up, distinguishing "no such ref" from a database failure.
+///
+/// Separate from [`resolve_ref`] because widening a ref across a path tries
+/// several candidates, and `Err` there has to keep meaning something went
+/// wrong — swallowing a connection error as "not found" would turn an outage
+/// into a 404.
+async fn lookup_ref(state: &AppState, repo: &RepoRow, name: &str) -> AppResult<Option<Hash>> {
+    let row: Option<(Vec<u8>,)> =
+        sqlx::query_as("SELECT target FROM refs WHERE repo_id = $1 AND name = $2")
+            .bind(repo.id)
+            .bind(name)
+            .fetch_optional(&state.db)
+            .await?;
+
+    let Some((bytes,)) = row else { return Ok(None) };
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| AppError::Internal(anyhow::anyhow!("corrupt ref target")))?;
+    Ok(Some(Hash(arr)))
+}
+
 /// Resolve a URL ref — a branch, a tag, or a commit hash.
 ///
 /// Tags are stored prefixed, so a URL saying `v1.0` has to be tried as
@@ -45,6 +66,19 @@ pub fn routes() -> Router<AppState> {
 /// the branch is the one someone browsing is more likely to mean. The prefixed
 /// spelling is also accepted, so a link that already carries it still works.
 async fn resolve_ref(state: &AppState, repo: &RepoRow, spec: &str) -> AppResult<Hash> {
+    if let Some(h) = try_resolve_ref(state, repo, spec).await? {
+        return Ok(h);
+    }
+    Err(AppError::not_found(format!(
+        "no such branch, tag or commit: {spec}"
+    )))
+}
+
+async fn try_resolve_ref(
+    state: &AppState,
+    repo: &RepoRow,
+    spec: &str,
+) -> AppResult<Option<Hash>> {
     let tagged = format!("{}{spec}", fkit_core::session::TAG_PREFIX);
     let candidates: [&str; 2] = if fkit_core::session::is_tag(spec) {
         [spec, spec]
@@ -53,23 +87,69 @@ async fn resolve_ref(state: &AppState, repo: &RepoRow, spec: &str) -> AppResult<
     };
 
     for name in candidates {
-        let row: Option<(Vec<u8>,)> =
-            sqlx::query_as("SELECT target FROM refs WHERE repo_id = $1 AND name = $2")
-                .bind(repo.id)
-                .bind(name)
-                .fetch_optional(&state.db)
-                .await?;
-
-        if let Some((bytes,)) = row {
-            let arr: [u8; 32] = bytes
-                .try_into()
-                .map_err(|_| AppError::Internal(anyhow::anyhow!("corrupt ref target")))?;
-            return Ok(Hash(arr));
+        if let Some(h) = lookup_ref(state, repo, name).await? {
+            return Ok(Some(h));
         }
     }
 
-    Hash::from_hex(spec)
-        .ok_or_else(|| AppError::not_found(format!("no such branch, tag or commit: {spec}")))
+    Ok(Hash::from_hex(spec))
+}
+
+/// Split `<ref>/<path>` when the ref itself contains slashes.
+///
+/// `/tree/feature/settings-redesign/web` is ambiguous: the branch could be
+/// `feature` holding `settings-redesign/web`, or `feature/settings-redesign`
+/// holding `web`. The router has to guess, so it guesses shortest and this
+/// widens the guess against the refs that actually exist.
+///
+/// The client percent-encodes the slash, which makes the whole name one path
+/// segment and avoids the question — but only as far as the first proxy that
+/// normalises `%2F` back into a slash, which a dev server and most reverse
+/// proxies do. Resolving it here means the URL works either way.
+async fn resolve_ref_in_path(
+    state: &AppState,
+    repo: &RepoRow,
+    spec: &str,
+    path: &str,
+) -> AppResult<(Hash, String)> {
+    // The literal spec wins, so no link that already worked changes meaning.
+    if let Some(h) = try_resolve_ref(state, repo, spec).await? {
+        return Ok((h, path.to_string()));
+    }
+
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    // Longest first: given both `a/b` and `a/b/c`, the deeper name is the one
+    // the URL was more specific about.
+    for take in (1..=segs.len()).rev() {
+        let candidate = format!("{spec}/{}", segs[..take].join("/"));
+        if let Some(h) = lookup_ref(state, repo, &candidate).await? {
+            return Ok((h, segs[take..].join("/")));
+        }
+        let tagged = format!("{}{candidate}", fkit_core::session::TAG_PREFIX);
+        if let Some(h) = lookup_ref(state, repo, &tagged).await? {
+            return Ok((h, segs[take..].join("/")));
+        }
+    }
+
+    Err(AppError::not_found(format!(
+        "no such branch, tag or commit: {spec}"
+    )))
+}
+
+/// The preamble for a handler that carries a path the ref may have eaten into.
+async fn open_in_path(
+    state: &AppState,
+    viewer: &Viewer,
+    owner: &str,
+    name: &str,
+    spec: &str,
+    path: &str,
+) -> AppResult<(Store, Hash, Hash, String)> {
+    let (repo, _, _) = super::load_repo(state, viewer, owner, name).await?;
+    let (commit_id, rest) = resolve_ref_in_path(state, &repo, spec, path).await?;
+    let store = state.store_for(repo.id).map_err(AppError::Internal)?;
+    let commit = content::commit_of(&store, commit_id)?;
+    Ok((store, commit_id, commit.tree, rest))
 }
 
 /// Open the store and resolve the ref — the common preamble of every handler.
@@ -112,7 +192,8 @@ async fn tree_path(
     viewer: Viewer,
     Path((owner, name, r, path)): Path<(String, String, String, String)>,
 ) -> AppResult<Json<TreeResponse>> {
-    let (store, commit, tree) = open(&state, &viewer, &owner, &name, &r).await?;
+    let (store, commit, tree, path) =
+        open_in_path(&state, &viewer, &owner, &name, &r, &path).await?;
     Ok(Json(TreeResponse {
         entries: content::list_dir(&store, tree, &path)?,
         path,
@@ -141,7 +222,8 @@ async fn blob(
     viewer: Viewer,
     Path((owner, name, r, path)): Path<(String, String, String, String)>,
 ) -> AppResult<Json<BlobResponse>> {
-    let (store, _, tree) = open(&state, &viewer, &owner, &name, &r).await?;
+    let (store, _, tree, path) =
+        open_in_path(&state, &viewer, &owner, &name, &r, &path).await?;
     let b = content::read_blob(&store, tree, &path)?;
 
     let text = if b.binary || b.truncated {
@@ -224,7 +306,8 @@ async fn last_commits_path(
     viewer: Viewer,
     Path((owner, name, r, path)): Path<(String, String, String, String)>,
 ) -> AppResult<Json<std::collections::HashMap<String, content::LastCommit>>> {
-    let (store, commit, _) = open(&state, &viewer, &owner, &name, &r).await?;
+    let (store, commit, _, path) =
+        open_in_path(&state, &viewer, &owner, &name, &r, &path).await?;
     Ok(Json(content::last_commits(&store, commit, &path, LAST_COMMIT_SCAN)?))
 }
 
@@ -244,7 +327,8 @@ async fn raw(
     use axum::http::header;
     use axum::response::IntoResponse;
 
-    let (store, _, tree) = open(&state, &viewer, &owner, &name, &r).await?;
+    let (store, _, tree, path) =
+        open_in_path(&state, &viewer, &owner, &name, &r, &path).await?;
     let (bytes, _size) = content::raw_blob(&store, tree, &path)?;
 
     // An image may be typed honestly: the formats below are decoded as pixels
@@ -335,7 +419,8 @@ async fn readme_at(
     viewer: Viewer,
     Path((owner, name, r, path)): Path<(String, String, String, String)>,
 ) -> AppResult<Json<Option<ReadmeResponse>>> {
-    let (store, _, tree) = open(&state, &viewer, &owner, &name, &r).await?;
+    let (store, _, tree, path) =
+        open_in_path(&state, &viewer, &owner, &name, &r, &path).await?;
     let dir = content::resolve_dir(&store, tree, &path)?;
     Ok(Json(
         content::find_readme(&store, dir).map(|(n, c)| ReadmeResponse { name: n, content: c }),
