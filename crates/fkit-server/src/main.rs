@@ -30,41 +30,51 @@ fn main() {
     }
 }
 
-fn run() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut cfg = Config {
-        data_dir: std::path::PathBuf::from("./fkit-data"),
-        listen: "127.0.0.1:7420".to_string(),
-        token: std::env::var("FKIT_TOKEN").ok().filter(|t| !t.is_empty()),
-        allow_create: true,
-        insecure_no_auth: false,
-    };
+// The daemon's options. A doc comment here would become the help text, and an
+// implementation note is not what someone typing --help asked for.
+//
+// `-d`/`-l` and the long forms are what the hand-rolled parser accepted, so an
+// existing unit file keeps working.
+#[derive(clap::Parser, Debug)]
+#[command(
+    name = "fkitd",
+    version,
+    about = "fkit sync daemon",
+    after_help = "ENVIRONMENT:\n  \
+                  FKIT_TOKEN          if set, clients must present this token\n\n\
+                  For user accounts, per-repo permissions and a web UI, run fkit-hub instead."
+)]
+struct Args {
+    /// Address to listen on.
+    #[arg(short, long, default_value = "127.0.0.1:7420")]
+    listen: String,
 
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--data" | "-d" => { cfg.data_dir = std::path::PathBuf::from(&args[i + 1]); i += 2 }
-            "--listen" | "-l" => { cfg.listen = args[i + 1].clone(); i += 2 }
-            "--no-create" => { cfg.allow_create = false; i += 1 }
-            "--insecure-no-auth" => { cfg.insecure_no_auth = true; i += 1 }
-            "-h" | "--help" => {
-                println!(
-                    "fkitd — fkit sync daemon\n\n\
-                     USAGE:\n    fkitd [--listen ADDR] [--data DIR] [--no-create]\n\n\
-                     OPTIONS:\n\
-                     \x20   -l, --listen ADDR   default 127.0.0.1:7420\n\
-                     \x20   -d, --data DIR      where repositories live (default ./fkit-data)\n\
-                     \x20   --no-create         reject pushes to repositories that do not exist\n\
-                     \x20   --insecure-no-auth  allow listening off-loopback with no token\n\n\
-                     ENVIRONMENT:\n\
-                     \x20   FKIT_TOKEN          if set, clients must present this token\n\n\
-                     For user accounts, per-repo permissions and a web UI, run fkit-hub instead.\n"
-                );
-                return Ok(());
-            }
-            other => bail!("unknown option '{other}' (try --help)"),
-        }
-    }
+    /// Where repositories live.
+    #[arg(short, long, default_value = "./fkit-data")]
+    data: std::path::PathBuf,
+
+    /// Reject pushes to repositories that do not exist.
+    #[arg(long)]
+    no_create: bool,
+
+    /// Allow listening off-loopback with no token.
+    #[arg(long)]
+    insecure_no_auth: bool,
+}
+
+fn run() -> Result<()> {
+    use clap::Parser;
+    let args = Args::parse();
+
+    let cfg = Config {
+        data_dir: args.data,
+        listen: args.listen,
+        // Deliberately not a flag. A token on the command line is a token in
+        // the process list, and in the shell history of whoever started it.
+        token: std::env::var("FKIT_TOKEN").ok().filter(|t| !t.is_empty()),
+        allow_create: !args.no_create,
+        insecure_no_auth: args.insecure_no_auth,
+    };
 
     // Fail before binding, not after — a warning in a container log is not a
     // safety mechanism.

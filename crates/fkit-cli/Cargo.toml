@@ -12,6 +12,7 @@ name = "fkit"
 path = "src/main.rs"
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 mimalloc = "0.1"
 fkit-core.workspace = true
 anyhow.workspace = true

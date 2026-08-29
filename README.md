@@ -437,9 +437,11 @@ crates/
 web/             the UI — Loom web components, no runtime dependencies
 ```
 
-`fkit-core` has **two dependencies**: `blake3` and `anyhow`. The WebSocket layer,
-its SHA-1 and base64, every binary encoding, and the argument parsing are written
-out longhand — it is meant to be read end to end. The hub is where that stops
+`fkit-core` has **two dependencies**: `blake3` and `anyhow`. The WebSocket
+layer, its SHA-1 and base64, and every binary encoding are written out
+longhand — it is meant to be read end to end. The binaries around it take
+`clap`, because argument parsing is a solved problem and hand-rolling it bought
+nothing but a missing `--version`. The hub is where that stops
 being a virtue: it uses axum, tokio and sqlx, because hand-rolling HTTP routing
 and the Postgres wire protocol would be effort with no insight at the end of it.
 

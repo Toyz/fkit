@@ -5,6 +5,7 @@
 //! few dozen lines of matching.
 
 use anyhow::{bail, Context, Result};
+use clap::CommandFactory;
 use fkit_core::repo::CommitAs;
 use fkit_core::checkout::checkout_tree;
 use fkit_core::diff as linediff;
@@ -18,74 +19,8 @@ use fkit_core::ws::WebSocket;
 use std::io::Write;
 use std::path::PathBuf;
 
-const USAGE: &str = "\
-fkit — a content-addressed version control system
+mod cli;
 
-USAGE:
-    fkit <command> [args]
-
-REPOSITORY
-    init [path]              create a repository
-    config [--global] <key> [value]
-                             read or set a config value (author, remote, token)
-    config --list            show effective values and where each came from
-
-SNAPSHOTS
-    status                   show what changed since the last commit
-    commit -m <message>      snapshot the working tree
-    log [-n <count>]         show commit history
-    diff [<a>] [<b>]         show what changed (defaults: HEAD vs working tree)
-        --stat               list changed paths only, no line content
-        -U <n>               lines of context (default 3)
-
-BRANCHES
-    branch                   list branches
-    branch <name>            create a branch at HEAD
-    branch -d <name>         delete a branch
-    tag                      list tags
-    tag <name> [<commit>]    tag a commit (HEAD by default); tags do not move
-    tag -f <name> [<commit>] move a tag anyway
-    tag -d <name>            delete a tag
-    switch <name>            move HEAD to a branch and update the working tree
-    merge <branch>           merge another branch into the current one
-        -m <message>         message for the merge commit
-    checkout <commit>        move HEAD to a specific commit (detached)
-        --force              discard uncommitted changes
-
-SUBMODULES
-    submodule                list mounted submodules and their state
-    submodule add <url> <path> [--branch <b>]
-                             mount another repository at <path>
-    submodule update [<path>] move the pin to the remote's current tip
-    submodule fetch [<path>]  retrieve content for a pin this store lacks
-    submodule rm <path>      unmount; the next commit will not carry it
-    submodule set-remote <path> <url>
-                             fetch this submodule from somewhere else
-
-REMOTES
-    remote [<url>]           show or set the remote (ws://host:7420/repo)
-    clone <url> [<dir>]      copy a remote repository
-        --no-checkout        fetch objects and refs, write no files
-    push [<branch>] [--force] [--no-tags]
-                             send commits and tags to the remote
-    pull [<branch>]          fetch commits from the remote and update
-
-INSPECTION
-    show <hash>              print an object's structure
-    tree [<commit>]          list the files in a commit
-    cat <path> [<commit>]    print a file's contents
-    merkle <hash>            visualise an object's Merkle tree
-    prove <path> [<commit>]  emit a proof that a path is in a commit
-        -o <file>            write to a file instead of stdout
-    verify <file> --root <h> check a proof against a commit hash you trust
-    pack                     fold loose objects into packed segments
-    gc                       delete objects no branch can reach
-        --dry-run            report what would go, change nothing
-        --prune-all          ignore the age guard (nothing else may be writing)
-    verify-tree <dir>        compare HEAD's tree against a directory, byte for byte
-    fsck                     verify every object and report unreachable ones
-    stats                    storage and deduplication statistics
-";
 
 // fkit spends most of its time allocating: the chunker cuts a stream into
 // millions of small buffers, hashes each, and drops nearly all of them again.
@@ -120,46 +55,57 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let Some(cmd) = args.first().map(|s| s.as_str()) else {
-        print!("{USAGE}");
+    use cli::{Cli, Command as C, SubmoduleCommand as S};
+    use clap::Parser;
+
+    let Some(command) = Cli::parse().command else {
+        // No command: the overview, and success. Asking what something does is
+        // not an error.
+        Cli::command().print_help()?;
         return Ok(());
     };
-    let rest = &args[1..];
 
-    match cmd {
-        "-h" | "--help" | "help" => {
-            print!("{USAGE}");
-            Ok(())
+    match command {
+        C::Init { path } => cmd_init(path.as_deref()),
+        C::Config { global, list, key, value } => cmd_config(global, list, key, value),
+        C::Status => cmd_status(),
+        C::Commit { message, author, date } => cmd_commit(message, author, date),
+        C::Log { count } => cmd_log(count),
+        C::Diff { stat, unified, a, b } => cmd_diff(stat, unified, a, b),
+        C::Branch { delete, name } => cmd_branch(delete, name),
+        C::Tag { delete, force, name, commit } => cmd_tag(delete, force, name, commit),
+        C::Switch { name, force } => cmd_switch(&name, force),
+        C::Merge { branch, message } => cmd_merge(&branch, message),
+        C::Checkout { commit, force } => cmd_checkout(&commit, force),
+        C::Show { hash } => cmd_show(&hash),
+        C::Tree { commit } => cmd_tree(commit.as_deref()),
+        C::Cat { path, commit } => cmd_cat(&path, commit.as_deref()),
+        C::Merkle { hash } => cmd_merkle(&hash),
+        C::Remote { url } => cmd_remote(url.as_deref()),
+        C::Clone { url, dir, no_checkout } => cmd_clone(&url, dir.as_deref(), no_checkout),
+        C::Push { branch, force, no_tags } => cmd_push(branch.as_deref(), force, no_tags),
+        C::Pull { branch } => cmd_pull(branch.as_deref()),
+        C::Prove { path, commit, output } => cmd_prove(&path, commit.as_deref(), output.as_deref()),
+        C::Verify { file, root } => cmd_verify(&file, &root),
+        C::Pack => cmd_pack(),
+        C::Gc(a) => cmd_gc(a.dry_run, a.prune_all),
+        C::VerifyTree { dir } => cmd_verify_tree(dir.as_deref()),
+        C::Fsck => cmd_fsck(),
+        C::Stats => cmd_stats(),
+
+        C::Submodule { command } => {
+            let repo = Repo::discover(&std::env::current_dir()?)?;
+            match command.unwrap_or(S::List) {
+                S::List => sub_list(&repo),
+                S::Add { url, path, branch } => sub_add(&repo, &url, &path, branch.as_deref()),
+                S::Update { path, branch } => {
+                    sub_update(&repo, path.as_deref(), branch.as_deref())
+                }
+                S::Fetch { path } => sub_fetch(&repo, path.as_deref()),
+                S::Rm { path } => sub_rm(&repo, &path),
+                S::SetRemote { path, url } => sub_set_remote(&repo, &path, &url),
+            }
         }
-        "init" => cmd_init(rest),
-        "config" => cmd_config(rest),
-        "status" => cmd_status(rest),
-        "commit" => cmd_commit(rest),
-        "log" => cmd_log(rest),
-        "diff" => cmd_diff(rest),
-        "branch" => cmd_branch(rest),
-        "tag" => cmd_tag(rest),
-        "switch" => cmd_switch(rest),
-        "merge" => cmd_merge(rest),
-        "checkout" => cmd_checkout(rest),
-        "show" => cmd_show(rest),
-        "tree" => cmd_tree(rest),
-        "cat" => cmd_cat(rest),
-        "merkle" => cmd_merkle(rest),
-        "remote" => cmd_remote(rest),
-        "clone" => cmd_clone(rest),
-        "push" => cmd_push(rest),
-        "pull" => cmd_pull(rest),
-        "prove" => cmd_prove(rest),
-        "verify" => cmd_verify(rest),
-        "pack" => cmd_pack(),
-        "gc" => cmd_gc(rest),
-        "verify-tree" => cmd_verify_tree(rest),
-        "fsck" => cmd_fsck(),
-        "stats" => cmd_stats(),
-        "submodule" => cmd_submodule(rest),
-        other => bail!("unknown command '{other}'\n\n{USAGE}"),
     }
 }
 
@@ -195,8 +141,8 @@ fn tree_of(repo: &Repo, commit: Hash) -> Result<Hash> {
 
 // ---- commands -----------------------------------------------------------
 
-fn cmd_init(args: &[String]) -> Result<()> {
-    let path = args.first().map(PathBuf::from).unwrap_or(std::env::current_dir()?);
+fn cmd_init(path: Option<&str>) -> Result<()> {
+    let path = path.map(PathBuf::from).unwrap_or(std::env::current_dir()?);
     std::fs::create_dir_all(&path)?;
     let repo = Repo::init(&path)?;
     println!("initialised empty fkit repository in {}", repo.root.join(".fkit").display());
@@ -207,12 +153,17 @@ fn cmd_init(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_config(args: &[String]) -> Result<()> {
+fn cmd_config(
+    global: bool,
+    list: bool,
+    key: Option<String>,
+    value: Option<String>,
+) -> Result<()> {
     use fkit_core::config;
 
-    let global = args.iter().any(|a| a == "--global" || a == "-g");
-    let list = args.iter().any(|a| a == "--list" || a == "-l");
-    let rest: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+    // The command reads as `<key> [value]`, so the pair is easier to match on
+    // than two options.
+    let rest: Vec<&String> = [key.as_ref(), value.as_ref()].into_iter().flatten().collect();
 
     if list {
         // Show where each value actually comes from — the whole point of having
@@ -290,13 +241,7 @@ fn redact(key: &str, value: &str) -> String {
     }
 }
 
-fn cmd_status(args: &[String]) -> Result<()> {
-    // `status` takes no options. Accepting one silently is worse than
-    // rejecting it: a script that asked for `--short` and got the long form
-    // anyway parses the wrong thing and looks like it worked.
-    if let Some(a) = args.first() {
-        bail!("status takes no arguments, got '{a}'");
-    }
+fn cmd_status() -> Result<()> {
     let repo = here()?;
     match repo.head()? {
         Head::Branch(b) => {
@@ -382,31 +327,18 @@ fn parse_date(raw: &str) -> Result<i64> {
         .with_context(|| format!("--date wants unix seconds, not '{raw}' (try: date -d ... +%s)"))
 }
 
-fn cmd_commit(args: &[String]) -> Result<()> {
-    let mut message: Option<String> = None;
-    let mut who = CommitAs::default();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-m" | "--message" => {
-                message = Some(args.get(i + 1).context("-m needs a message")?.clone());
-                i += 2;
-            }
-            // Both of these exist for importers replaying a history from
-            // somewhere else; see `Repo::commit_as`.
-            "--author" => {
-                who.author = Some(args.get(i + 1).context("--author needs a value")?.clone());
-                i += 2;
-            }
-            "--date" => {
-                let raw = args.get(i + 1).context("--date needs a value")?;
-                who.timestamp = Some(parse_date(raw)?);
-                i += 2;
-            }
-            other => bail!("unexpected argument '{other}'"),
-        }
-    }
+fn cmd_commit(
+    message: Option<String>,
+    author: Option<String>,
+    date: Option<String>,
+) -> Result<()> {
     let message = message.context("usage: fkit commit -m <message>")?;
+    // Both of these exist for importers replaying a history from somewhere
+    // else; see `Repo::commit_as`.
+    let who = CommitAs {
+        author,
+        timestamp: date.as_deref().map(parse_date).transpose()?,
+    };
 
     let repo = here()?;
     // An explicit --author is the answer to "who wrote this", so it satisfies
@@ -445,18 +377,8 @@ fn cmd_commit(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_log(args: &[String]) -> Result<()> {
-    let mut limit = 20usize;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-n" => {
-                limit = args.get(i + 1).context("-n needs a count")?.parse()?;
-                i += 2;
-            }
-            other => bail!("unexpected argument '{other}'"),
-        }
-    }
+fn cmd_log(count: Option<usize>) -> Result<()> {
+    let limit = count.unwrap_or(20);
 
     let repo = here()?;
     let Some(head) = repo.head_commit()? else {
@@ -482,30 +404,20 @@ fn cmd_log(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_diff(args: &[String]) -> Result<()> {
+fn cmd_diff(
+    stat: bool,
+    unified: Option<usize>,
+    a: Option<String>,
+    b: Option<String>,
+) -> Result<()> {
     let repo = here()?;
 
-    let mut stat = false;
-    let mut revs: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--stat" => { stat = true; i += 1 }
-            "-U" | "--unified" => {
-                // Accepted and validated, but the hunk grouping uses the
-                // library default; surfacing a knob we ignore would be worse
-                // than saying so.
-                let _: usize = args
-                    .get(i + 1)
-                    .context("-U needs a number")?
-                    .parse()
-                    .context("-U takes a line count")?;
-                bail!("-U is not implemented yet; context is fixed at {}", linediff::CONTEXT);
-            }
-            other if other.starts_with('-') => bail!("unknown option '{other}'"),
-            other => { revs.push(other.to_string()); i += 1 }
-        }
+    // Accepted so the spelling is not a parse error, and refused so nobody
+    // believes it did something. Saying so beats a knob that is ignored.
+    if unified.is_some() {
+        bail!("-U is not implemented yet; context is fixed at {}", linediff::CONTEXT);
     }
+    let revs: Vec<String> = [a, b].into_iter().flatten().collect();
 
     // Only take a working-tree snapshot when the command actually needs one.
     let snap = if revs.len() < 2 { Some(repo.snapshot()?) } else { None };
@@ -627,19 +539,14 @@ fn read_side(
 /// that matters is that a tag does not move: it is a claim about what a name
 /// meant at a moment, and repointing it makes every earlier checkout of that
 /// name silently wrong.
-fn cmd_tag(args: &[String]) -> Result<()> {
+fn cmd_tag(
+    delete: bool,
+    force: bool,
+    name: Option<String>,
+    commit: Option<String>,
+) -> Result<()> {
     let repo = here()?;
-    let mut force = false;
-    let mut delete = false;
-    let mut positional: Vec<&String> = Vec::new();
-    for a in args {
-        match a.as_str() {
-            "--force" | "-f" => force = true,
-            "--delete" | "-d" => delete = true,
-            other if other.starts_with('-') => bail!("unknown option '{other}'"),
-            _ => positional.push(a),
-        }
-    }
+    let positional: Vec<&String> = [name.as_ref(), commit.as_ref()].into_iter().flatten().collect();
 
     if delete {
         let name = positional.first().context("usage: fkit tag -d <name>")?;
@@ -688,9 +595,17 @@ fn cmd_tag(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_branch(args: &[String]) -> Result<()> {
+fn cmd_branch(delete: bool, name: Option<String>) -> Result<()> {
     let repo = here()?;
-    match args {
+    // Rebuilt into the shape the arms below already match on, so the bodies
+    // that do the actual work are untouched.
+    let args: Vec<String> = match (delete, &name) {
+        (true, Some(n)) => vec!["-d".into(), n.clone()],
+        (true, None) => bail!("usage: fkit branch -d <name>"),
+        (false, Some(n)) => vec![n.clone()],
+        (false, None) => vec![],
+    };
+    match args.as_slice() {
         [] => {
             let current = match repo.head()? {
                 Head::Branch(b) => Some(b),
@@ -734,18 +649,9 @@ fn cmd_branch(args: &[String]) -> Result<()> {
     }
 }
 
-fn cmd_switch(args: &[String]) -> Result<()> {
+fn cmd_switch(name: &str, force: bool) -> Result<()> {
     let repo = here()?;
-    let mut force = false;
-    let mut name = None;
-    for a in args {
-        if a == "--force" || a == "-f" {
-            force = true;
-        } else {
-            name = Some(a.clone());
-        }
-    }
-    let name = name.context("usage: fkit switch <branch>")?;
+    let name = name.to_string();
     let target = repo
         .read_ref(&name)?
         .with_context(|| format!("no such branch: {name}"))?;
@@ -758,24 +664,11 @@ fn cmd_switch(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_merge(args: &[String]) -> Result<()> {
+fn cmd_merge(branch: &str, message: Option<String>) -> Result<()> {
     use fkit_core::merge::{merge_base, merge_trees, ConflictKind};
 
     let repo = here()?;
-    let mut message: Option<String> = None;
-    let mut branch: Option<String> = None;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-m" | "--message" => {
-                message = Some(args.get(i + 1).context("-m needs a message")?.clone());
-                i += 2;
-            }
-            other if other.starts_with('-') => bail!("unknown option '{other}'"),
-            other => { branch = Some(other.to_string()); i += 1 }
-        }
-    }
-    let spec = branch.context("usage: fkit merge <branch> [-m <message>]")?;
+    let spec = branch.to_string();
 
     if repo.merge_head()?.is_some() {
         bail!("a merge is already in progress — resolve the conflicts and commit, \
@@ -870,19 +763,9 @@ fn cmd_merge(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_checkout(args: &[String]) -> Result<()> {
+fn cmd_checkout(commit: &str, force: bool) -> Result<()> {
     let repo = here()?;
-    let mut force = false;
-    let mut spec = None;
-    for a in args {
-        if a == "--force" || a == "-f" {
-            force = true;
-        } else {
-            spec = Some(a.clone());
-        }
-    }
-    let spec = spec.context("usage: fkit checkout <commit> [--force]")?;
-    let target = resolve(&repo, &spec)?;
+    let target = resolve(&repo, commit)?;
 
     let from = repo.head_tree()?;
     let plan = checkout_tree(&repo, from, tree_of(&repo, target)?, force)?;
@@ -900,9 +783,8 @@ fn report_plan(plan: &fkit_core::checkout::CheckoutPlan) {
     }
 }
 
-fn cmd_show(args: &[String]) -> Result<()> {
+fn cmd_show(spec: &str) -> Result<()> {
     let repo = here()?;
-    let spec = args.first().context("usage: fkit show <hash>")?;
     let id = resolve(&repo, spec)?;
     let obj = repo.store.get_verified(id)?;
 
@@ -976,9 +858,9 @@ fn cmd_show(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_tree(args: &[String]) -> Result<()> {
+fn cmd_tree(spec: Option<&str>) -> Result<()> {
     let repo = here()?;
-    let commit = match args.first() {
+    let commit = match spec {
         Some(s) => resolve(&repo, s)?,
         None => repo.head_commit()?.context("no commits yet")?,
     };
@@ -992,16 +874,15 @@ fn cmd_tree(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_cat(args: &[String]) -> Result<()> {
+fn cmd_cat(path: &str, spec: Option<&str>) -> Result<()> {
     let repo = here()?;
-    let path = args.first().context("usage: fkit cat <path> [<commit>]")?;
-    let commit = match args.get(1) {
+    let commit = match spec {
         Some(s) => resolve(&repo, s)?,
         None => repo.head_commit()?.context("no commits yet")?,
     };
     let files = repo.walk_tree(tree_of(&repo, commit)?)?;
     let entry = files
-        .get(path.as_str())
+        .get(path)
         .with_context(|| format!("no such path in that commit: {path}"))?;
 
     let stdout = std::io::stdout();
@@ -1014,9 +895,8 @@ fn cmd_cat(args: &[String]) -> Result<()> {
 /// Visualise the Merkle tree under an object. This is the command that makes the
 /// data structure legible: you can watch a file decompose into chunks, and see
 /// which chunks are shared with other files.
-fn cmd_merkle(args: &[String]) -> Result<()> {
+fn cmd_merkle(spec: &str) -> Result<()> {
     let repo = here()?;
-    let spec = args.first().context("usage: fkit merkle <hash>")?;
     let id = resolve(&repo, spec)?;
     let mut seen = std::collections::HashSet::new();
     walk_merkle(&repo, id, "", true, &mut seen, 0)?;
@@ -1135,9 +1015,9 @@ fn remote_url(repo: &Repo) -> Result<String> {
         .context("no remote configured — run: fkit remote ws://host:7420/your-repo")
 }
 
-fn cmd_remote(args: &[String]) -> Result<()> {
+fn cmd_remote(url: Option<&str>) -> Result<()> {
     let repo = here()?;
-    match args.first() {
+    match url {
         None => match repo.config_get("remote") {
             Some(u) => println!("{u}"),
             None => println!("no remote configured"),
@@ -1153,21 +1033,12 @@ fn cmd_remote(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_push(args: &[String]) -> Result<()> {
+fn cmd_push(branch: Option<&str>, force: bool, no_tags: bool) -> Result<()> {
     let repo = here()?;
-    let mut force = false;
-    let mut with_tags = true;
-    let mut branch = None;
-    for a in args {
-        match a.as_str() {
-            "--force" | "-f" => force = true,
-            // Tags ride along by default: a release tag left behind on the
-            // machine that made it is a tag nobody else can act on.
-            "--no-tags" => with_tags = false,
-            other => branch = Some(other.to_string()),
-        }
-    }
-    let branch = match branch {
+    // Tags ride along by default: a release tag left behind on the machine
+    // that made it is a tag nobody else can act on.
+    let with_tags = !no_tags;
+    let branch = match branch.map(str::to_string) {
         Some(b) => b,
         None => match repo.head()? {
             Head::Branch(b) => b,
@@ -1253,10 +1124,10 @@ fn push_tags(repo: &Repo, ws: &mut WebSocket) -> Result<()> {
     Ok(())
 }
 
-fn cmd_pull(args: &[String]) -> Result<()> {
+fn cmd_pull(branch: Option<&str>) -> Result<()> {
     let repo = here()?;
-    let branch = match args.first() {
-        Some(b) => b.clone(),
+    let branch = match branch {
+        Some(b) => b.to_string(),
         None => match repo.head()? {
             Head::Branch(b) => b,
             Head::Detached(_) => bail!("HEAD is detached — name a branch to pull"),
@@ -1347,21 +1218,6 @@ fn pull_branch(
 // `checkout_tree`, which keeps `.fkit/submodules/` in step with whatever tree
 // it just wrote. Neither needed to be taught what a submodule is.
 
-fn cmd_submodule(args: &[String]) -> Result<()> {
-    let repo = Repo::discover(&std::env::current_dir()?)?;
-    match args.first().map(|s| s.as_str()) {
-        None | Some("list") => sub_list(&repo),
-        Some("add") => sub_add(&repo, &args[1..]),
-        Some("update") => sub_update(&repo, &args[1..]),
-        Some("fetch") => sub_fetch(&repo, &args[1..]),
-        Some("rm") | Some("remove") => sub_rm(&repo, &args[1..]),
-        Some("set-remote") => sub_set_remote(&repo, &args[1..]),
-        Some(other) => bail!(
-            "unknown submodule command '{other}'\n\
-             try: list, add, update, fetch, rm"
-        ),
-    }
-}
 
 /// The pin recorded by HEAD, if there is a HEAD.
 fn head_pins(repo: &Repo) -> Result<std::collections::BTreeMap<String, Hash>> {
@@ -1415,21 +1271,7 @@ fn sub_list(repo: &Repo) -> Result<()> {
     Ok(())
 }
 
-fn sub_add(repo: &Repo, args: &[String]) -> Result<()> {
-    let branch_flag = flag_value(args, "--branch");
-    let pos: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
-    let (url, path) = match (pos.first(), pos.get(1)) {
-        (Some(u), Some(p)) => (u.as_str(), p.as_str()),
-        _ => bail!("usage: fkit submodule add <wss://host/owner/repo> <path> [--branch <b>]"),
-    };
-    // `--branch main` leaves "main" in the positional list unless it is taken
-    // out, which would otherwise be read as the path.
-    let path = if Some(path.to_string()) == branch_flag {
-        pos.get(2).map(|p| p.as_str()).context("usage: fkit submodule add <url> <path>")?
-    } else {
-        path
-    };
-
+fn sub_add(repo: &Repo, url: &str, path: &str, branch_flag: Option<&str>) -> Result<()> {
     fkit_core::submodule::valid_path(path)?;
     if fkit_core::submodule::read(repo, path)?.is_some() {
         bail!("{path} is already a submodule");
@@ -1440,7 +1282,7 @@ fn sub_add(repo: &Repo, args: &[String]) -> Result<()> {
     }
 
     let (mut ws, refs) = connect(url, None)?;
-    let branch = pick_branch(&refs, branch_flag.as_deref())?;
+    let branch = pick_branch(&refs, branch_flag)?;
     println!("mounting {url} ({branch}) at {path}");
 
     // Objects land in *this* repository's store. There is no second store and
@@ -1477,9 +1319,8 @@ fn sub_add(repo: &Repo, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn sub_update(repo: &Repo, args: &[String]) -> Result<()> {
-    let branch_flag = flag_value(args, "--branch");
-    let only = args.iter().find(|a| !a.starts_with('-')).cloned();
+fn sub_update(repo: &Repo, only: Option<&str>, branch_flag: Option<&str>) -> Result<()> {
+    let only = only.map(str::to_string);
     let mounts = fkit_core::submodule::list(repo)?;
     if mounts.is_empty() {
         bail!("no submodules to update");
@@ -1496,7 +1337,7 @@ fn sub_update(repo: &Repo, args: &[String]) -> Result<()> {
             continue;
         }
         let (mut ws, refs) = connect(&m.remote, None)?;
-        let branch = pick_branch(&refs, branch_flag.as_deref())?;
+        let branch = pick_branch(&refs, branch_flag)?;
         let tip = fetch_ref(repo, &mut ws, &branch)?;
         if tip == m.pin {
             println!("{}: already at {}", m.path, tip.short());
@@ -1520,8 +1361,8 @@ fn sub_update(repo: &Repo, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn sub_fetch(repo: &Repo, args: &[String]) -> Result<()> {
-    let only = args.iter().find(|a| !a.starts_with('-')).cloned();
+fn sub_fetch(repo: &Repo, only: Option<&str>) -> Result<()> {
+    let only = only.map(str::to_string);
     let mounts = fkit_core::submodule::list(repo)?;
     let mut missing = 0;
     for (path, m) in &mounts {
@@ -1551,8 +1392,7 @@ fn sub_fetch(repo: &Repo, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn sub_rm(repo: &Repo, args: &[String]) -> Result<()> {
-    let path = args.first().context("usage: fkit submodule rm <path>")?;
+fn sub_rm(repo: &Repo, path: &str) -> Result<()> {
     let m = fkit_core::submodule::read(repo, path)?
         .with_context(|| format!("{path} is not a submodule"))?;
 
@@ -1578,11 +1418,7 @@ fn sub_rm(repo: &Repo, args: &[String]) -> Result<()> {
 /// The project's suggestion in `.fkit-submodules` is left alone: this is the
 /// override, and overrides that edit the thing they override are how you end
 /// up needing a command like `git submodule sync`.
-fn sub_set_remote(repo: &Repo, args: &[String]) -> Result<()> {
-    let (path, url) = match (args.first(), args.get(1)) {
-        (Some(p), Some(u)) => (p, u),
-        _ => bail!("usage: fkit submodule set-remote <path> <url>"),
-    };
+fn sub_set_remote(repo: &Repo, path: &str, url: &str) -> Result<()> {
     let m = fkit_core::submodule::read(repo, path)?
         .with_context(|| format!("{path} is not a submodule"))?;
     fkit_core::submodule::write(repo, &fkit_core::submodule::Mount {
@@ -1627,27 +1463,14 @@ fn fetch_ref(_repo: &Repo, ws: &mut WebSocket, branch: &str) -> Result<Hash> {
     }
 }
 
-fn flag_value(args: &[String], name: &str) -> Option<String> {
-    let i = args.iter().position(|a| a == name)?;
-    args.get(i + 1).cloned()
-}
 
-fn cmd_clone(args: &[String]) -> Result<()> {
+fn cmd_clone(url: &str, dir: Option<&str>, no_checkout: bool) -> Result<()> {
     // Flags may appear anywhere, so pick the positionals out rather than
-    // assuming the URL is argv[1].
-    let no_checkout = args.iter().any(|a| a == "--no-checkout" || a == "--bare");
-    let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
-
-    let url = positional
-        .first()
-        .copied()
-        .context("usage: fkit clone [--no-checkout] <wss://host/owner/repo> [dir]")?;
     if !(url.starts_with("ws://") || url.starts_with("wss://")) {
         bail!("clone needs a ws:// or wss:// URL, got '{url}'");
     }
-    let dir = positional
-        .get(1)
-        .map(|d| PathBuf::from(d.as_str()))
+    let dir = dir
+        .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(repo_name_from_url(url)));
 
     if dir.exists() && std::fs::read_dir(&dir)?.next().is_some() {
@@ -1710,21 +1533,11 @@ fn cmd_clone(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_prove(args: &[String]) -> Result<()> {
+fn cmd_prove(path: &str, spec: Option<&str>, out_file: Option<&str>) -> Result<()> {
     let repo = here()?;
-    let mut out_file: Option<String> = None;
-    let mut positional: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-o" | "--output" => {
-                out_file = Some(args.get(i + 1).context("-o needs a file")?.clone());
-                i += 2;
-            }
-            other if other.starts_with('-') => bail!("unknown option '{other}'"),
-            other => { positional.push(other.to_string()); i += 1 }
-        }
-    }
+    let positional: Vec<String> =
+        [Some(path.to_string()), spec.map(str::to_string)].into_iter().flatten().collect();
+    let out_file = out_file.map(str::to_string);
     let path = positional.first().context("usage: fkit prove <path> [<commit>]")?;
     let commit = match positional.get(1) {
         Some(spec) => resolve(&repo, spec)?,
@@ -1754,21 +1567,9 @@ fn cmd_prove(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_verify(args: &[String]) -> Result<()> {
-    let mut root: Option<String> = None;
-    let mut file: Option<String> = None;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--root" | "-r" => {
-                root = Some(args.get(i + 1).context("--root needs a commit hash")?.clone());
-                i += 2;
-            }
-            other if other.starts_with('-') => bail!("unknown option '{other}'"),
-            other => { file = Some(other.to_string()); i += 1 }
-        }
-    }
-    let file = file.context("usage: fkit verify <proof-file> --root <commit-hash>")?;
+fn cmd_verify(file: &str, root_arg: &str) -> Result<()> {
+    let root: Option<String> = Some(root_arg.to_string());
+    let file = file.to_string();
     let root = root.context("--root is required: a proof is only meaningful against a hash you already trust")?;
     let root = Hash::from_hex(&root).context("--root must be a full 64-character commit hash")?;
 
@@ -1829,18 +1630,20 @@ fn cmd_pack() -> Result<()> {
     Ok(())
 }
 
-fn cmd_gc(args: &[String]) -> Result<()> {
+fn cmd_gc(dry_run: bool, prune_all: bool) -> Result<()> {
     use fkit_core::gc;
 
     let repo = here()?;
-    let mut opts = gc::Options::default();
-    for a in args {
-        match a.as_str() {
-            "--dry-run" | "-n" => opts.dry_run = true,
-            "--prune-all" => opts.min_age = std::time::Duration::ZERO,
-            other => bail!("unknown option '{other}'"),
-        }
-    }
+    let opts = gc::Options {
+        dry_run,
+        // The age guard is what protects a push's objects between the moment
+        // they are written and the moment a ref reaches them.
+        min_age: if prune_all {
+            std::time::Duration::ZERO
+        } else {
+            gc::Options::default().min_age
+        },
+    };
 
     // Roots: every branch, plus HEAD and any merge in progress. Missing
     // MERGE_HEAD here would collect the other side of a conflict the user is
@@ -1982,14 +1785,11 @@ impl<R: std::io::Read> std::io::Write for CompareSink<R> {
 /// This is the honest end-to-end check for a repository too large to check out:
 /// content is streamed back out of the object store and compared to the
 /// original in place, so verifying 150 GiB needs no free disk at all.
-fn cmd_verify_tree(args: &[String]) -> Result<()> {
+fn cmd_verify_tree(dir: Option<&str>) -> Result<()> {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let repo = here()?;
-    let against = args
-        .first()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| repo.root.clone());
+    let against = dir.map(PathBuf::from).unwrap_or_else(|| repo.root.clone());
     if !against.is_dir() {
         bail!("{} is not a directory", against.display());
     }
