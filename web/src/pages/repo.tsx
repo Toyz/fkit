@@ -2476,21 +2476,24 @@ export class PageRepo extends LoomElement {
   }
 
   /**
-   * The latest commit on whatever is being browsed, above the file list.
+   * The commit being browsed, above the file list.
    *
-   * Taken from the ref's own head rather than fetching the log: the refs call
-   * already carries the tip commit for every branch and tag, so this costs
-   * nothing extra. Browsing a bare commit hash has no ref to read, and the bar
-   * is simply omitted rather than showing a guess.
+   * Read from the tree response, which is the commit actually on screen. It
+   * used to come from the ref list, which knows only branches and tags — so
+   * the bar vanished entirely when browsing a bare commit hash, exactly when
+   * a reader most needs telling which commit they are looking at. The ref list
+   * is still the fallback for a server that does not send it yet.
    */
   private renderLatest() {
     const at = this.loc!;
     const ref = this.refName();
-    const head = (this.refs ?? []).find((r) => r.name === ref)?.head;
+    const head =
+      this.treeQuery.data?.head ?? (this.refs ?? []).find((r) => r.name === ref)?.head;
     if (!head) return null;
 
     const commit = `/${at.owner}/${at.name}/commit/${head.commit}`;
     const history = `/${at.owner}/${at.name}/commits/${ref}`;
+    const count = this.treeQuery.data?.commits ?? this.stats?.commits;
 
     return (
       <div class="latest">
@@ -2505,13 +2508,14 @@ export class PageRepo extends LoomElement {
         <span class="when">{relativeTime(head.timestamp)}</span>
         <a class="count" href={history} onClick={linkHandler(history)}>
           <loom-icon name="history" size={12}></loom-icon>
-          {this.stats ? (
-            <>
-              <b>{this.stats.commits.toLocaleString()}</b>{" "}
-              {this.stats.commits === 1 ? "commit" : "commits"}
-            </>
-          ) : (
+          {/* Counted from the commit on screen, not from the default branch:
+              walking back through history should make the number go down. */}
+          {count === undefined ? (
             "history"
+          ) : (
+            <>
+              <b>{count.toLocaleString()}</b> {count === 1 ? "commit" : "commits"}
+            </>
           )}
         </a>
       </div>

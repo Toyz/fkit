@@ -178,7 +178,80 @@ async fn open(
 struct TreeResponse {
     path: String,
     commit: String,
+    /// The commit this tree came from, summarised.
+    ///
+    /// The page used to read this off the ref list, which only knows about
+    /// branches and tags — so browsing a bare commit hash had nothing to show
+    /// and the bar above the files simply vanished. The commit is resolved
+    /// here anyway to reach the tree, so answering it costs one more lookup.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    head: Option<crate::models::HeadView>,
+    /// Commits reachable from `commit` — the history of what is on screen,
+    /// not of the default branch. Browsing an older commit used to report the
+    /// repository's total, so the count did not change as you walked back
+    /// through it.
+    commits: usize,
     entries: Vec<content::EntryView>,
+}
+
+/// Count the commits reachable from `tip`, memoised on the commit hash.
+///
+/// The walk itself is the one the stats endpoint does: commit objects only, so
+/// it covers the history rather than every chunk in the repository. It is
+/// linear in the history, though, and this runs for every directory anyone
+/// opens — so without the memo, walking into a subdirectory of a large
+/// repository would re-count the whole thing.
+///
+/// The cache needs no invalidation and never goes stale. A commit hash names
+/// one exact set of ancestors for all time, so the answer for a given hash is
+/// a fact rather than a snapshot. That is the whole bargain of addressing
+/// things by their content.
+fn count_history(store: &fkit_core::Store, tip: fkit_core::Hash) -> usize {
+    /// Bounded so a server browsing endlessly many commits cannot grow it
+    /// without limit; a count is 8 bytes, so this is a few kilobytes.
+    const MAX: usize = 4096;
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<fkit_core::Hash, usize>>> =
+        std::sync::OnceLock::new();
+    let cache = SEEN.get_or_init(Default::default);
+
+    if let Ok(map) = cache.lock()
+        && let Some(n) = map.get(&tip)
+    {
+        return *n;
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![tip];
+    let mut n = 0usize;
+    while let Some(h) = stack.pop() {
+        if !seen.insert(h) {
+            continue;
+        }
+        if let Ok(fkit_core::Object::Commit(c)) = store.get(h) {
+            n += 1;
+            stack.extend(c.parents);
+        }
+    }
+
+    if let Ok(mut map) = cache.lock() {
+        if map.len() >= MAX {
+            map.clear();
+        }
+        map.insert(tip, n);
+    }
+    n
+}
+
+/// Summarise the commit a tree came from, with its account link attached.
+async fn tree_head(
+    state: &AppState,
+    store: &fkit_core::Store,
+    commit: fkit_core::Hash,
+) -> Option<crate::models::HeadView> {
+    let mut head = crate::routes::repos::head_view(store, commit)?;
+    let found = content::authors_of(&state.db, std::iter::once(head.commit.as_str())).await;
+    head.pushed_by = found.get(&head.commit).cloned();
+    Some(head)
 }
 
 async fn tree_root(
@@ -190,10 +263,13 @@ async fn tree_root(
     let (store, commit, tree) = open(&state, &viewer, &owner, &name, &r).await?;
     let mut entries = content::list_dir(&store, tree, "")?;
     link_submodules(&state, &viewer, host_of(&headers), &owner, &name, &mut entries).await;
+    let head = tree_head(&state, &store, commit).await;
     Ok(Json(TreeResponse {
         entries,
         path: String::new(),
         commit: commit.to_hex(),
+        commits: count_history(&store, commit),
+        head,
     }))
 }
 
@@ -258,10 +334,13 @@ async fn tree_path(
         open_in_path(&state, &viewer, &owner, &name, &r, &path).await?;
     let mut entries = content::list_dir(&store, tree, &path)?;
     link_submodules(&state, &viewer, host_of(&headers), &owner, &name, &mut entries).await;
+    let head = tree_head(&state, &store, commit).await;
     Ok(Json(TreeResponse {
         entries,
         path,
         commit: commit.to_hex(),
+        commits: count_history(&store, commit),
+        head,
     }))
 }
 

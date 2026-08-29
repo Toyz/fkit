@@ -170,6 +170,10 @@ export interface Entry {
 export interface TreeResponse {
   path: string;
   commit: string;
+  /** The commit this tree came from. Absent only if the server is older. */
+  head?: Head;
+  /** Commits reachable from `commit`, not from the default branch. */
+  commits?: number;
   entries: Entry[];
 }
 
