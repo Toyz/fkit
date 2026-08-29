@@ -483,11 +483,28 @@ set only, so `--force` cannot eat a file fkit has never seen.
   bases. fkit picks one and reports the ambiguity rather than merging them into a
   virtual base the way git does.
 - **TLS.** Both servers speak plain `ws://`. Terminate TLS in front.
-- **Packfiles.** Every object is its own file: simple to reason about, hard on
-  filesystems at very large object counts.
-- **Cross-repo dedup.** Each repository has its own store, so the same vendored
-  dependency in two repos is stored twice. Sharing one pool needs refcounting
-  and care about private data.
+- **Delta compression.** Objects are stored whole. Replaying this repository's
+  own history makes the gap concrete:
+
+  | 61 commits of fkit itself | on disk |
+  |---|---|
+  | fkit | 2.2 MiB |
+  | git, fully repacked | **594 KiB** |
+
+  Deduplication is working — 66.7 MiB of logical content across those commits
+  collapses to 5.3 MiB unique and 2.2 MiB stored, 30× — but 62% of the source
+  files here are smaller than the 8 KiB average chunk, so a one-line edit
+  rewrites the whole file as a new chunk. Content-defined chunking pays off on
+  large files with localized edits, which is the opposite of source code. Two
+  obvious levers were measured and neither is one: zstd 1→9 gives 2.2 → 2.0
+  MiB, and a 2 KiB average chunk cuts unique bytes 23% while leaving the disk
+  total unchanged, because smaller frames compress worse and the extra index
+  entries eat the rest. Closing it needs deltas between versions of a chunk.
+
+- **Cross-repo dedup beyond a fork network.** Forks share one store, so a
+  repository and its forks deduplicate against each other. Two *unrelated*
+  repositories do not, and pooling them needs refcounting and care about
+  private data.
 
 ## Tests
 
@@ -495,7 +512,7 @@ set only, so `--force` cannot eat a file fkit has never seen.
 make test        # cargo test --workspace, then tsc --noEmit for the UI
 ```
 
-107 Rust tests, zero clippy warnings. The ones that document the actual ideas:
+196 Rust tests, zero clippy warnings. The ones that document the actual ideas:
 
 - `chunker::insertion_only_perturbs_local_chunks` — a 10-byte insert into 4 MB
   leaves >95% of chunks untouched
@@ -517,6 +534,17 @@ make test        # cargo test --workspace, then tsc --noEmit for the UI
 - `merge::a_rebuilt_tree_hashes_the_same_as_an_ingested_one`
 - `diff::reconstruction_holds_for_a_range_of_edits`
 - `workflow::checkout_into_an_empty_directory_writes_everything`
+- `submodules::a_submodule_is_committed_as_a_pin_and_not_as_a_copy` — the
+  parent's commit stores none of the submodule's own objects a second time
+- `submodules::checking_out_an_older_commit_moves_the_submodule_back` — the
+  thing git does not do
+- `submodules::gc_keeps_what_a_pin_points_at` — nothing taught gc about
+  submodules; this asserts that not teaching it was correct
+- `submodules::a_pin_the_store_cannot_resolve_is_refused` — a commit nobody
+  could check out is refused at the point it is made
+- `submodule::what_is_recorded_relatively_resolves_back_to_where_it_came_from`
+- `cache::tests::no_object_may_take_more_than_its_share`
+- `cache::tier_tests::a_far_tier_that_is_unreachable_only_costs_hits`
 
 ## License
 
