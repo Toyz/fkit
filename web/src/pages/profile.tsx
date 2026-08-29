@@ -173,10 +173,13 @@ export class PageProfile extends LoomElement {
     const pub = p?.repos.filter((r) => r.visibility === "public").length ?? 0;
     const priv = (p?.repos.length ?? 0) - pub;
     const topics = p ? rankTopics(p.repos) : [];
-    const latest = p?.repos.reduce<Repo | null>(
-      (best, r) => (!best || r.updated_at > best.updated_at ? r : best),
-      null,
-    );
+    // Only a repository that has a commit can have been pushed to. Ranking
+    // every repository by updated_at made "last push" report the creation of
+    // an empty one, and dropped the tip hash because that repository had no
+    // tip to show.
+    const latest = p?.repos
+      .filter((r) => r.head)
+      .reduce<Repo | null>((best, r) => (!best || r.updated_at > best.updated_at ? r : best), null);
 
     return (
       <div class="wrap">

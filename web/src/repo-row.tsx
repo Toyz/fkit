@@ -8,6 +8,7 @@
  * answers "what is this, and what happened to it last".
  */
 import { css } from "@toyz/loom";
+import "./components/fkit-avatar";
 import { relativeTime, type Repo } from "./api";
 import { linkHandler } from "./nav";
 
@@ -19,7 +20,7 @@ export const repoRowSheet = css`
      row, which is what made it look busy. */
   .rr {
     display: grid;
-    grid-template-columns: 16px minmax(0, 1fr) auto;
+    grid-template-columns: 20px minmax(0, 1fr) auto;
     column-gap: 10px;
     row-gap: 2px;
     padding: 9px 12px;
@@ -30,6 +31,7 @@ export const repoRowSheet = css`
   .rr:hover { background: var(--raised); text-decoration: none; }
 
   .rr .ic { grid-row: 1; color: var(--faint); display: flex; align-items: center; }
+  .rr .ic fkit-avatar { margin-left: -1px; }
   .rr .top {
     grid-row: 1; grid-column: 2;
     display: flex; align-items: baseline; gap: 8px; min-width: 0;
@@ -60,14 +62,17 @@ export const repoRowSheet = css`
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
   }
   .rr .meta { flex: none; margin-left: auto; padding-left: 12px; }
-  .rr .none { font-family: var(--sans); font-style: italic; }
 
   /* Private is a state worth reading, but it should not shout: no border, no
-     box — just a different colour, like the rest of the metadata. */
-  .rr .priv {
-    font-size: 10.5px; color: var(--faint);
-    text-transform: uppercase; letter-spacing: .06em; flex: none;
-  }
+     box, and not capitals either — set in caps beside a lowercase name it was
+     the loudest thing on the row. */
+  .rr .priv { font-size: 11px; color: var(--faint); flex: none; }
+
+  /* A repository with no commits has nothing to say on a second line, so it
+     does not get one — five of those in a row was half a screen of "no
+     commits yet" under five names. It is said once, in the column that would
+     otherwise hold a timestamp that means only "when this was created". */
+  .rr .none { font-style: italic; font-family: var(--sans); }
 
   @media (max-width: 700px) {
     .rr .ds, .rr .meta { display: none; }
@@ -77,6 +82,20 @@ export const repoRowSheet = css`
 export interface RepoRowOptions {
   /** Show `owner/name` rather than just `name`. False on a user's own page. */
   withOwner?: boolean;
+  /**
+   * Lead each row with the owner's tile instead of a repository glyph.
+   *
+   * Only worth it when the list actually spans owners. On a server with one
+   * account it is the same square repeated down the page, which is strictly
+   * worse than the glyph it replaced — that at least distinguishes a private
+   * repository from a public one.
+   */
+  ownerTiles?: boolean;
+}
+
+/** Whether a list is worth leading with owner tiles: do its owners differ? */
+export function spansOwners(repos: Repo[]): boolean {
+  return new Set(repos.map((r) => r.owner)).size > 1;
 }
 
 export function repoRow(r: Repo, opts: RepoRowOptions = {}) {
@@ -89,9 +108,15 @@ export function repoRow(r: Repo, opts: RepoRowOptions = {}) {
 
   return (
     <a class="rr" loom-key={`${r.owner}/${r.name}`} href={href} onClick={linkHandler(href)}>
-      <span class="ic" title={r.visibility}>
-        <loom-icon name={priv ? "lock" : "repo"} size={13}></loom-icon>
-      </span>
+      {opts.ownerTiles ? (
+        <span class="ic" title={r.owner}>
+          <fkit-avatar name={r.owner} size={19}></fkit-avatar>
+        </span>
+      ) : (
+        <span class="ic" title={r.visibility}>
+          <loom-icon name={priv ? "lock" : "repo"} size={13}></loom-icon>
+        </span>
+      )}
 
       <span class="top">
         <span class="nm">
@@ -102,21 +127,19 @@ export function repoRow(r: Repo, opts: RepoRowOptions = {}) {
         {r.description ? <span class="ds">{r.description}</span> : null}
       </span>
 
-      <span class="when">{relativeTime(r.updated_at)}</span>
-
-      <span class="last">
-        {r.head ? (
-          <>
-            <span class="sha">{r.head.short}</span>
-            <span class="msg">
-              {r.head.summary} — {authorName(r.head.author)}
-            </span>
-          </>
-        ) : (
-          <span class="none">no commits yet</span>
-        )}
-        {counts ? <span class="meta">{counts}</span> : null}
+      <span class="when">
+        {r.head ? relativeTime(r.updated_at) : <span class="none">no commits yet</span>}
       </span>
+
+      {r.head ? (
+        <span class="last">
+          <span class="sha">{r.head.short}</span>
+          <span class="msg">
+            {r.head.summary} — {authorName(r.head.author)}
+          </span>
+          {counts ? <span class="meta">{counts}</span> : null}
+        </span>
+      ) : null}
     </a>
   );
 }

@@ -6,16 +6,25 @@ import { route } from "@toyz/loom/router";
 import { base } from "../ui";
 import { type Repo } from "../api";
 import { linkHandler } from "../nav";
-import { repoRow, repoRowSheet } from "../repo-row";
+import { repoRow, repoRowSheet, spansOwners } from "../repo-row";
 import { Session } from "../session";
 
 const sheet = css`
-  .bar { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; }
-  .bar h1 { margin-right: 2px; }
-  /* The count belongs to the title, not to the filter it was sitting beside. */
-  .count { flex: 1; color: var(--faint); font-size: 11px; font-variant-numeric: tabular-nums; }
-  .bar input { width: 180px; font-size: 12px; height: 26px; padding: 0 9px; }
+  /* The index was the one page the rest of the app's vocabulary never reached:
+     its own bar, its own count, its own filter placement. It uses the same
+     heading every other page does now — accent under the word, the state of
+     the list at the right of the rule, actions at the outer edge. */
+  .head-acts { display: flex; align-items: center; gap: 9px; }
+  .head-acts input { width: 170px; font-size: 12px; height: 24px; padding: 0 9px; }
+  .head-acts .btn { font-size: 11.5px; }
 
+  .empty { padding: 40px 14px; text-align: center; }
+  .empty h2 { color: var(--muted); }
+  .empty .prose {
+    font-family: var(--sans); color: var(--faint); font-size: 12.5px;
+    margin: 7px auto 0; max-width: 46ch; line-height: 1.5;
+  }
+  .empty .btn { margin-top: 14px; }
 `;
 
 @route("/")
@@ -48,58 +57,67 @@ export class PageRepos extends LoomElement {
 
   update() {
     const list = this.visible();
+    const all = this.repos.data ?? [];
+    const priv = all.filter((r) => r.visibility === "private").length;
+    // Worth a column of faces only if the faces differ.
+    const tiles = spansOwners(all);
+    // Say what the list is, and — while filtering — how much of it you are
+    // being shown, since a filtered count alone reads as the whole total.
+    const value = this.repos.loading
+      ? ""
+      : this.filter
+        ? `${list.length} of ${all.length}`
+        : `${all.length - priv} public${priv ? ` · ${priv} private` : ""}`;
+
     return (
       <div class="wrap">
-        <div class="bar">
-          <h1>repositories</h1>
-          <span class="count">
-            {this.repos.loading
-              ? ""
-              : `${list.length}${this.filter ? ` / ${this.repos.data?.length ?? 0}` : ""}`}
-          </span>
-          <input
-            placeholder="filter"
-            value={this.filter}
-            onInput={(e: Event) => (this.filter = (e.target as HTMLInputElement).value)}
-          />
-        </div>
-
         {this.repos.error ? <div class="error">{this.repos.error.message}</div> : null}
 
-        {this.repos.loading ? (
-          <div class="panel">
-            {[0, 1, 2, 3, 4].map(() => (
-              <div class="rr sk-row">
-                <span class="ic"><span class="sk" style="width:13px;height:13px"></span></span>
-                <span class="top"><span class="sk tall" style="width:min(38%,220px)"></span></span>
-                <span class="right"><span class="sk" style="width:60px"></span></span>
-                <span class="last"><span class="sk" style="width:min(52%,320px)"></span></span>
+        <fkit-section heading="Repositories" value={value}>
+          <span slot="action" class="head-acts">
+            <input
+              placeholder="filter"
+              value={this.filter}
+              onInput={(e: Event) => (this.filter = (e.target as HTMLInputElement).value)}
+            />
+            {this.session.isAuthed ? (
+              <a class="btn" href="/new" onClick={linkHandler("/new")}>
+                <loom-icon name="plus" size={11}></loom-icon> new repository
+              </a>
+            ) : null}
+          </span>
+
+          <fkit-list>
+            {this.repos.loading ? (
+              [0, 1, 2, 3, 4].map(() => (
+                <div class="rr sk-row">
+                  <span class="ic"><span class="sk" style="width:19px;height:19px"></span></span>
+                  <span class="top"><span class="sk tall" style="width:min(38%,220px)"></span></span>
+                  <span class="when"><span class="sk" style="width:60px"></span></span>
+                  <span class="last"><span class="sk" style="width:min(52%,320px)"></span></span>
+                </div>
+              ))
+            ) : list.length === 0 ? (
+              <div class="empty">
+                <h2>{this.filter ? "no matches" : "nothing here yet"}</h2>
+                <p class="prose">
+                  {this.filter
+                    ? "No repository matches that filter."
+                    : this.session.isAuthed
+                      ? "Create a repository, then push to it from the fkit CLI."
+                      : "Sign in to see private repositories you have access to."}
+                </p>
+                {!this.filter && this.session.isAuthed ? (
+                  <a class="btn primary" href="/new" onClick={linkHandler("/new")}>
+                    <loom-icon name="plus" size={12}></loom-icon> new repository
+                  </a>
+                ) : null}
               </div>
-            ))}
-          </div>
-        ) : list.length === 0 ? (
-          <div class="panel">
-            <div class="empty">
-              <h2>{this.filter ? "no matches" : "nothing here yet"}</h2>
-              <p class="prose">
-                {this.filter
-                  ? "No repository matches that filter."
-                  : this.session.isAuthed
-                    ? "Create a repository, then push to it from the fkit CLI."
-                    : "Sign in to see private repositories you have access to."}
-              </p>
-              {!this.filter && this.session.isAuthed ? (
-                <a class="btn primary" href="/new" onClick={linkHandler("/new")}>
-                  <loom-icon name="plus" size={12}></loom-icon> new repository
-                </a>
-              ) : null}
-            </div>
-          </div>
-        ) : (
-          <div class="panel">
-            {list.map((r) => repoRow(r, { withOwner: true }))}
-          </div>
-        )}
+            ) : (
+              list.map((r) => repoRow(r, { withOwner: true, ownerTiles: tiles }))
+            )}
+          </fkit-list>
+        </fkit-section>
       </div>
     );
   }
