@@ -1539,20 +1539,27 @@ const sheet = css`
   .md h1, .md h2 { border-bottom: 1px solid var(--border); padding-bottom: .25em; margin: 1.4em 0 .6em; }
   .md h1:first-child { margin-top: 0; }
 
-  /* The heading anchor sits in the margin so it never reflows the text when it
-     appears, the way a leading "#" inside the line would. */
-  .md :is(h1, h2, h3, h4, h5, h6) { position: relative; }
+  /* The anchor follows the heading text rather than hanging in the margin.
+     Hanging it outside meant an offset in em, which lands somewhere different
+     for every heading level, and a dependency on the container's padding
+     being wide enough to hold it. Inline it cannot be misplaced: it is always
+     one space after the words. The space is reserved whether or not it is
+     visible, so revealing it on hover never reflows the line. */
   .md .anchor {
-    position: absolute; left: -0.85em; top: 0;
+    margin-left: .45em;
     color: var(--faint); text-decoration: none;
+    font-weight: 400;
     opacity: 0; transition: opacity .12s;
   }
   .md :is(h1, h2, h3, h4, h5, h6):hover .anchor,
   .md .anchor:focus-visible { opacity: 1; }
   .md .anchor:hover { color: var(--accent); }
-  /* A heading that was just jumped to is worth pointing at for a moment. */
-  .md :is(h1, h2, h3, h4, h5, h6):target { scroll-margin-top: 12px; }
-  .md :is(h1, h2, h3, h4, h5, h6):target .anchor { opacity: 1; color: var(--accent); }
+  /* The site header is sticky, so scrolling a heading to the top of the
+     viewport parks it underneath. This is the offset every other sticky thing
+     on the page uses.
+     Not on :target — a document fragment never matches an element inside a
+     shadow root, so that selector was doing nothing at all. */
+  .md :is(h1, h2, h3, h4, h5, h6) { scroll-margin-top: 52px; }
   @media (prefers-reduced-motion: reduce) { .md .anchor { transition: none; } }
   .md h3, .md h4 { margin: 1.3em 0 .4em; }
   .md p { margin: 0 0 .9em; }
@@ -2011,6 +2018,11 @@ export class PageRepo extends LoomElement {
 
     this.addEventListener("click", onClick);
     window.addEventListener("hashchange", jump);
+    // Arriving straight at a URL with a fragment: nothing has been clicked and
+    // no hash has changed, so without this the page simply stays at the top.
+    // `jumpToHash` waits for the heading to exist, so calling it before the
+    // document has loaded is the normal case rather than a race.
+    if (location.hash) jump();
     return () => {
       this.removeEventListener("click", onClick);
       window.removeEventListener("hashchange", jump);

@@ -155,12 +155,13 @@ export function renderMarkdown(src: string, ctx?: MarkdownContext): string {
       }
 
       // The anchor is a real link so it can be copied, middle-clicked and
-      // bookmarked; it is hidden until the heading is hovered.
+      // bookmarked; it is hidden until the heading is hovered. It follows the
+      // text rather than preceding it, so it cannot land on top of anything.
       out.push(
         id
-          ? `<h${level} id="${id}">` +
+          ? `<h${level} id="${id}">${body}` +
               `<a class="anchor" href="#${id}" aria-label="Link to this section">#</a>` +
-              `${body}</h${level}>`
+              `</h${level}>`
           : `<h${level}>${body}</h${level}>`,
       );
       i++;
