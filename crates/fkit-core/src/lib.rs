@@ -8,6 +8,7 @@
 //! 4. [`store`]   — how objects live on disk
 
 pub mod archive;
+pub mod cache;
 pub mod checkout;
 pub mod chunker;
 pub mod config;

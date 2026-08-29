@@ -10,6 +10,14 @@ repository.workspace = true
 name = "fkit-hub"
 path = "src/main.rs"
 
+[features]
+default = []
+# A shared object cache in Valkey or Redis, selected at runtime with
+# `[cache] redis_url`. Off by default: on one host with local storage the
+# memory tier already answers, and a round trip costs more than the disk read
+# it would replace.
+redis-cache = ["fkit-core/redis-cache"]
+
 [dependencies]
 mimalloc = "0.1"
 fkit-core.workspace = true

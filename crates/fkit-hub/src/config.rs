@@ -30,6 +30,25 @@ struct FileConfig {
     limits: LimitsSection,
     #[serde(default)]
     email: EmailSection,
+    #[serde(default)]
+    cache: CacheSection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CacheSection {
+    /// How much object data to hold in this process, in mebibytes.
+    memory_mb: Option<usize>,
+    /// How long an untouched entry may stay, in seconds.
+    ttl_secs: Option<u64>,
+    /// A Valkey or Redis URL to share a second tier through.
+    ///
+    /// Worth setting only when a cache miss is expensive: several hub
+    /// processes that would each start cold, or object storage slower than a
+    /// local disk. On one host with local storage it is slower than the disk
+    /// it would sit in front of, which is why memory is always the first tier
+    /// and this is only ever the second.
+    redis_url: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -136,6 +155,12 @@ pub struct Config {
     /// Mail settings taken from the environment, which are *not* seeds — see
     /// [`EnvEmail`].
     pub env_email: EnvEmail,
+    /// How much object data each process holds, in bytes.
+    pub cache_memory_bytes: usize,
+    /// How long an untouched cache entry may stay.
+    pub cache_ttl_secs: u64,
+    /// A Valkey/Redis URL for a shared second tier, if one is wanted.
+    pub cache_redis_url: Option<String>,
     /// Where the config came from, for the startup banner.
     pub source: Option<PathBuf>,
 }
@@ -149,6 +174,9 @@ impl Default for Config {
             web_dir: PathBuf::from("web/dist"),
             secure_cookies: false,
             trust_proxy: false,
+            cache_memory_bytes: fkit_core::cache::DEFAULT_CAPACITY,
+            cache_ttl_secs: fkit_core::cache::DEFAULT_TTL.as_secs(),
+            cache_redis_url: None,
             open_registration: true,
             require_auth: false,
             default_repo_visibility: "private".into(),
@@ -222,6 +250,9 @@ impl Config {
         if let Some(v) = f.server.web_dir { self.web_dir = v }
         if let Some(v) = f.server.secure_cookies { self.secure_cookies = v }
         if let Some(v) = f.server.trust_proxy { self.trust_proxy = v }
+        if let Some(v) = f.cache.memory_mb { self.cache_memory_bytes = v * 1024 * 1024 }
+        if let Some(v) = f.cache.ttl_secs { self.cache_ttl_secs = v }
+        if let Some(v) = f.cache.redis_url { self.cache_redis_url = Some(v) }
         if let Some(v) = f.server.open_registration { self.open_registration = v }
         if let Some(v) = f.server.require_auth { self.require_auth = v }
         if let Some(v) = f.server.default_repo_visibility {
@@ -257,6 +288,18 @@ impl Config {
         // to silently fail. All three read the same way now.
         if let Some(v) = flag_env("FKIT_SECURE_COOKIES") { self.secure_cookies = v }
         if let Some(v) = flag_env("FKIT_TRUST_PROXY") { self.trust_proxy = v }
+        // A cache URL is a piece of infrastructure wiring, so the environment
+        // is where a container-run server will most naturally set it.
+        if let Ok(v) = std::env::var("FKIT_CACHE_REDIS_URL")
+            && !v.trim().is_empty()
+        {
+            self.cache_redis_url = Some(v);
+        }
+        if let Ok(v) = std::env::var("FKIT_CACHE_MEMORY_MB")
+            && let Ok(mb) = v.trim().parse::<usize>()
+        {
+            self.cache_memory_bytes = mb * 1024 * 1024;
+        }
         if let Some(v) = flag_env("FKIT_OPEN_REGISTRATION") { self.open_registration = v }
         if let Some(v) = flag_env("FKIT_REQUIRE_AUTH") { self.require_auth = v }
         // RESEND_API_KEY is what Resend's own documentation and every hosting
@@ -388,6 +431,16 @@ secure_cookies = false
 # OFF on a directly-exposed server: the header is client-supplied, so believing
 # it there lets anyone mint a new identity per request and skip the limit.
 trust_proxy = false
+
+[cache]
+# Object bytes held in this process. The store is content-addressed, so a
+# cached object can never be stale — only unwanted.
+memory_mb = 64
+ttl_secs = 1800
+# A shared second tier. Leave unset on a single host with local storage: a
+# round trip to Redis costs more than reading the object off disk, so it only
+# pays when a miss is expensive — several hub processes, or slow storage.
+# redis_url = "redis://valkey:6379"
 
 # Set false to run a private instance where only an admin can create accounts.
 # The very first account is always allowed, so a fresh server is never locked

@@ -15,6 +15,10 @@ compression = ["dep:zstd"]
 # wss:// support in the WebSocket client. Off in a build that only ever speaks
 # to a hub on a trusted network, which keeps rustls out of the binary.
 tls = ["dep:rustls", "dep:webpki-roots", "dep:rustls-pki-types"]
+# A shared object cache in Valkey or Redis. Off by default: it is only worth
+# having when a miss is expensive — several hub processes, or objects on
+# storage slower than a local disk. See `cache::RedisCache`.
+redis-cache = ["dep:redis"]
 
 [dependencies]
 blake3.workspace = true
@@ -23,3 +27,4 @@ zstd = { version = "0.13", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"], optional = true }
 webpki-roots = { version = "1", optional = true }
 rustls-pki-types = { version = "1", features = ["std"], optional = true }
+redis = { version = "0.27", default-features = false, optional = true }

@@ -53,6 +53,14 @@ pub struct Store {
     /// expensive work (reading, chunking, hashing, compressing) happens outside
     /// the lock, and only the segment append is serialised.
     pack: std::sync::Mutex<Option<crate::pack::Pack>>,
+
+    /// Recently-read object bytes, so a graph walk does not go back to disk
+    /// for the same commit and tree on every step.
+    ///
+    /// Safe to hold indefinitely because an object's name is a digest of its
+    /// bytes: a cached entry cannot become wrong, only unwanted. Deletion is
+    /// the one event that invalidates it, and collection clears it.
+    cache: std::sync::Arc<dyn crate::cache::ObjectCache>,
 }
 
 /// Stats from a write, so callers can report what actually moved.
@@ -99,7 +107,11 @@ impl Store {
             None
         };
 
-        Ok(Store { root, pack: std::sync::Mutex::new(pack) })
+        Ok(Store {
+            root,
+            pack: std::sync::Mutex::new(pack),
+            cache: std::sync::Arc::new(crate::cache::MemoryCache::default()),
+        })
     }
 
     /// Begin writing new objects into packed segments.
@@ -211,6 +223,10 @@ impl Store {
         segments: &[u32],
         keep: &std::collections::HashSet<Hash>,
     ) -> Result<crate::pack::CompactStats> {
+        // Objects are about to stop existing. A cache still holding their
+        // bytes would answer `get` for something `has` denies — the one way a
+        // content-addressed cache can be wrong.
+        self.cache.clear();
         let mut slot = self.pack.lock().unwrap();
         let pack = slot
             .as_mut()
@@ -334,18 +350,65 @@ impl Store {
 
     /// Read the raw framed bytes (tag + body) of an object.
     pub fn get_raw(&self, h: Hash) -> Result<Vec<u8>> {
-        if let Some(pack) = self.pack.lock().unwrap().as_ref()
-            && let Some(bytes) = pack.get(h)?
-        {
-            return Ok(bytes);
+        Ok(self.get_shared(h)?.as_ref().clone())
+    }
+
+    /// The framed bytes, without copying them out of the cache.
+    ///
+    /// Every read goes through here. A hit avoids a `read` syscall for a loose
+    /// object, and for a packed one also avoids decompressing it again — which
+    /// is the larger saving, since almost everything is packed.
+    pub fn get_shared(&self, h: Hash) -> Result<std::sync::Arc<Vec<u8>>> {
+        if let Some(hit) = self.cache.get(h) {
+            return Ok(hit);
         }
-        let path = self.path_for(h);
-        fs::read(&path).with_context(|| format!("object {} not found in store", h.short()))
+
+        let bytes = {
+            let packed = {
+                let guard = self.pack.lock().unwrap();
+                match guard.as_ref() {
+                    Some(pack) => pack.get(h)?,
+                    None => None,
+                }
+            };
+            match packed {
+                Some(b) => b,
+                None => {
+                    let path = self.path_for(h);
+                    fs::read(&path)
+                        .with_context(|| format!("object {} not found in store", h.short()))?
+                }
+            }
+        };
+
+        let shared = std::sync::Arc::new(bytes);
+        self.cache.put(h, std::sync::Arc::clone(&shared));
+        Ok(shared)
     }
 
     pub fn get(&self, h: Hash) -> Result<Object> {
-        let framed = self.get_raw(h)?;
+        let framed = self.get_shared(h)?;
         Self::decode_framed(&framed)
+    }
+
+    /// What the object cache has been doing.
+    pub fn cache_stats(&self) -> crate::cache::CacheStats {
+        self.cache.stats()
+    }
+
+    /// Drop one object from the cache, because it has left the store.
+    pub fn forget_cached(&self, h: Hash) {
+        self.cache.forget(h);
+    }
+
+    /// Replace the cache — to size it for a particular server, to share one
+    /// across stores, or to turn it off entirely.
+    ///
+    /// Takes an `Arc` so several stores in one process can share a single
+    /// budget rather than each keeping its own, which is what a server holding
+    /// many repositories wants.
+    pub fn set_cache(&mut self, cache: std::sync::Arc<dyn crate::cache::ObjectCache>) {
+        self.cache = cache;
     }
 
     pub fn decode_framed(framed: &[u8]) -> Result<Object> {

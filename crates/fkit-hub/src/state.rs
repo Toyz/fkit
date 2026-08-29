@@ -28,6 +28,11 @@ pub struct AppState {
     pub limiter: Arc<dyn RateLimiter>,
     /// Whether `X-Forwarded-For` may be believed when identifying a client.
     pub trust_proxy: bool,
+    /// One object cache for the whole server, handed to every `Store` it
+    /// opens. Behind a trait for the same reason the rate limiter is: it can
+    /// move out of this process without any read path changing — see
+    /// [`fkit_core::cache`].
+    pub object_cache: Arc<dyn fkit_core::cache::ObjectCache>,
 }
 
 impl AppState {
@@ -58,12 +63,21 @@ impl AppState {
     /// so that passing a plain repo id is a visible mistake rather than a
     /// silent one.
     pub fn store_for_network(&self, network_id: Uuid) -> Result<Store> {
-        Store::open(
+        let mut store = Store::open(
             self.data_dir
                 .join("repos")
                 .join(network_id.to_string())
                 .join("objects"),
-        )
+        )?;
+        // One cache for the whole server rather than one per `Store`. A store
+        // is opened per request, so a per-store cache would be born empty and
+        // die at the end of the handler — which is every miss and no hits.
+        //
+        // Sharing it across repositories is safe for the same reason sharing a
+        // store between forks is: the key is a digest of the value, so two
+        // repositories cannot mean different things by one hash.
+        store.set_cache(std::sync::Arc::clone(&self.object_cache));
+        Ok(store)
     }
 
     /// The store for a repository that is its own network.

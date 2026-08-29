@@ -119,6 +119,9 @@ pub fn collect(store: &Store, roots: &[Hash], opts: Options) -> Result<Report> {
         let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         if !opts.dry_run {
             std::fs::remove_file(&path)?;
+            // The store no longer has it, so the cache must not either —
+            // otherwise `get` would answer for something `has` denies.
+            store.forget_cached(id);
         }
         report.loose_removed += 1;
         report.bytes_reclaimed += size;

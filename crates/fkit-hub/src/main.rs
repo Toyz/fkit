@@ -94,6 +94,8 @@ async fn main() -> Result<()> {
     .await
     .context("loading instance settings")?;
 
+    let object_cache = build_object_cache(&cfg);
+
     let state = AppState {
         db,
         data_dir: cfg.data_dir.clone(),
@@ -103,6 +105,7 @@ async fn main() -> Result<()> {
         max_archive_bytes: cfg.max_archive_bytes,
         limiter: std::sync::Arc::new(ratelimit::MemoryLimiter::default()),
         trust_proxy: cfg.trust_proxy,
+        object_cache,
     };
 
     let api = Router::new()
@@ -270,4 +273,52 @@ fn spa(dir: &PathBuf) -> ServeDir<tower_http::services::fs::ServeFile> {
 async fn shutdown() {
     let _ = tokio::signal::ctrl_c().await;
     tracing::info!("shutting down");
+}
+
+/// Build the object cache this server will use.
+///
+/// Memory is always the first tier and is never optional: reading a packed
+/// object from a local disk costs single-digit microseconds, so a cache that
+/// answered over a network *instead* would be slower than no cache at all.
+/// A shared tier is added behind it when one is configured, where it saves the
+/// miss rather than the read.
+///
+/// A shared tier that will not connect is reported and skipped rather than
+/// fatal. The server is completely functional without it — it is an
+/// optimisation, and refusing to start over one would trade the whole service
+/// for a faster one.
+fn build_object_cache(cfg: &config::Config) -> std::sync::Arc<dyn fkit_core::cache::ObjectCache> {
+    use fkit_core::cache::{MemoryCache, ObjectCache};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let ttl = Duration::from_secs(cfg.cache_ttl_secs);
+    let near: Arc<dyn ObjectCache> = Arc::new(MemoryCache::new(cfg.cache_memory_bytes, ttl));
+
+    let Some(url) = cfg.cache_redis_url.as_deref() else {
+        return near;
+    };
+
+    #[cfg(feature = "redis-cache")]
+    {
+        match fkit_core::cache::RedisCache::connect(url, "fkit:obj:", ttl) {
+            Ok(far) => {
+                tracing::info!("object cache: memory + shared at {url}");
+                Arc::new(fkit_core::cache::Tiered::new(near, Arc::new(far)))
+            }
+            Err(e) => {
+                tracing::warn!("shared object cache at {url} unavailable ({e}); memory only");
+                near
+            }
+        }
+    }
+
+    #[cfg(not(feature = "redis-cache"))]
+    {
+        tracing::warn!(
+            "a shared object cache is configured ({url}) but this binary was built \
+             without the `redis-cache` feature; using memory only"
+        );
+        near
+    }
 }
