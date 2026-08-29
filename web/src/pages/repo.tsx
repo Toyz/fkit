@@ -296,6 +296,54 @@ function sameName(claimed: string, account: string): boolean {
   return claimed.trim().toLowerCase() === account.trim().toLowerCase();
 }
 
+/**
+ * Compare two tag names the way a person reads them.
+ *
+ * Digit runs compare as numbers, so `v1.10.0` sorts above `v1.9.0` — which a
+ * plain string compare gets backwards, and tags are overwhelmingly versions.
+ * Everything else compares as text.
+ */
+function compareTagNames(a: string, b: string): number {
+  const parts = (s: string) => s.match(/\d+|\D+/g) ?? [];
+  const pa = parts(a);
+  const pb = parts(b);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const x = pa[i];
+    const y = pb[i];
+    if (x === undefined) return -1;
+    if (y === undefined) return 1;
+    const nx = /^\d/.test(x);
+    const ny = /^\d/.test(y);
+    if (nx && ny) {
+      const d = Number(x) - Number(y);
+      if (d !== 0) return d;
+    } else {
+      const d = x.localeCompare(y);
+      if (d !== 0) return d;
+    }
+  }
+  return 0;
+}
+
+/**
+ * Tags, newest first.
+ *
+ * By the commit's time, then by name descending. The tiebreak matters more
+ * than it looks: tags pushed together share a timestamp to the second, so a
+ * release series was being ordered entirely by the fallback — and the fallback
+ * was ascending, which put v1.0.0 above v1.2.0 on every repository whose tags
+ * arrived in one push.
+ */
+function sortTags(tags: Ref[]): Ref[] {
+  return tags
+    .slice()
+    .sort(
+      (a, b) =>
+        (b.head?.timestamp ?? 0) - (a.head?.timestamp ?? 0) ||
+        compareTagNames(b.name, a.name),
+    );
+}
+
 function widenRef(known: string[], ref: string, path: string): { ref: string; path: string } {
   if (!ref || !path || known.includes(ref)) return { ref, path };
 
@@ -1663,6 +1711,18 @@ const sheet = css`
   }
   .mkrule input { flex: 1; font-size: 12px; }
 
+  /* Continues the list rather than sitting under it: same height and inset as
+     a tag row, so the list reads as having more below rather than ending. */
+  .showmore {
+    display: flex; align-items: center; justify-content: center; gap: 10px;
+    width: 100%; font: inherit; font-family: var(--mono); font-size: 12px;
+    padding: 11px 14px; cursor: pointer;
+    border: 0; border-top: 1px solid var(--border);
+    background: none; color: var(--muted);
+  }
+  .showmore:hover { background: var(--raised); color: var(--text); }
+  .showmore .rest { color: var(--faint); font-size: 11px; }
+
   /* The limits a rule imposes, each one its own switch. */
   .rlim { display: flex; align-items: center; gap: 14px; flex: none; }
   .rlim .lim {
@@ -1722,6 +1782,10 @@ export class PageRepo extends LoomElement {
     init: { credentials: "same-origin" },
   })
   accessor rulesQuery!: ApiState<BranchRule[]>;
+
+  /** How many pages of tags the tags view has been asked to show. */
+  @reactive accessor tagPages = 1;
+
   /**
    * Decoration: counts and sizes for the sidebar. A failure here must not take
    * the page with it, which `@fetch` gives for free — the error lands in
@@ -2409,9 +2473,7 @@ export class PageRepo extends LoomElement {
     const at = this.loc!;
     const r = this.repo!;
 
-    const tags = this.tags().slice().sort(
-      (a, b) => (b.head?.timestamp ?? 0) - (a.head?.timestamp ?? 0),
-    );
+    const tags = sortTags(this.tags());
     const tagsHref = `/${at.owner}/${at.name}/tags`;
 
     return (
@@ -4293,11 +4355,7 @@ export class PageRepo extends LoomElement {
    */
   private renderTags() {
     const at = this.loc!;
-    const tags = this.tags().slice().sort((a, b) => {
-      const ta = a.head?.timestamp ?? 0;
-      const tb = b.head?.timestamp ?? 0;
-      return tb - ta || a.name.localeCompare(b.name);
-    });
+    const tags = sortTags(this.tags());
 
     if (tags.length === 0) {
       // The commands are only useful to someone who could run them. Showing
@@ -4321,13 +4379,23 @@ fkit push</pre>
       );
     }
 
+    // Revealed a page at a time rather than paged with numbers: a tag list is
+    // read from the newest end, and someone looking for an old release wants
+    // to keep the ones above it on screen while they scan.
+    const PER_PAGE = 30;
+    const shown = tags.slice(0, this.tagPages * PER_PAGE);
+
     return (
       <div class="panel">
         <div class="panel-head">
           <span>tags</span>
-          <span class="val">{tags.length}</span>
+          <span class="val">
+            {shown.length < tags.length
+              ? `${shown.length} of ${tags.length}`
+              : String(tags.length)}
+          </span>
         </div>
-        {tags.map((t) => {
+        {shown.map((t) => {
           const tree = `/${at.owner}/${at.name}/tree/${t.name}`;
           const commit = `/${at.owner}/${at.name}/commit/${t.target}`;
           return (
@@ -4357,6 +4425,13 @@ fkit push</pre>
             </a>
           );
         })}
+
+        {shown.length < tags.length ? (
+          <button class="showmore" onClick={() => (this.tagPages += 1)}>
+            Show {Math.min(PER_PAGE, tags.length - shown.length)} more
+            <span class="rest">{tags.length - shown.length} left</span>
+          </button>
+        ) : null}
       </div>
     );
   }
