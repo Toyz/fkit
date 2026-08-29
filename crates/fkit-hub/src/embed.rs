@@ -514,8 +514,12 @@ pub fn inject(html: &str, meta: &Meta, base: &str, site: &str) -> String {
     if let Some(img) = &meta.image {
         let i = esc(img);
         tags.push_str(&format!("<meta property=\"og:image\" content=\"{i}\">\n"));
-        tags.push_str("<meta property=\"og:image:width\" content=\"1200\">\n");
-        tags.push_str("<meta property=\"og:image:height\" content=\"630\">\n");
+        // Taken from the card itself: a declared size that disagrees with the
+        // bytes makes a client reserve the wrong space and the image jump.
+        tags.push_str(&format!(
+            "<meta property=\"og:image:width\" content=\"{W}\">\n\
+             <meta property=\"og:image:height\" content=\"{H}\">\n"
+        ));
         tags.push_str(&format!("<meta property=\"og:image:alt\" content=\"{t}\">\n"));
         tags.push_str("<meta name=\"twitter:card\" content=\"summary_large_image\">\n");
         tags.push_str(&format!("<meta name=\"twitter:image\" content=\"{i}\">\n"));
@@ -616,7 +620,15 @@ fn truncate(s: &str, max: usize) -> String {
 // ---- the card ------------------------------------------------------------
 
 const W: u32 = 1200;
-const H: u32 = 630;
+/// Shorter than the 1.91:1 that link previews conventionally use.
+///
+/// That ratio is sized for a photograph. This card holds a name, a sentence
+/// and a row of counts, and at 630 tall it came out as two 130-pixel bands of
+/// nothing wrapped around four short lines — which is most of what made an
+/// embed feel padded, since a chat client scales the whole thing down and the
+/// empty part scales with it. Still comfortably inside what every client
+/// accepts for a large image.
+const H: u32 = 480;
 const BG: &str = "#090d0d";
 const TEXT: &str = "#dde5e3";
 const MUTED: &str = "#7d908c";
@@ -821,24 +833,24 @@ pub fn card_svg(card: &Card) -> String {
     // centred in whatever room is left between the header and the rule. Fixed
     // offsets left a card with a one-line description sitting high with a band
     // of dead space beneath it, and a three-line one nearly touching the rule.
-    const TOP: f32 = 118.0;
-    let rule = H as f32 - 132.0;
+    const TOP: f32 = 112.0;
+    let rule = H as f32 - 118.0;
 
     let mut block = String::new();
     let mut y = 0.0f32;
     let mut first_size = 0.0f32;
 
     if !card.eyebrow.is_empty() {
-        let size = fit_size(&card.eyebrow, inner, &[32.0, 28.0, 24.0, 20.0]);
+        let size = fit_size(&card.eyebrow, inner, &[34.0, 30.0, 26.0, 22.0]);
         first_size = size;
         block.push_str(&format!(
             r#"<text x="{PAD}" y="{y}" font-family="{FAMILY}" font-size="{size}" fill="{MUTED}">{}</text>"#,
             xesc(&card.eyebrow)
         ));
-        y += 74.0;
+        y += 70.0;
     }
 
-    let size = fit_size(&card.title, inner, &[86.0, 72.0, 60.0, 48.0, 38.0, 30.0]);
+    let size = fit_size(&card.title, inner, &[92.0, 76.0, 62.0, 50.0, 40.0, 30.0]);
     if first_size == 0.0 {
         first_size = size;
     }
@@ -856,7 +868,7 @@ pub fn card_svg(card: &Card) -> String {
     let mut last_size = size;
 
     if !card.body.trim().is_empty() {
-        y += 62.0;
+        y += 58.0;
         let lines = wrap(card.body.trim(), 28.0, inner, 3);
         for (i, line) in lines.iter().enumerate() {
             if i > 0 {

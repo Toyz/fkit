@@ -110,9 +110,16 @@ struct OEmbed {
     kind: &'static str,
     provider_name: String,
     provider_url: String,
-    /// Discord draws this as the small line above the embed.
-    author_name: String,
-    author_url: String,
+    /// Discord draws this as a line above the title.
+    ///
+    /// Omitted where it would only repeat what the title already says. A
+    /// repository's title is `owner/name`, so an author line reading `owner`
+    /// stacks a third restatement of the same identity above a card that then
+    /// says it a fourth time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    author_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    author_url: Option<String>,
     title: String,
 }
 
@@ -142,11 +149,18 @@ async fn oembed(
     };
     let site = state.policy().site_name;
 
-    // The author line is what a reader most wants above a repository card, so
-    // it is the owner where there is one, and the site otherwise.
-    let (author_name, author_url) = match path.trim_matches('/').split('/').next() {
-        Some(owner) if !owner.is_empty() => (owner.to_string(), format!("{base}/{owner}")),
-        _ => (site.clone(), base.clone()),
+    // Only when it adds something. Every page under an owner already carries
+    // that owner in its title, and a profile page *is* the owner.
+    // Anywhere in the title, not just at the front: an issue's title ends with
+    // `owner/repo`, and repeating the owner above it as an "author" is worse
+    // than redundant there — the line reads as who wrote the thing, and it is
+    // the person who owns the repository.
+    let owner = path.trim_matches('/').split('/').next().unwrap_or_default();
+    let redundant = owner.is_empty() || meta.title.contains(owner);
+    let (author_name, author_url) = if redundant {
+        (None, None)
+    } else {
+        (Some(owner.to_string()), Some(format!("{base}/{owner}")))
     };
 
     Json(OEmbed {
