@@ -7,6 +7,7 @@ storage, written to be read.
 fkit init                 fkit commit -m "..."      fkit push
 fkit status               fkit log                  fkit pull
 fkit switch <branch>      fkit merkle <hash>        fkit clone ws://host/repo
+fkit submodule add <url> <path>                     fkit gc
 ```
 
 ## What makes it different from git
@@ -74,6 +75,11 @@ Commit ──tree──> Tree ──> Entries ──entry──> Tree ──> �
   │                         directory entries)
   └──parent──> Commit ──> …
 ```
+
+A directory entry names a file, a subdirectory, a symlink, or a **submodule** —
+in which case the hash it carries is a `Commit` of another repository. That is
+the whole of the submodule design, and the section below is about why putting
+it there rather than beside the repository is what makes it work.
 
 Note the symmetry: **`Tree`/`Entries` is to a directory exactly what
 `File`/`Chunk` is to a file.** Both are interior nodes over content-defined runs
@@ -164,6 +170,28 @@ packed      127 object(s)
 Compression is a cargo feature. `--no-default-features` keeps `fkit-core` at
 exactly blake3 + anyhow.
 
+### Caching decompressed objects
+
+Rendering a page walks the same tree nodes over and over, decompressing each
+one every time. A cache in front of the store fixes that, and content
+addressing makes it unusually easy: **a hash names one byte sequence forever,
+so a cached object can never be stale.** There is no invalidation problem to
+get wrong — only eviction, which is a size and a TTL.
+
+```
+$ cargo run --release --example cachebench -- .fkit/objects <commit>
+objects walked: 1889
+uncached  221.35ms for 20 walks
+cached     10.56ms for 20 walks
+speedup   21.0x
+```
+
+`ObjectCache` is a trait. `MemoryCache` is LRU by bytes with a TTL,
+`RedisCache` is behind the `redis-cache` feature, and `Tiered` composes them —
+memory is always the near tier, because a round trip to Redis costs more than
+reading the object off local disk. `NoCache` is the default in the library, so
+nothing pays for a cache it did not ask for.
+
 ## Garbage collection
 
 ```sh
@@ -204,6 +232,58 @@ working directory and `MERGE_HEAD` records the other parent, so the eventual
 `fkit commit` still records two parents rather than pretending the branches never
 met.
 
+## Submodules
+
+Another repository, pinned at an exact revision:
+
+```sh
+fkit submodule add wss://host/alice/loom vendor/loom
+fkit submodule                 # what is mounted, and whether it is current
+fkit submodule update          # move the pin to the remote's tip
+```
+
+The pin is a tree entry, so it is **inside the parent commit's hash**. Git
+splits that one fact across three places — the revision in a gitlink, the URL
+in a tracked `.gitmodules`, the effective URL in `.git/config` — which is why
+`git submodule sync` and `git submodule init` have to exist at all. Here a
+commit names one complete state, submodules included.
+
+Because the pin is an ordinary link in the object graph, everything that walks
+links already handles it. None of these needed a line of code:
+
+| | |
+|---|---|
+| `push` | sends the submodule's content with the commit that references it, so committing a pin you never pushed is not possible |
+| `gc` | keeps it, having no way to consider it garbage |
+| `fsck` | checks it along with everything else |
+| `clone` | brings it down complete — there is no `--recursive` |
+
+Checkout is the case git gets worst: `git checkout` of an older commit leaves
+submodules where they were, silently, unless you remember a flag. Here
+`walk_tree` expands a pin into its content, so checkout, archive and diff treat
+a submodule as ordinary files without knowing it exists — and the objects are
+already local, so nothing has to be fetched to make one checkout move
+everything.
+
+What is left beside the repository is only what is genuinely not content:
+where to fetch from. A project may suggest one in a tracked `.fkit-submodules`,
+
+```
+vendor/loom = wss://host/alice/loom@<64 hex>
+```
+
+and the revision after the `@` makes a submodule bump an ordinary one-line
+diff — a review can see what it moved to, which `.gitmodules` plus a gitlink
+cannot show. The commit is still what pins; that line is rewritten whenever the
+pin moves, and `fkit submodule` reports it as stale if the two ever disagree.
+A relative url (`../loom`) resolves against the repository's own remote, so a
+fork on another host fetches from that host rather than sending everyone back
+to the original.
+
+Developing a dependency in place is deliberately not supported. A submodule
+here is content, not a nested working repository, so git's detached-HEAD
+work-eater has nowhere to happen; clone it on its own to work on it.
+
 ## Sync
 
 `fkit push` and `fkit pull` speak a small binary protocol over a WebSocket. The
@@ -231,6 +311,39 @@ Accounts, per-repo permissions, a web UI, and Postgres-backed refs. The web page
 and the sync socket share one port and one URL: `https://hub/you/proj` in a
 browser and `ws://hub/you/proj` from the CLI are the same repository, told apart
 by the `Upgrade` header.
+
+It carries the usual forge furniture — issues, merge requests, labels, review
+comments — with a few places where content addressing changes what is possible:
+
+**Forks share an object store.** A fork records the root of its fork network
+and uses that network's store, so forking is O(1) on disk however large the
+repository, and a merge request across two forks needs no transfer at all
+because both sides' commits already resolve in the same store. Sharing a store
+between repositories is safe by construction rather than by convention: an
+object's name *is* a digest of its bytes, so two repositories cannot disagree
+about what a hash means. Garbage collection is then a network-wide question —
+every ref of every repository sharing the store is a root — and runs under a
+Postgres advisory lock so two collections cannot overlap.
+
+**Review comments are anchored to content, not to a line number.** A diff is
+recomputed live from two branches, so a comment pinned to "line 42 of commit
+abc" slides onto an unrelated line the moment anyone pushes. Pinned to the hash
+of the file it was written against, it stays where it was put through a rebase,
+an amend, or ten unrelated commits — and when the file does change, the comment
+is not silently wrong: its blob is absent from the new diff, which is what
+"outdated" means and can be shown as such. Unresolved threads block the merge.
+
+**An issue can point at the exact lines it is about.** Select lines while
+reading a file and open an issue from them; the issue carries the blob hash and
+renders that code on its own page, still correct after the file has been
+renamed or rewritten. GitHub offers a permalink to paste into the body, which
+names a commit and two line numbers and quietly points at different code the
+moment anything above it is edited.
+
+Branches and tags can be deleted, with the guards that implies — not the
+default branch, and not one an open merge request still needs — and a merge can
+delete the branch it came from, since merging makes those commits ancestors of
+the target and removing the branch discards nothing.
 
 ```sh
 make up          # generates .env with random secrets, then builds and starts
@@ -285,6 +398,12 @@ It **refuses to start** on a non-loopback address without a token unless you pas
 * Ref updates are fast-forward-only unless forced. In the hub the check and the
   write share a transaction with the ref row locked; `fkitd` can only manage a
   per-process lock, which is the honest limit of file-backed refs.
+* Server administrators can read every repository. That is deliberate — it is
+  what "administrator" means for operations — so it is disclosed in the UI on
+  every such view rather than only in an audit table, and recorded in one.
+* `server.trust_proxy` must stay **off** on a directly-exposed server. The
+  header it believes is client-supplied, so trusting it there lets anyone mint
+  a new identity per request and skip rate limiting entirely.
 * There is no TLS. Put the hub behind a terminating proxy and set
   `secure_cookies`.
 
@@ -298,6 +417,7 @@ crates/
     chunker.rs     content-defined chunking, and why fixed-size fails
     store.rs       the CAS on disk (loose + packed)
     pack.rs        append-only segments, their index, and compression
+    cache.rs       the object cache: a trait, memory and Redis behind it
     gc.rs          reachability, the age guard, and segment compaction
     diff.rs        Myers line diff, and why it is line-aware
     merge.rs       merge base, three-way tree and line merge
@@ -305,6 +425,8 @@ crates/
     ingest.rs      filesystem -> Merkle DAG, in parallel
     repo.rs        refs, HEAD, commits, diffing
     checkout.rs    Merkle DAG -> filesystem
+    submodule.rs   pinning another repository, and where its remote lives
+    archive.rs     streaming tar and zip straight from the store
     proto.rs       the sync wire protocol
     session.rs     the server-side session loop, over a RepoHost
     ws.rs          RFC 6455, hand-rolled
@@ -325,9 +447,12 @@ The frontend is [Loom](https://github.com/Toyz/loom) — decorator-driven web
 components, JSX compiled to real DOM, no virtual DOM. ~44 KB gzipped total, no
 webfonts, and it paints on the first frame. Large files and long histories go
 through `<loom-virtual>`, and syntax highlighting is a line-aware tokenizer
-(`web/src/highlight.ts`) written specifically so it composes with virtualization
-— every off-the-shelf highlighter returns one HTML string for a whole document,
-which you cannot slice per line.
+(`web/src/highlight.ts`) written specifically so it composes with
+virtualization — most off-the-shelf highlighters return one HTML string for a
+whole document, which you cannot slice per line. Adding a language is one entry
+holding its grammar, its extensions and its exact filenames; a format that is
+line-oriented rather than nested gives regex patterns instead and skips the
+tokenizer.
 
 ## Design decisions worth knowing about
 

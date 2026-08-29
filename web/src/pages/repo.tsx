@@ -969,10 +969,47 @@ const sheet = css`
 
   /* A merge request's description sits under its header, not in a comment
      box: it is the request itself, not something said about it. */
+  /* Full width, like every other panel on the page. The text inside stays
+     hard-wrapped — its paragraphs and lists are expressed with line breaks, so
+     re-flowing it would destroy the only formatting it has — and the space
+     that leaves to the right is padding inside a box rather than a layout that
+     has failed. Sizing the box to the text instead left a narrow column
+     floating in a wide page, which looked worse. */
   .sdesc {
-    font-family: var(--sans); font-size: 13px; color: var(--text);
-    line-height: 1.6; margin: 0 0 16px; white-space: pre-wrap;
+    position: relative;
+    margin: 0 0 16px;
+    border: 1px solid var(--border);
+    border-left: 2px solid var(--border-hi);
+    border-radius: var(--radius);
+    background: var(--raised);
   }
+  .sdesc .mtext {
+    font-family: var(--sans); font-size: 13px; color: var(--text);
+    line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere;
+    padding: 13px 16px;
+  }
+  .sdesc.long .mtext { overflow: hidden; }
+  .sdesc.clip .mtext { max-height: 15.5em; }
+  @media (prefers-reduced-motion: no-preference) {
+    .sdesc.long .mtext { transition: max-height .26s cubic-bezier(.22,.61,.36,1); }
+    .sdesc.clip::after { transition: opacity .2s ease; }
+  }
+  /* Fades into the box rather than the page, so the cut looks deliberate. */
+  .sdesc.long::after {
+    content: ""; position: absolute; left: 0; right: 0; bottom: 30px;
+    height: 46px; pointer-events: none; opacity: 0;
+    background: linear-gradient(transparent, var(--raised));
+  }
+  .sdesc.clip::after { opacity: 1; }
+  .sdesc .mmore {
+    display: flex; align-items: center; justify-content: center; gap: 6px;
+    width: 100%; height: 30px;
+    border: 0; border-top: 1px solid var(--border);
+    background: transparent; color: var(--muted);
+    font: inherit; font-size: 11.5px; cursor: pointer;
+    border-radius: 0 0 var(--radius) var(--radius);
+  }
+  .sdesc .mmore:hover { background: var(--bg); color: var(--text); }
   .new-issue fkit-field:last-of-type { margin-bottom: 0; }
 
   /* ---- reviewing a change ----------------------------------------------
@@ -1884,6 +1921,14 @@ export class PageRepo extends LoomElement {
    */
   private dragging = false;
 
+  /**
+   * Which commit's message is expanded, by hash.
+   *
+   * Keyed by hash rather than a boolean so that moving to another commit does
+   * not arrive already expanded.
+   */
+  @reactive accessor msgOpenFor = "";
+
   /** Momentary "copied" on the selection bar's link button. */
   @reactive accessor linkCopied = false;
 
@@ -2422,6 +2467,9 @@ export class PageRepo extends LoomElement {
     return <div class="panel files">{rows}</div>;
   }
 
+  /** Above this many lines, a commit message collapses behind "show all". */
+  static readonly MESSAGE_LINES = 12;
+
   /** Above this many lines, the file is virtualized instead of fully rendered. */
   private static readonly VIRTUALIZE_OVER = 400;
 
@@ -2839,6 +2887,115 @@ export class PageRepo extends LoomElement {
   /// tree beside the diff, the sidebar of facts — because it is the same
   /// question asked of one commit rather than a range, and answering it in a
   /// different shape made the two feel like different programs.
+  /**
+   * Undo a commit message's hard wrapping, without destroying its structure.
+   *
+   * A message is written to a 72-column terminal, so every paragraph arrives
+   * pre-broken. Rendered as-is in a panel three times that wide it looks like
+   * a stray 80-character column rather than prose, and re-wrapping the window
+   * does nothing. Joining the lines of a paragraph lets it use the width it
+   * has been given.
+   *
+   * Only *prose* is joined. A line that is indented, bulleted, numbered,
+   * quoted or a heading is carrying meaning in its break, so it is left
+   * exactly as it was — which covers code blocks, lists and tables, and is the
+   * whole reason this is not a one-line `replace`.
+   */
+  private static reflow(body: string): string {
+    const structural = (l: string) =>
+      l.trim() === "" ||
+      /^\s/.test(l) ||                    // indented: code, or a continuation
+      /^[-*+>#|]/.test(l.trim()) ||       // list, quote, heading, table
+      /^\d+[.)]\s/.test(l.trim()) ||      // numbered list
+      /^[=-]{3,}$/.test(l.trim());        // a rule
+
+    const out: string[] = [];
+    let para: string[] = [];
+    const flush = () => {
+      if (para.length) out.push(para.join(" "));
+      para = [];
+    };
+    for (const line of body.split("\n")) {
+      if (structural(line)) {
+        flush();
+        out.push(line);
+      } else {
+        para.push(line.trim());
+      }
+    }
+    flush();
+    return out.join("\n");
+  }
+
+  /**
+   * A commit's message body.
+   *
+   * Kept hard-wrapped. A commit message is written to a column on purpose —
+   * its paragraphs, lists and indented blocks are all expressed with line
+   * breaks — so re-flowing it to the page width would destroy the only
+   * formatting it has. The box is sized to that column instead, which is what
+   * stops a 70-character message reading as a broken half-empty layout.
+   *
+   * Long ones collapse: a fifty-line message is a wall between the reader and
+   * the diff they came for.
+   */
+  private renderCommitBody(body: string, hash: string) {
+    const text = PageRepo.reflow(body);
+    const lines = text.split("\n").length;
+    const long = lines > PageRepo.MESSAGE_LINES;
+    const open = this.msgOpenFor === hash;
+
+    return (
+      <div class={`sdesc ${long ? "long" : ""} ${long && !open ? "clip" : ""}`}>
+        <div class="mtext">{text}</div>
+        {long ? (
+          <button class="mmore" onClick={(e: Event) => this.toggleMessage(e, hash)}>
+            <loom-icon name={open ? "up" : "chevron"} size={11}></loom-icon>
+            {open ? "show less" : "show the rest"}
+          </button>
+        ) : null}
+      </div>
+    );
+  }
+
+  /**
+   * Expand or collapse a message, at its real height.
+   *
+   * `max-height` has to be a number for the transition to run, and the number
+   * has to be this message's own height — a large constant animates at the
+   * wrong speed and arrives early, which is what makes a collapse feel cheap.
+   * It is released to `none` once open so the box still reflows on a resize.
+   */
+  private toggleMessage(e: Event, hash: string) {
+    const box = (e.currentTarget as HTMLElement).closest(".sdesc");
+    const el = box?.querySelector(".mtext") as HTMLElement | undefined;
+    const open = this.msgOpenFor === hash;
+
+    if (!el) {
+      this.msgOpenFor = open ? "" : hash;
+      return;
+    }
+
+    if (open) {
+      // From its full height to the clamp, in two frames: the browser needs a
+      // number to animate away from.
+      el.style.maxHeight = `${el.scrollHeight}px`;
+      requestAnimationFrame(() => {
+        this.msgOpenFor = "";
+        requestAnimationFrame(() => (el.style.maxHeight = ""));
+      });
+      return;
+    }
+
+    el.style.maxHeight = `${el.scrollHeight}px`;
+    this.msgOpenFor = hash;
+    const done = () => {
+      el.style.maxHeight = "";
+      el.removeEventListener("transitionend", done);
+    };
+    el.addEventListener("transitionend", done);
+  }
+
   private renderCommitDetail() {
     const d = this.detail!;
     const at = this.loc!;
@@ -2905,7 +3062,7 @@ export class PageRepo extends LoomElement {
           </div>
         </div>
 
-        {body ? <div class="sdesc">{body}</div> : null}
+        {body ? this.renderCommitBody(body, d.hash) : null}
 
         <div class="review">
           {/* Drawn at its final size while the patch is in flight, so the diff
