@@ -106,7 +106,10 @@ function parse(): { owner: string; name: string; view: View } | null {
     };
   }
   if (kind === "commit" && rest[0]) return { owner, name, view: { kind: "commit", hash: rest[0] } };
-  if (kind === "commits") return { owner, name, view: { kind: "commits", ref: rest[0] ?? "" } };
+  // A commit list has no path after the ref, so the whole remainder is the
+  // name — which is what makes `/commits/feature/thing` work without having to
+  // wait for the ref list the way a tree does.
+  if (kind === "commits") return { owner, name, view: { kind: "commits", ref: rest.join("/") } };
   if (kind === "compare") {
     // GitHub's spelling: /compare/base...head. Falling back to an empty head
     // lets /compare/<base> mean "pick something to compare against".
@@ -119,6 +122,35 @@ function parse(): { owner: string; name: string; view: View } | null {
     return { owner, name, view: { kind, ref: ref ?? "", path: path.join("/") } };
   }
   return { owner, name, view: { kind: "unknown" } };
+}
+
+/**
+ * Split `<ref>/<path>` when the ref itself contains slashes.
+ *
+ * `/owner/repo/tree/feature/settings-redesign/web` is ambiguous on its face:
+ * the branch could be `feature` with path `settings-redesign/web`, or the
+ * branch `feature/settings-redesign` with path `web`. Nothing in the URL says
+ * which, so [`parse`] guesses the shortest ref and this corrects it once the
+ * ref list has actually arrived.
+ *
+ * Only wrong guesses are corrected. If the first segment really is a ref, that
+ * reading stands — otherwise a repository with both `feature` and
+ * `feature/x` would lose the ability to browse a directory called `x` on
+ * `feature`, and every link that already worked would change meaning.
+ */
+function widenRef(known: string[], ref: string, path: string): { ref: string; path: string } {
+  if (!ref || !path || known.includes(ref)) return { ref, path };
+
+  const segs = path.split("/");
+  // Longest first: with both `a/b` and `a/b/c` present, the deeper name is the
+  // one the URL was more specific about.
+  for (let take = segs.length; take >= 1; take--) {
+    const candidate = [ref, ...segs.slice(0, take)].join("/");
+    if (known.includes(candidate)) {
+      return { ref: candidate, path: segs.slice(take).join("/") };
+    }
+  }
+  return { ref, path };
 }
 
 /**
@@ -1016,7 +1048,12 @@ export class PageRepo extends LoomElement {
   // unused private member for a method nothing in the class calls.
   @on(window, "popstate")
   onNav() {
-    const next = parse();
+    // Widened here as well as in `onRefs`, and that is not belt-and-braces.
+    // `onRefs` fires when the refs *query* resolves, which on a second visit
+    // to the same repository it never does — the list is already cached. So
+    // navigating main -> feature/x worked the first time and broke on every
+    // one after, because nothing re-split the URL.
+    const next = this.widened(parse());
     const changedRepo =
       !this.loc || !next || next.owner !== this.loc.owner || next.name !== this.loc.name;
     this.loc = next;
@@ -1042,7 +1079,30 @@ export class PageRepo extends LoomElement {
    */
   @watch("refsQuery")
   onRefs() {
-    if (this.refsQuery.ok) void this.loadView();
+    if (!this.refsQuery.ok) return;
+    const wide = this.widened(this.loc);
+    if (wide !== this.loc) this.loc = wide;
+    void this.loadView();
+  }
+
+  /**
+   * Re-split the location now that the ref names are known.
+   *
+   * Assigning a new `loc` rather than mutating the view in place, because the
+   * queries key off it and would not otherwise notice.
+   */
+  private widened(at: ReturnType<typeof parse>): ReturnType<typeof parse> {
+    if (!at) return at;
+    const v = at.view;
+    if (v.kind !== "tree" && v.kind !== "blob") return at;
+
+    // Nothing to widen against until the refs have arrived; the first load
+    // goes out naive and `onRefs` corrects it.
+    const known = (this.refs ?? []).map((r) => (r.kind === "tag" ? `tags/${r.name}` : r.name));
+    const wide = widenRef(known, v.ref, v.path);
+    if (wide.ref === v.ref) return at;
+
+    return { ...at, view: { kind: v.kind, ref: wide.ref, path: wide.path } };
   }
 
   /** A repository that does not exist is a 404, not an error banner. */
