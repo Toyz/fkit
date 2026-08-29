@@ -43,3 +43,7 @@ flate2 = "1"
 tokio-stream = "0.1"
 bytes = "1"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "http2", "rustls"] }
+# Social card rendering. Text is laid out and rasterised in-process because the
+# alternative is a headless browser, which is a heavier dependency than the
+# whole hub.
+resvg = { version = "0.45", default-features = false, features = ["text", "system-fonts"] }

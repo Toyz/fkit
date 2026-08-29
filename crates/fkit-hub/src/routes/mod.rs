@@ -7,6 +7,7 @@ pub mod issues;
 pub mod merges;
 pub mod repos;
 pub mod session;
+pub mod social;
 
 use crate::auth::Viewer;
 use crate::error::{AppError, AppResult};

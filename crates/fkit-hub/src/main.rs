@@ -12,6 +12,7 @@
 mod auth;
 mod config;
 mod content;
+mod embed;
 mod email;
 mod error;
 mod models;
@@ -32,9 +33,9 @@ use axum::Router;
 use config::Config;
 use sqlx::postgres::PgPoolOptions;
 use state::AppState;
-use std::path::PathBuf;
 use tower_http::compression::CompressionLayer;
 use tower::Layer;
+use axum::http::HeaderMap;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
@@ -125,6 +126,9 @@ async fn main() -> Result<()> {
         // Top level, not under /api: the base URL is handed to the Go
         // toolchain in a meta tag, and it fetches exactly what it is given.
         .merge(routes::gomod::routes())
+        // Top level for the same reason: these URLs are published in the page
+        // head and fetched by crawlers exactly as written.
+        .merge(routes::social::routes())
         .route("/_health", get(health))
         // Built assets MUST be mounted before the repo route. `/assets/app.js`
         // has exactly two segments, so it also matches `/{owner}/{repo}` — and a
@@ -145,7 +149,7 @@ async fn main() -> Result<()> {
         // Same path serves the web page and the sync socket; the Upgrade header
         // decides which.
         .route("/{owner}/{repo}", get(repo_entrypoint))
-        .fallback_service(spa(&cfg.web_dir))
+        .fallback(shell)
         // Before routing, because `?go-get=1` can arrive on any path under a
         // repository and every one of them must answer the same thing.
         .layer(axum::middleware::from_fn(go_get))
@@ -237,7 +241,8 @@ async fn repo_entrypoint(
         .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
 
     if !is_upgrade {
-        return index_html(&state).await;
+        let p = req.uri().path().to_string();
+        return index_html(&state, &p, req.headers()).await;
     }
 
     let (mut parts, _body) = req.into_parts();
@@ -298,16 +303,27 @@ async fn go_get(req: Request, next: axum::middleware::Next) -> Response {
 /// cached forever, but the shell is what *points* at them — let a browser
 /// heuristically cache it and users keep running an old bundle after every
 /// deploy, with no way to tell.
-async fn index_html(state: &AppState) -> Response {
+async fn index_html(state: &AppState, path: &str, headers: &HeaderMap) -> Response {
     match tokio::fs::read_to_string(state.web_dir.join("index.html")).await {
-        Ok(html) => (
-            [
-                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-                (header::CACHE_CONTROL, "no-store, must-revalidate"),
-            ],
-            html,
-        )
-            .into_response(),
+        Ok(html) => {
+            // Anything not publicly readable gets no preview at all, which is
+            // the same nothing a missing page gets. The app still renders it
+            // normally for whoever is allowed to see it — this only changes
+            // what a crawler is told.
+            let base = routes::social::base_url(state, headers);
+            let html = match embed::describe(state, path, &base).await {
+                Some(meta) => embed::inject(&html, &meta, &base),
+                None => embed::inject_blank(&html),
+            };
+            (
+                [
+                    (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                    (header::CACHE_CONTROL, "no-store, must-revalidate"),
+                ],
+                html,
+            )
+                .into_response()
+        }
         Err(_) => (
             StatusCode::NOT_FOUND,
             "web UI not built — run `npm install && npm run build` in web/",
@@ -316,10 +332,36 @@ async fn index_html(state: &AppState) -> Response {
     }
 }
 
-/// Serve built assets, falling back to `index.html` so client-side routes like
-/// `/travis/fkit/blob/main/src/lib.rs` reach the SPA instead of 404ing.
-fn spa(dir: &PathBuf) -> ServeDir<tower_http::services::fs::ServeFile> {
-    ServeDir::new(dir).fallback(tower_http::services::ServeFile::new(dir.join("index.html")))
+/// Serve a static file if there is one, otherwise the app shell.
+///
+/// Client-side routes like `/travis/fkit/blob/main/src/lib.rs` have to reach
+/// the SPA rather than 404, and on the way out the shell picks up the metadata
+/// for whichever route was asked for — see `embed`. That is the only reason
+/// this is a handler and not a `ServeDir`: a static file cannot describe
+/// itself to a crawler.
+async fn shell(State(state): State<AppState>, req: Request) -> Response {
+    use tower::ServiceExt;
+
+    let path = req.uri().path().to_string();
+    let headers = req.headers().clone();
+
+    // A real file wins. `ServeDir` refuses paths that climb out of the
+    // directory, so this does not need its own traversal check.
+    //
+    // Directory indexes are off: with them on, `/` is answered with the raw
+    // index.html and never reaches the metadata below, so the site's own root
+    // was the one page with no preview.
+    let served = ServeDir::new(&state.web_dir)
+        .append_index_html_on_directories(false)
+        .oneshot(req)
+        .await;
+    if let Ok(res) = served
+        && res.status() != StatusCode::NOT_FOUND
+    {
+        return res.map(axum::body::Body::new);
+    }
+
+    index_html(&state, &path, &headers).await
 }
 
 async fn shutdown() {

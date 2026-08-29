@@ -173,6 +173,9 @@ const RESERVED: &[&str] = &[
     // -- routes that exist today --
     "api", "admin", "assets", "static", "login", "logout", "register", "new",
     "settings", "explore", "search", "help", "about", "_health",
+    // Link previews. `/og/...` and `/oembed` are fetched by crawlers exactly
+    // as published, so they are static routes and would shadow an account.
+    "og", "oembed",
     // -- routes a forge tends to grow --
     "blog", "docs", "documentation", "status", "pricing", "terms", "privacy",
     "legal", "contact", "download", "downloads", "changelog", "releases",

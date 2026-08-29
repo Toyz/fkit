@@ -385,6 +385,45 @@ Per-repository visibility is independent of all that: a public instance can host
 private repositories, and a public repository on it is readable — and cloneable —
 by someone with no account at all, while still refusing their pushes.
 
+### Link previews
+
+Paste a link to a repository, profile, issue, merge request, commit or file
+into Discord, Slack, Signal or anywhere else that unfurls URLs and it arrives
+with a title, a description and a rendered card. Search engines read the same
+tags.
+
+None of it needs JavaScript. A crawler fetches the URL once and never runs the
+app, so the shell is rewritten on the way out with the metadata for whichever
+route was asked for, and the app boots from it unchanged. The card itself is
+laid out as SVG and rasterised in-process — Liberation Mono is vendored so it
+renders identically on a container with no fonts installed.
+
+Set `server.public_url` (or `FKIT_PUBLIC_URL`). Open Graph URLs must be
+absolute, and without it the hub has to guess from the request's `Host`, which
+a proxy may have rewritten.
+
+```
+/og/{owner}/{repo}.png              a repository's card
+/og/{owner}.png                     a profile's
+/og/{owner}/{repo}/issues/{n}.png   an issue's
+/oembed?url=...                     the oEmbed document linked from every page
+```
+
+**A private repository has no preview at all.** Not a generic one — none. The
+page carries no Open Graph tags, no oEmbed link and a `noindex`, and the card
+and oEmbed endpoints answer 404, so the link simply does not unfurl.
+
+GitHub answers a private repository with its own site metadata, so the link
+still arrives with a title, a description and a logo, and a link nobody in the
+channel can open is presented looking exactly like one they can. Showing
+nothing is the more useful answer as well as the more honest one.
+
+Everything here resolves as an anonymous viewer, so a private repository, a
+repository that does not exist and a misspelt username produce byte-identical
+responses. This is the place where getting it wrong would be worst: an unfurled
+link is shown to a whole channel, so leaking a name or a description into one
+republishes it to everybody in the room.
+
 ### `fkitd` — the minimal daemon
 
 No accounts, no UI, refs as files, one optional shared token. Good for a private
@@ -417,6 +456,11 @@ It **refuses to start** on a non-loopback address without a token unless you pas
   the server knows the answer instead of guessing it. Both are shown: the
   author string as written, and the account beside it. A token can decline to
   link, which is what a mirror of someone else's history should use.
+* Link previews describe only what an anonymous visitor could already read —
+  see above. The metadata, the oEmbed document and the card image all go
+  through one resolver, so none of them can disagree with the others about
+  what is public, and a page with nothing public to say produces no preview
+  rather than a generic one.
 * `server.trust_proxy` must stay **off** on a directly-exposed server. The
   header it believes is client-supplied, so trusting it there lets anyone mint
   a new identity per request and skip rate limiting entirely.
