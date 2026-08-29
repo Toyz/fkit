@@ -684,6 +684,19 @@ const sheet = css`
      filename you just asked for. */
   .df { scroll-margin-top: 56px; }
 
+  /* The cut at the bottom of a long file. Full width and clearly a control,
+     because it is the only thing standing between the reader and the rest of
+     the file. */
+  .more {
+    display: flex; align-items: center; justify-content: center; gap: 7px;
+    width: 100%; padding: 7px 0;
+    border: 0; border-top: 1px solid var(--border); border-radius: 0;
+    background: var(--raised); color: var(--muted);
+    font-size: 11.5px; font-family: var(--sans);
+  }
+  .more:hover { background: var(--surface); color: var(--text); border-color: var(--border); }
+  .more loom-icon.closed { transform: rotate(180deg); }
+
   /* ---- a comment pinned to a line ---- */
   .dl { position: relative; }
   /* The gutter button only appears on the row under the pointer — a plus on
@@ -1103,6 +1116,10 @@ export class PageRepo extends LoomElement {
   @reactive accessor writingAt = "";
   /// Resolved threads collapse; this remembers the ones re-opened by hand.
   @reactive accessor shownThreads: Record<string, boolean> = {};
+  /// Files whose diff has been expanded past the cut. A 3,500-line file is
+  /// not a diff anyone reads top to bottom, and rendering it costs the same
+  /// whether or not they do.
+  @reactive accessor wholeFile: Record<string, boolean> = {};
   /// Which issues the list is showing. Part of the query URL, so changing it
   /// refetches rather than filtering a list that was never loaded.
   @reactive accessor issueFilter: "open" | "closed" | "all" = "open";
@@ -1887,6 +1904,29 @@ export class PageRepo extends LoomElement {
     // Only a merge request has somewhere to attach a line comment, and only a
     // signed-in viewer can write one.
     const canTalk = this.comments !== null && this.session.isAuthed;
+
+    // Cut a long file down to its first hunks unless asked for the rest. The
+    // limit is on lines rather than hunks, because one hunk can be the whole
+    // file and twenty can be twenty words.
+    const CUT = 320;
+    const whole = !!this.wholeFile[f.path];
+    const total = f.hunks.reduce((n, h) => n + h.lines.length, 0);
+    let shown = f.hunks;
+    let hidden = 0;
+    if (!whole && total > CUT) {
+      shown = [];
+      let used = 0;
+      for (const h of f.hunks) {
+        if (used >= CUT) break;
+        const room = CUT - used;
+        // Cut inside a hunk, not only between them. A generated file is one
+        // hunk of ten thousand lines, which is exactly the case this is for,
+        // and stopping at hunk boundaries would never cut it at all.
+        shown.push(room >= h.lines.length ? h : { ...h, lines: h.lines.slice(0, room) });
+        used += Math.min(room, h.lines.length);
+      }
+      hidden = total - used;
+    }
     const isOpen = !this.collapsed[f.path];
     const lang = languageFor(f.path);
     const ref = atRef ?? this.detail?.hash ?? this.refName();
@@ -1937,7 +1977,7 @@ export class PageRepo extends LoomElement {
                 the two versions differ too much for a line diff — shown as a full replacement
               </div>
             ) : null}
-            {f.hunks.map((h) => (
+            {shown.map((h) => (
               <div>
                 <div class="hh">{h.header}</div>
                 {h.lines.map((l) => {
@@ -1980,6 +2020,27 @@ export class PageRepo extends LoomElement {
                 })}
               </div>
             ))}
+
+            {hidden > 0 ? (
+              <button
+                type="button"
+                class="more"
+                onClick={() => (this.wholeFile = { ...this.wholeFile, [f.path]: true })}
+              >
+                <loom-icon name="chevron" size={12}></loom-icon>
+                show {hidden.toLocaleString()} more {hidden === 1 ? "line" : "lines"}
+              </button>
+            ) : null}
+            {whole && total > CUT ? (
+              <button
+                type="button"
+                class="more"
+                onClick={() => (this.wholeFile = { ...this.wholeFile, [f.path]: false })}
+              >
+                <loom-icon class="closed" name="chevron" size={12}></loom-icon>
+                collapse
+              </button>
+            ) : null}
           </div>
         )}
       </div>
