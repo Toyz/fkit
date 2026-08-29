@@ -56,15 +56,12 @@ const sheet = css`
 
   .who { position: sticky; top: 52px; }
 
-  /* Initials, not an avatar service: no external request, no tracking, and it
-     works on a server with no route to the internet. */
+  /* The same component the profile form previews, so what you are shown
+     while editing is what a visitor actually gets. */
+  fkit-avatar { display: block; margin-bottom: 14px; }
   .av {
     width: 84px; height: 84px; border-radius: var(--radius);
-    background: var(--accent-weak); color: var(--accent);
-    display: grid; place-items: center;
-    font-size: 30px; font-weight: 600; text-transform: uppercase;
-    letter-spacing: .02em;
-    margin-bottom: 14px;
+    background: var(--accent-weak); margin-bottom: 14px;
   }
   .who h1 {
     font-size: 19px; font-weight: 500; letter-spacing: -0.01em;
@@ -195,7 +192,7 @@ export class PageProfile extends LoomElement {
           <div class="who">
             {p ? (
               <>
-                <div class="av">{p.username.slice(0, 2)}</div>
+                <fkit-avatar name={p.username} size={84}></fkit-avatar>
                 <h1>{p.username}</h1>
                 {p.display_name ? <div class="dn">{p.display_name}</div> : null}
 

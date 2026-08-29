@@ -32,6 +32,25 @@ const SECTIONS: [Section, string, string][] = [
   ["sessions", "sessions", "history"],
 ];
 
+/**
+ * What a token line says about itself: which token it is, whether anything is
+ * still using it, and when it stops working.
+ *
+ * Expiry was missing, which made a page of tokens unable to answer the one
+ * question you go there to ask — why did my push stop working.
+ */
+function tokenMeta(t: Token): string {
+  const bits = [`fkit_pat_${t.prefix}…`];
+  bits.push(t.last_used_at ? `last used ${relativeTime(t.last_used_at)}` : "never used");
+  if (t.expires_at) {
+    const done = new Date(t.expires_at).getTime() <= Date.now();
+    bits.push(done ? "expired" : `expires ${relativeTime(t.expires_at)}`);
+  } else {
+    bits.push("never expires");
+  }
+  return bits.join(" · ");
+}
+
 const sheet = css`
   .panel-body { padding: 14px; }
   form.stack { display: flex; flex-direction: column; gap: 12px; }
@@ -69,6 +88,30 @@ const sheet = css`
   .check { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; }
   .check input { width: auto; }
   .ok { color: var(--added); font-size: 12px; }
+
+  /* The form, and beside it the thing the form produces. */
+  .two {
+    display: grid; grid-template-columns: minmax(0, 1fr) 250px;
+    gap: 40px; align-items: start;
+  }
+  @media (max-width: 860px) { .two { grid-template-columns: 1fr; gap: 24px; } }
+
+  .card {
+    border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 18px; text-align: center;
+  }
+  .card .lbl {
+    font-size: 10px; text-transform: uppercase; letter-spacing: .09em;
+    color: var(--faint); margin-bottom: 14px;
+  }
+  .card .nm { font-size: 15px; margin-top: 12px; overflow-wrap: anywhere; }
+  .card .dn {
+    font-family: var(--sans); color: var(--muted); font-size: 12.5px; margin-top: 3px;
+  }
+  .card .dn.none { color: var(--faint); font-style: italic; }
+  .card .go { display: inline-flex; margin-top: 14px; font-size: 11.5px; }
+
+  .warn { color: var(--removed); font-size: 11.5px; margin-top: 6px; }
 `;
 
 abstract class SettingsBase extends LoomElement {
@@ -104,6 +147,15 @@ export class PageSettings extends SettingsBase {
   @reactive accessor sessions: SessionInfo[] | null = null;
   @reactive accessor canWrite = true;
   @reactive accessor copied = false;
+
+  /// What the profile form currently holds, so the preview beside it can show
+  /// what the change will actually look like before it is saved. Null means
+  /// "whatever the server last said" — the two differ only once you type.
+  @reactive accessor draftName: string | null = null;
+
+  /// Whether the two new-password fields agree. Checked as you type, because
+  /// finding out on submit means retyping both.
+  @reactive accessor pwMismatch = false;
 
   /// Cancelled automatically if the component goes away, so the flash can
   /// never fire into a detached element. Repeated copies restart the timer
@@ -141,7 +193,9 @@ export class PageSettings extends SettingsBase {
     if (this.section === "tokens" && this.tokens === null) {
       this.tokens = await api.tokens().catch(() => []);
     }
-    if (this.section === "sessions") {
+    // The password page states how many sessions it is about to end, so it
+    // needs the same list the sessions page does.
+    if (this.section === "sessions" || this.section === "password") {
       this.sessions = await api.sessions().catch(() => []);
     }
   }
@@ -174,60 +228,95 @@ export class PageSettings extends SettingsBase {
 
   private profile() {
     const u = this.me;
+    // What the preview shows: what you have typed, or what is stored.
+    const shownName = this.draftName ?? u?.display_name ?? "";
+    const who = u?.username ?? "";
+
     return (
-      <fkit-page heading="Profile" value={this.me?.username ?? ""}>
-        <fkit-section
-          blurb="Your username and display name appear beside your commits and on any repository you own."
-        >
-          <form
-            onSubmit={(e: Event) => {
-              e.preventDefault();
-              const f = e.target as HTMLFormElement;
-              const display_name = (f.elements.namedItem("display_name") as HTMLInputElement).value;
-              const email = (f.elements.namedItem("email") as HTMLInputElement).value;
-              void this.act(async () => {
-                const next = await api.updateProfile({ display_name, email });
-                this.me = next;
-                await this.session.load();
-              }, "Profile updated");
-            }}
-          >
-            <fkit-field
-              label="Username"
-              help="Permanent. It is part of every repository URL you own, so changing it would break every clone anyone has taken."
+      <fkit-page heading="Profile" value={who}>
+        <fkit-section blurb="Your username and display name appear beside your commits and on any repository you own.">
+          <div class="two">
+            <form
+              onSubmit={(e: Event) => {
+                e.preventDefault();
+                const f = e.target as HTMLFormElement;
+                const display_name = (f.elements.namedItem("display_name") as HTMLInputElement).value;
+                const email = (f.elements.namedItem("email") as HTMLInputElement).value;
+                void this.act(async () => {
+                  const next = await api.updateProfile({ display_name, email });
+                  this.me = next;
+                  this.draftName = null;
+                  await this.session.load();
+                }, "Profile updated");
+              }}
             >
-              <input value={u?.username ?? ""} disabled />
-            </fkit-field>
+              <fkit-field
+                label="Username"
+                help="Permanent. It is part of every repository URL you own, so changing it would break every clone anyone has taken."
+              >
+                <input value={who} disabled />
+              </fkit-field>
 
-            <fkit-field
-              label="Display name"
-              help="Shown beside your commits. Leave empty to use your username."
-            >
-              <input name="display_name" value={u?.display_name ?? ""} placeholder="Your name" />
-            </fkit-field>
+              <fkit-field
+                label="Display name"
+                help="Shown beside your commits. Leave empty to use your username."
+              >
+                <input
+                  name="display_name"
+                  value={u?.display_name ?? ""}
+                  placeholder="Your name"
+                  onInput={(e: Event) => (this.draftName = (e.target as HTMLInputElement).value)}
+                />
+              </fkit-field>
 
-            <fkit-field
-              label="Email"
-              help="Used for password resets. Never shown on a public page."
-            >
-              <input name="email" type="email" value={u?.email ?? ""} required />
-            </fkit-field>
+              <fkit-field
+                label="Email"
+                help="Used for password resets. Never shown on a public page."
+              >
+                <input name="email" type="email" value={u?.email ?? ""} required />
+              </fkit-field>
 
-            <fkit-actions>
-              <button class="primary" type="submit" disabled={this.busy}>Save profile</button>
-              {this.notice ? <span class="ok">{this.notice}</span> : null}
-            </fkit-actions>
-          </form>
+              <fkit-actions>
+                <button class="primary" type="submit" disabled={this.busy}>Save profile</button>
+                {this.notice ? <span class="ok">{this.notice}</span> : null}
+              </fkit-actions>
+            </form>
+
+            {/* The page that edits an identity should show that identity.
+                Initials are derived from the username, so this is the whole of
+                what a visitor sees — there is nothing else to preview. */}
+            <div class="card">
+              <div class="lbl">how people see you</div>
+              <fkit-avatar name={who} size={72}></fkit-avatar>
+              <div class="nm">{who}</div>
+              <div class={`dn ${shownName ? "" : "none"}`}>
+                {shownName || "no display name"}
+              </div>
+              {who ? (
+                <a class="btn go" href={`/${who}`} onClick={linkHandler(`/${who}`)}>
+                  <loom-icon name="external" size={11}></loom-icon> view your page
+                </a>
+              ) : null}
+            </div>
+          </div>
         </fkit-section>
       </fkit-page>
     );
   }
 
   private password() {
+    // Say what the button will actually do, with the real number.
+    const others = (this.sessions ?? []).filter((x) => !x.current).length;
     return (
       <fkit-page heading="Password">
         <fkit-section
-          blurb="Changing your password signs out every other session, so a stolen one stops working immediately."
+          blurb={
+            this.sessions === null
+              ? "Changing your password signs out every other session, so a stolen one stops working immediately."
+              : others === 0
+                ? "This is your only session, so nothing else will be signed out."
+                : `Changing your password will also sign out your ${others} other ${others === 1 ? "session" : "sessions"}, so a stolen one stops working immediately.`
+          }
         >
           <form
             onSubmit={(e: Event) => {
@@ -235,12 +324,13 @@ export class PageSettings extends SettingsBase {
               const f = e.target as HTMLFormElement;
               const at = (n: string) => (f.elements.namedItem(n) as HTMLInputElement).value;
               if (at("next") !== at("again")) {
-                this.error = "The new passwords do not match.";
+                this.pwMismatch = true;
                 return;
               }
               void this.act(async () => {
                 await api.changePassword(at("current"), at("next"));
                 f.reset();
+                this.pwMismatch = false;
               }, "Password changed");
             }}
           >
@@ -252,15 +342,31 @@ export class PageSettings extends SettingsBase {
               label="New password"
               help="At least 10 characters. Length beats punctuation."
             >
-              <input name="next" type="password" autocomplete="new-password" required />
+              <input name="next" type="password" autocomplete="new-password" required minLength={10} />
             </fkit-field>
 
             <fkit-field label="Confirm new password">
-              <input name="again" type="password" autocomplete="new-password" required />
+              <input
+                name="again"
+                type="password"
+                autocomplete="new-password"
+                required
+                // Checked as you type: finding out on submit means retyping
+                // both fields, since a password field cannot be read back.
+                onInput={(e: Event) => {
+                  const el = e.target as HTMLInputElement;
+                  const form = el.closest("form") as HTMLFormElement;
+                  const next = (form.elements.namedItem("next") as HTMLInputElement).value;
+                  this.pwMismatch = !!el.value && el.value !== next;
+                }}
+              />
+              {this.pwMismatch ? <div class="warn">The two passwords do not match.</div> : null}
             </fkit-field>
 
             <fkit-actions>
-              <button class="primary" type="submit" disabled={this.busy}>Change password</button>
+              <button class="primary" type="submit" disabled={this.busy || this.pwMismatch}>
+                Change password
+              </button>
               {this.notice ? <span class="ok">{this.notice}</span> : null}
             </fkit-actions>
           </form>
@@ -337,7 +443,7 @@ export class PageSettings extends SettingsBase {
                   loom-key={t.id}
                   icon="key"
                   name={t.name}
-                  meta={`fkit_pat_${t.prefix}… · ${t.last_used_at ? `last used ${relativeTime(t.last_used_at)}` : "never used"}`}
+                  meta={tokenMeta(t)}
                 >
                   <span class={`tag ${t.can_write ? "on" : ""}`}>
                     {t.can_write ? "read + write" : "read"}
@@ -372,90 +478,113 @@ export class PageSettings extends SettingsBase {
 
   private sessionsSection() {
     const list = this.sessions;
-    const others = (list ?? []).filter((x) => !x.current).length;
+    const current = (list ?? []).find((x) => x.current) ?? null;
+    const others = (list ?? []).filter((x) => !x.current);
+
     return (
-      <fkit-page heading="Sessions" value={this.sessions ? `${this.sessions.length} active` : ""}>
+      <fkit-page heading="Sessions" value={list ? `${list.length} active` : ""}>
+        {/* This browser first, and alone. Finding the session you are actually
+            using inside a list of fifty identical "Chrome" rows was the whole
+            problem with the old page. */}
         <fkit-section
-          blurb="Browsers signed in to this account. Access tokens are listed separately."
+          heading="This browser"
+          blurb="The session you are using right now."
         >
-          <fkit-list heading="Active sessions">
+          <fkit-list>
             {list === null ? (
               <fkit-empty><span class="sk" style="width:200px"></span></fkit-empty>
-            ) : list.length === 0 ? (
-              <fkit-empty>No active sessions.</fkit-empty>
+            ) : current ? (
+              this.sessionRow(current)
             ) : (
-              list.map((sess) => (
-                <fkit-row
-                  loom-key={sess.id}
-                  icon={sess.current ? "check" : "history"}
-                  current={sess.current}
-                  name={shortAgent(sess.user_agent)}
-                  meta={`Signed in ${relativeTime(sess.created_at)} · expires ${relativeTime(sess.expires_at)}`}
-                >
-                  {sess.current ? <span class="tag on">This browser</span> : null}
-                  <button
-                    class="danger bare"
-                    disabled={this.busy}
-                    onClick={async () => {
-                      const ok = await confirmAction({
-                        title: sess.current ? "Sign out of this browser?" : "Revoke this session?",
-                        body: sess.current
-                          ? "You will be signed out here and returned to the sign-in page."
-                          : `${shortAgent(sess.user_agent)} will be signed out immediately.`,
-                        confirm: sess.current ? "Sign out" : "Revoke",
-                        danger: true,
-                      });
-                      if (!ok) return;
-                      void this.act(async () => {
-                        await api.revokeSession(sess.id);
-                        if (sess.current) {
-                          await this.session.logout();
-                          go("/login");
-                          return;
-                        }
-                        this.sessions = await api.sessions();
-                      });
-                    }}
-                  >
-                    {sess.current ? "Sign out" : "Revoke"}
-                  </button>
-                </fkit-row>
-              ))
+              <fkit-empty>Signed in with an access token rather than a browser session.</fkit-empty>
             )}
           </fkit-list>
         </fkit-section>
 
-        {others > 0 ? (
-          <fkit-section
-            heading="Sign out everywhere else"
-            blurb={`Ends ${others} other ${others === 1 ? "session" : "sessions"} and leaves this one alone. Changing your password does the same thing.`}
-          >
-            <fkit-actions>
-              <button
-                class="danger"
-                disabled={this.busy}
-                onClick={async () => {
-                  const ok = await confirmAction({
-                    title: "Sign out everywhere else?",
-                    body: `${others} other ${others === 1 ? "session" : "sessions"} will be signed out. This browser stays signed in.`,
-                    confirm: "Sign out everywhere else",
-                    danger: true,
-                  });
-                  if (!ok) return;
-                  await this.act(async () => {
-                    const r = await api.revokeOtherSessions();
-                    this.sessions = await api.sessions();
-                    this.notice = `${r.revoked} session(s) signed out`;
-                  });
-                }}
-              >
-                Sign out everywhere else
-              </button>
-              {this.notice ? <span class="ok">{this.notice}</span> : null}
-            </fkit-actions>
-          </fkit-section>
-        ) : null}
+        <fkit-section
+          heading="Everywhere else"
+          value={list ? `${others.length} ${others.length === 1 ? "session" : "sessions"}` : ""}
+          blurb="Other browsers signed in to this account. Access tokens are listed separately, under access tokens."
+        >
+          {/* The action that ends them all rides the heading, not the bottom
+              of the list — with fifty sessions it was a scroll away from the
+              thing it acts on. */}
+          {others.length ? (
+            <button
+              slot="action"
+              class="danger bare"
+              disabled={this.busy}
+              onClick={async () => {
+                const ok = await confirmAction({
+                  title: "Sign out everywhere else?",
+                  body: `${others.length} other ${others.length === 1 ? "session" : "sessions"} will be signed out. This browser stays signed in.`,
+                  confirm: "Sign out everywhere else",
+                  danger: true,
+                });
+                if (!ok) return;
+                await this.act(async () => {
+                  const r = await api.revokeOtherSessions();
+                  this.sessions = await api.sessions();
+                  this.notice = `${r.revoked} session(s) signed out`;
+                });
+              }}
+            >
+              Sign out all
+            </button>
+          ) : null}
+
+          <fkit-list>
+            {list === null ? (
+              <fkit-empty><span class="sk" style="width:200px"></span></fkit-empty>
+            ) : others.length === 0 ? (
+              <fkit-empty>Nowhere else. This is your only session.</fkit-empty>
+            ) : (
+              others.map((sess) => this.sessionRow(sess))
+            )}
+          </fkit-list>
+          {this.notice ? <fkit-actions><span class="ok">{this.notice}</span></fkit-actions> : null}
+        </fkit-section>
       </fkit-page>
+    );
+  }
+
+  /// One session, wherever it is listed.
+  private sessionRow(sess: SessionInfo) {
+    return (
+      <fkit-row
+        loom-key={sess.id}
+        icon={sess.current ? "check" : "history"}
+        current={sess.current}
+        name={shortAgent(sess.user_agent)}
+        meta={`Signed in ${relativeTime(sess.created_at)} · expires ${relativeTime(sess.expires_at)}`}
+      >
+        <button
+          class="danger bare"
+          disabled={this.busy}
+          onClick={async () => {
+            const ok = await confirmAction({
+              title: sess.current ? "Sign out of this browser?" : "Revoke this session?",
+              body: sess.current
+                ? "You will be signed out here and returned to the sign-in page."
+                : `${shortAgent(sess.user_agent)} will be signed out immediately.`,
+              confirm: sess.current ? "Sign out" : "Revoke",
+              danger: true,
+            });
+            if (!ok) return;
+            void this.act(async () => {
+              await api.revokeSession(sess.id);
+              if (sess.current) {
+                await this.session.logout();
+                go("/login");
+                return;
+              }
+              this.sessions = await api.sessions();
+            });
+          }}
+        >
+          {sess.current ? "Sign out" : "Revoke"}
+        </button>
+      </fkit-row>
     );
   }
 
