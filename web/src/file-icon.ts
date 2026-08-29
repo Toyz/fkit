@@ -41,6 +41,19 @@ const BY_NAME: Record<string, string> = {
   cargo: "gear",
   justfile: "gear",
   readme: "book",
+  // A guide is the file a newcomer is looking for, so it gets a mark of its
+  // own rather than the generic document one.
+  getting_started: "guide",
+  "getting-started": "guide",
+  gettingstarted: "guide",
+  get_started: "guide",
+  quickstart: "guide",
+  quick_start: "guide",
+  "quick-start": "guide",
+  tutorial: "guide",
+  install: "terminal",
+  installation: "terminal",
+  deploy: "terminal",
   // The submodule manifest gets the same mark as the submodules it declares,
   // so the file and the rows it explains are recognisably the same subject.
   "fkit-submodules": "submodule",

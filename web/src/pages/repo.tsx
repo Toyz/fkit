@@ -2352,6 +2352,11 @@ export class PageRepo extends LoomElement {
 
     const known: [RegExp, string, string][] = [
       [/^readme$/, "readme", "book"],
+      // Before the legal and process files: someone arriving at a repository
+      // wants to know how to start, and a tab order is a priority order.
+      [/^(getting[_-]?started|get[_-]?started|quickstart|quick[_-]?start)$/,
+        "getting started", "guide"],
+      [/^install(ation)?$/, "install", "terminal"],
       [/^licen[cs]e$/, "license", "scale"],
       [/^contributing$/, "contributing", "people"],
       [/^code[_-]?of[_-]?conduct$/, "code of conduct", "heart"],
