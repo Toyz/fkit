@@ -43,6 +43,19 @@ export interface Repo {
   tags: number;
 }
 
+export interface GcReport {
+  dry_run: boolean;
+  total: number;
+  reachable: number;
+  unreachable: number;
+  /** Unreachable, but held back by the grace period. */
+  too_young: number;
+  loose_removed: number;
+  packed_dropped: number;
+  segments_compacted: number;
+  bytes_reclaimed: number;
+}
+
 export interface Ref {
   /** The bare name — a tag's `tags/` prefix is stripped by the server. */
   name: string;
@@ -458,6 +471,19 @@ export const api = {
     request<{ ok: boolean }>(`/repos/${owner}/${name}`, { method: "DELETE" }),
 
   refs: (owner: string, name: string) => request<Ref[]>(`/repos/${owner}/${name}/refs`),
+
+  /**
+   * Reclaim objects no ref can reach.
+   *
+   * Objects younger than the server's grace period are always kept, whatever
+   * this asks for: a push writes its objects before it moves the ref, so a
+   * collector that ignored age could delete a push still in flight.
+   */
+  gc: (owner: string, name: string, dry_run: boolean) =>
+    request<GcReport>(`/repos/${owner}/${name}/gc`, {
+      method: "POST",
+      body: body({ dry_run }),
+    }),
 
   /**
    * Remove a branch or a tag.

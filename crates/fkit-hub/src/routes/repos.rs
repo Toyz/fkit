@@ -8,7 +8,7 @@ use crate::state::AppState;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{delete, get, patch};
+use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use fkit_core::hash::Hash;
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,7 @@ pub fn routes() -> Router<AppState> {
         .route("/repos/{owner}/{name}", delete(delete_repo))
         .route("/repos/{owner}/{name}/refs", get(list_refs).delete(delete_ref))
         .route("/repos/{owner}/{name}/stats", get(repo_stats))
+        .route("/repos/{owner}/{name}/gc", post(collect_garbage))
         .route(
             "/repos/{owner}/{name}/collaborators",
             get(list_collaborators).post(add_collaborator),
@@ -443,6 +444,122 @@ async fn delete_repo(
     super::audit(&state, viewer.id(), None, "repo.delete",
         serde_json::json!({ "name": format!("{owner}/{name}") })).await;
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Deserialize, Default)]
+struct GcIn {
+    /// Report what would go without removing anything.
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Serialize)]
+struct GcOut {
+    dry_run: bool,
+    total: usize,
+    reachable: usize,
+    unreachable: usize,
+    /// Unreachable, but held back by the age guard.
+    too_young: usize,
+    loose_removed: usize,
+    packed_dropped: usize,
+    segments_compacted: usize,
+    bytes_reclaimed: u64,
+}
+
+/// Reclaim objects no ref can reach.
+///
+/// Deleting a branch removes a name, not the commits under it — which is
+/// correct, since objects are shared and a delete that walked the whole store
+/// would be both slow and wrong. But nothing reclaimed the leftovers either,
+/// so the space was gone for good. This is the other half.
+///
+/// The age guard is deliberately not exposed. A push writes its objects and
+/// *then* moves the ref, so in that window its objects are unreachable by
+/// definition; on a server there is always potentially a push in flight, and
+/// `--prune-all` is only ever safe when nothing else is writing. The default
+/// grace period stands, whoever asks.
+async fn collect_garbage(
+    State(state): State<AppState>,
+    viewer: Viewer,
+    Path((owner, name)): Path<(String, String)>,
+    body: Option<Json<GcIn>>,
+) -> AppResult<Json<GcOut>> {
+    let (repo, access, _) = super::load_repo(&state, &viewer, &owner, &name).await?;
+    require_admin(access)?;
+    let dry_run = body.map(|Json(b)| b.dry_run).unwrap_or(false);
+
+    // One collector per repository. Two walking the same store would each
+    // compute a live set blind to the other's compaction. The lock lives on a
+    // dedicated connection rather than the pool at large, because a session
+    // advisory lock is released by the connection that took it — handing that
+    // connection back mid-collection would leak the lock.
+    let mut conn = state.db.acquire().await.map_err(anyhow::Error::from)?;
+    let key = i64::from_be_bytes(repo.id.as_bytes()[..8].try_into().unwrap());
+    let (locked,): (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
+        .bind(key)
+        .fetch_one(&mut *conn)
+        .await?;
+    if !locked {
+        return Err(AppError::Conflict(
+            "a collection is already running for this repository".into(),
+        ));
+    }
+
+    let result = async {
+        let roots: Vec<(Vec<u8>,)> = sqlx::query_as("SELECT target FROM refs WHERE repo_id = $1")
+            .bind(repo.id)
+            .fetch_all(&state.db)
+            .await?;
+        let roots: Vec<Hash> = roots
+            .into_iter()
+            .filter_map(|(b,)| Some(Hash(b.try_into().ok()?)))
+            .collect();
+
+        let store = state.store_for(repo.id).map_err(AppError::Internal)?;
+        // A graph walk plus file IO: minutes on a large repository, and none
+        // of it async. Off the runtime thread it goes.
+        let opts = fkit_core::gc::Options { dry_run, ..Default::default() };
+        tokio::task::spawn_blocking(move || fkit_core::gc::collect(&store, &roots, opts))
+            .await
+            .map_err(anyhow::Error::from)?
+            .map_err(AppError::Internal)
+    }
+    .await;
+
+    let (unlocked,): (bool,) = sqlx::query_as("SELECT pg_advisory_unlock($1)")
+        .bind(key)
+        .fetch_one(&mut *conn)
+        .await?;
+    debug_assert!(unlocked, "the lock we took should still be ours");
+
+    let r = result?;
+
+    if !dry_run && (r.loose_removed > 0 || r.packed_dropped > 0) {
+        super::audit(
+            &state,
+            viewer.id(),
+            Some(repo.id),
+            "repo.gc",
+            serde_json::json!({
+                "removed": r.loose_removed + r.packed_dropped,
+                "bytes_reclaimed": r.bytes_reclaimed,
+            }),
+        )
+        .await;
+    }
+
+    Ok(Json(GcOut {
+        dry_run,
+        total: r.total,
+        reachable: r.reachable,
+        unreachable: r.unreachable,
+        too_young: r.too_young,
+        loose_removed: r.loose_removed,
+        packed_dropped: r.packed_dropped,
+        segments_compacted: r.segments_compacted,
+        bytes_reclaimed: r.bytes_reclaimed,
+    }))
 }
 
 /// Which ref to remove.

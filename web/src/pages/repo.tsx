@@ -23,6 +23,7 @@ import {
   humanSize,
   syncUrl,
   relativeTime,
+  type GcReport,
   type BlobResponse,
   type TreeResponse,
   type Commit,
@@ -546,6 +547,11 @@ const sheet = css`
     border-top: 1px solid var(--border); font-family: var(--sans);
   }
 
+  .gc-report {
+    font-family: var(--sans); font-size: 11.5px; color: var(--muted);
+    margin: 12px 0 0; line-height: 1.5; max-width: 78ch;
+  }
+
   /* ---- setup instructions ---- */
   /* A centred column: the panel is full width but the instructions are a
      reading measure, and left-anchoring them left a dead half-screen. */
@@ -904,6 +910,10 @@ export class PageRepo extends LoomElement {
   /// last said. Distinguishing the two is what lets "remove every topic" save
   /// as an empty list rather than reading as "no edit".
   @reactive accessor topicDraft: string[] | null = null;
+
+  /// The last collection report, kept so a dry run can be read before the
+  /// real one is asked for.
+  @reactive accessor gcReport: GcReport | null = null;
   /**
    * The line diff, which can be real work on a large commit. It is its own
    * query so the summary is not waiting behind it — and being keyed by the
@@ -2759,9 +2769,67 @@ fkit push</pre>
   }
 
   private settingsDanger(r: Repo, at: { owner: string; name: string }) {
+    const g = this.gcReport;
     return (
       <fkit-page heading="Danger zone" value={r.full_name}>
-        <fkit-section blurb="Nothing here can be undone from this page.">
+        {/* Not destructive in the way the box below is — it removes only what
+            no branch or tag can reach, keeps anything recent whatever it is
+            asked, and verifies what survives. It lives here because it is the
+            other maintenance task nobody visits this page for by accident. */}
+        <fkit-section
+          heading="Storage"
+          value={g ? `${g.reachable} reachable · ${g.unreachable} not` : ""}
+          blurb="Deleting a branch removes a name, not the commits under it. This is what actually reclaims the space: objects no branch or tag can reach are removed, and shared chunks are kept as long as anything still points at them. Objects younger than a day are always kept, because a push writes its objects before it moves the ref."
+        >
+          <fkit-actions>
+            <button
+              disabled={this.busy}
+              onClick={() =>
+                void this.act(async () => {
+                  this.gcReport = await api.gc(at.owner, at.name, true);
+                })
+              }
+            >
+              Check what is unreferenced
+            </button>
+            {g && g.unreachable > g.too_young ? (
+              <button
+                class="danger"
+                disabled={this.busy}
+                onClick={async () => {
+                  const ok = await confirmAction({
+                    title: "Reclaim unreferenced objects?",
+                    body: `${g.unreachable - g.too_young} object(s) can be removed. Anything still reachable from a branch or tag is kept, and every surviving object is verified afterwards.`,
+                    confirm: "Reclaim",
+                    danger: true,
+                  });
+                  if (!ok) return;
+                  await this.act(async () => {
+                    this.gcReport = await api.gc(at.owner, at.name, false);
+                    await this.statsQuery.refetch();
+                  }, "Storage reclaimed");
+                }}
+              >
+                Reclaim
+              </button>
+            ) : null}
+            {this.notice ? <span class="ok">{this.notice}</span> : null}
+          </fkit-actions>
+
+          {g ? (
+            <p class="gc-report">
+              {g.total} object(s): {g.reachable} reachable, {g.unreachable} not.{" "}
+              {g.too_young > 0 ? `${g.too_young} of those are too recent to touch yet. ` : ""}
+              {g.dry_run
+                ? g.unreachable > g.too_young
+                  ? "Nothing has been removed."
+                  : "Nothing to reclaim."
+                : `Removed ${g.loose_removed + g.packed_dropped}, compacting ${g.segments_compacted} segment(s) and reclaiming ${humanSize(g.bytes_reclaimed)}.`}
+            </p>
+          ) : null}
+        </fkit-section>
+
+        <fkit-section heading="Delete" blurb="Nothing here can be undone from this page.">
           <fkit-danger>
             <fkit-danger-row
               name="Delete this repository"
