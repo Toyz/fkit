@@ -83,20 +83,22 @@ const sheet = css`
   .urow .mid { display: flex; justify-content: center; overflow: visible; }
   /* Real buttons rather than bare words: these disable and delete accounts,
      and the pair used to sit at the same weight as the text beside them. */
-  .urow .acts { display: flex; gap: 6px; justify-content: flex-end; overflow: visible; }
+  .urow .acts { display: flex; gap: 14px; justify-content: flex-end; overflow: visible; }
+  /* Same treatment as the token list: an action is text that colours and
+     underlines, never a box — a box is what a state wears. */
   .urow .acts button {
     font: inherit; font-size: 11.5px; font-family: var(--mono);
-    padding: 3px 8px; border-radius: var(--radius); cursor: pointer;
-    border: 1px solid transparent; background: none; color: var(--muted);
+    padding: 3px 0; cursor: pointer; border: 0; background: none;
+    color: var(--muted);
+    text-decoration: underline;
+    text-decoration-color: transparent;
+    text-underline-offset: 2px;
   }
   .urow .acts button:hover:not(:disabled) {
-    border-color: var(--border-hi); background: var(--bg); color: var(--text);
+    color: var(--text); text-decoration-color: currentColor;
   }
-  .urow .acts button.danger:hover:not(:disabled) {
-    border-color: color-mix(in srgb, var(--removed) 55%, transparent);
-    color: var(--removed);
-  }
-  .urow .acts button:disabled { opacity: .35; cursor: default; }
+  .urow .acts button.danger:hover:not(:disabled) { color: var(--removed); }
+  .urow .acts button:disabled { opacity: .35; cursor: default; text-decoration-color: transparent; }
 
   /* Filter. Worth having before the list is long enough to need scrolling —
      an administrator usually arrives looking for one person by name. */

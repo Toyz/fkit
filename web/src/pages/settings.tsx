@@ -90,7 +90,7 @@ const sheet = css`
      one destructive action. Fixed columns, because ragged ones down a list of
      ten tokens read as ten different layouts. */
   .tmeta {
-    display: grid; grid-template-columns: 88px 74px 56px;
+    display: grid; grid-template-columns: 88px 74px auto;
     align-items: center; gap: 10px; flex: none;
   }
 
@@ -107,17 +107,23 @@ const sheet = css`
   .chip.act:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
   .chip.act:disabled { opacity: .5; cursor: default; }
 
+  /* An action, not a state, and it has to read as one. Given a box on hover it
+     became a third chip identical to the two beside it, so the thing that
+     deletes a credential looked like a label describing one. Bare text
+     instead, pinned to the row's right edge so it does not drift with the
+     width of the word. */
   .revoke {
     font: inherit; font-family: var(--mono); font-size: 11px;
-    padding: 3px 0; width: 100%; cursor: pointer;
-    border: 1px solid transparent; border-radius: var(--radius);
-    background: none; color: var(--muted);
+    justify-self: end; padding: 3px 0; cursor: pointer;
+    border: 0; background: none; color: var(--muted);
+    text-decoration: underline;
+    text-decoration-color: transparent;
+    text-underline-offset: 2px;
   }
   .revoke:hover:not(:disabled) {
-    border-color: color-mix(in srgb, var(--removed) 55%, transparent);
-    color: var(--removed);
+    color: var(--removed); text-decoration-color: currentColor;
   }
-  .revoke:disabled { opacity: .5; cursor: default; }
+  .revoke:disabled { opacity: .5; cursor: default; text-decoration-color: transparent; }
 
   /* The token that was just made. Accented because it is the one thing on
      this page that cannot be recovered by reloading. */
