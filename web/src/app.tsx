@@ -43,7 +43,15 @@ const shell = css`
    * the visible area. That single movement was most of the page's layout
    * shift. Content growing below the fold is not something anyone perceives;
    * the footer sliding past their eyes is. */
-  main { flex: 1 0 auto; padding: 16px 0 48px; }
+  main {
+    flex: 1 0 auto;
+    padding: 16px 0 48px;
+    /* The rule the comment above describes, which had gone missing. Without
+       it the footer starts just under whatever has loaded so far and is shoved
+       down through the viewport by everything that arrives after — one
+       movement that was most of the page's measured layout shift. */
+    min-height: calc(100vh - 140px);
+  }
 
   footer { border-top: 1px solid var(--border); padding: 10px 0; color: var(--faint); font-size: 11px; }
   footer .wrap { display: flex; gap: 16px; flex-wrap: wrap; }
@@ -149,6 +157,7 @@ export class FkitApp extends LoomElement {
           </div>
         </header>
 
+        <fkit-to-top></fkit-to-top>
         <main>
           <loom-outlet></loom-outlet>
         </main>

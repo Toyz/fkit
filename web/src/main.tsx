@@ -22,6 +22,7 @@ import "./components/fkit-discussion";
 import "./components/fkit-modal";
 import "./components/fkit-label";
 import "./components/fkit-notice";
+import "./components/fkit-to-top";
 import "./components/fkit-file-tree";
 import "./icons";
 

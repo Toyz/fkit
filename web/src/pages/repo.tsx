@@ -53,6 +53,7 @@ import "../components/branch-picker";
 import "../components/clone-button";
 import "../components/fkit-select";
 import "../components/fkit-choice";
+import { treeOrder } from "../components/fkit-file-tree";
 import { adoptInto } from "../adopt";
 import { dirIcon, fileIcon } from "../file-icon";
 import { confirmAction } from "../components/fkit-dialog";
@@ -91,6 +92,56 @@ function splitRefSpec(spec: string): { repo: string | null; branch: string } {
   const i = spec.indexOf(":");
   if (i < 0) return { repo: null, branch: spec };
   return { repo: spec.slice(0, i), branch: spec.slice(i + 1) };
+}
+
+/**
+ * How many files of a change to render at once.
+ *
+ * A commit touching hundreds of files costs its whole layout before any of it
+ * can be read, and almost nobody reads past the first few. The rest are one
+ * button away.
+ */
+const FILE_PAGE = 12;
+
+/**
+ * Files this viewer has said they are done with, keyed by content.
+ *
+ * Keyed by the file's *hash*, not its path, and that is what makes the hard
+ * part free: when someone pushes a change to a file you had marked as read, it
+ * becomes a different blob, so it is silently no longer marked. The state
+ * expires exactly when it stops being true, with nothing to invalidate.
+ *
+ * Local to the browser, because "I have read this" is a fact about a person,
+ * not about the change — it is not the server's to hold, and two reviewers do
+ * not share one answer.
+ */
+const VIEWED_KEY = "fkit:viewed";
+
+function readViewed(): Record<string, true> {
+  try {
+    return JSON.parse(localStorage.getItem(VIEWED_KEY) ?? "{}") as Record<string, true>;
+  } catch {
+    // A browser that refuses storage, or a value someone hand-edited. Losing
+    // the marks is not worth an error.
+    return {};
+  }
+}
+
+function writeViewed(v: Record<string, true>) {
+  try {
+    localStorage.setItem(VIEWED_KEY, JSON.stringify(v));
+  } catch {
+    /* private window, or the quota is full; the marks are a convenience */
+  }
+}
+
+/** A change's files, in the order the file tree lists them. */
+function inTreeOrder(files: FileDiff[]): FileDiff[] {
+  const order = treeOrder(
+    files.map((f) => ({ path: f.path, status: f.status, added: f.added, removed: f.removed })),
+  );
+  const at = new Map(order.map((p, i) => [p, i]));
+  return [...files].sort((a, b) => (at.get(a.path) ?? 0) - (at.get(b.path) ?? 0));
 }
 
 /** Two comments on the same line of the same version of the same file. */
@@ -308,17 +359,29 @@ const sheet = css`
   /* Tile, name, and what is true of it — the same three-part header the
      settings, profile and issue pages use, so a repository does not announce
      itself in a different voice from everything else. */
+  /* Aligned to the top rather than the middle. Centring worked until a fork
+     added a "forked from" line under the name: the block grew, its centre
+     moved down, and the badges and the button drifted below the title they
+     belong to. */
   .rhead {
     display: grid; grid-template-columns: auto minmax(0, 1fr) auto;
-    align-items: center; gap: 12px;
-    padding: 4px 0 8px;
+    align-items: start; gap: 12px;
+    padding: 4px 0 10px;
   }
   .rmid { min-width: 0; }
-  .rmeta { display: flex; align-items: center; gap: 8px; flex: none; }
+  /* The title line is 26px tall; this puts the badges and the button on it
+     rather than above or below it. */
+  .rhead > fkit-avatar { margin-top: 1px; }
+  .rmeta {
+    display: flex; align-items: center; gap: 8px; flex: none;
+    min-height: 26px;
+  }
 
   .rhead .p {
     font-size: 18px; font-weight: 500; letter-spacing: -0.01em; margin: 0;
     display: flex; min-width: 0;
+    /* Matches .rmeta, so the name and the controls share one line. */
+    min-height: 26px; align-items: center;
   }
   /* The accent sits under the name itself, exactly as it does under a section
      heading — the mark that says which page you are on. */
@@ -728,6 +791,8 @@ const sheet = css`
     display: flex; align-items: baseline; gap: 11px; flex-wrap: wrap;
     padding-bottom: 9px; border-bottom: 1px solid var(--border);
   }
+  .sline .grow { flex: 1; }
+  .sline .btn { font-size: 11.5px; align-self: center; }
   .sline h1 {
     font-size: 19px; font-weight: 500; letter-spacing: -0.01em;
     margin: 0; overflow-wrap: anywhere;
@@ -741,6 +806,7 @@ const sheet = css`
   .sby .who { color: var(--text); font-weight: 600; text-decoration: none; }
   .sby .who:hover { color: var(--accent); }
   .sby .ex { color: var(--faint); font-family: var(--mono); font-size: 11.5px; }
+  .sby .dot { color: var(--border-hi); }
   .sby .ex .exlink { color: var(--muted); text-decoration: none; }
   .sby .ex .exlink:hover { color: var(--accent); }
 
@@ -929,6 +995,12 @@ const sheet = css`
     font-size: 11.5px; font-family: var(--sans);
   }
   .more:hover { background: var(--surface); color: var(--text); border-color: var(--border); }
+  /* The cap between files, rather than inside one: it sits on its own with
+     the same weight as a file header, because it stands where a file would. */
+  .more.files {
+    border: 1px solid var(--border); border-radius: var(--radius);
+    margin-top: 10px; padding: 9px 0;
+  }
   .more loom-icon.closed { transform: rotate(180deg); }
 
   /* The merge request's own tabs, under its header. Quieter than the
@@ -1002,6 +1074,49 @@ const sheet = css`
     display: flex; align-items: center; gap: 6px;
     font-size: 11.5px; color: var(--added); font-family: var(--sans);
   }
+
+  /* "I am done with this file."
+   *
+   * A pill rather than a checkbox with a label beside it. The stock control
+   * is the operating system's shape and reads as something that wandered in
+   * from another program; and the base sheet styles every label element as an
+   * uppercase form caption, which this inherited — hence the shouting, and
+   * the letter-spacing that pushed it three pixels out of line with the rest
+   * of the row.
+   */
+  .df .viewed {
+    display: inline-flex; align-items: center; gap: 6px;
+    flex: none; height: 20px; padding: 0 10px;
+    border: 1px solid var(--border-hi); border-radius: 999px;
+    background: var(--bg); color: var(--muted);
+    cursor: pointer; user-select: none;
+    /* Undo the caption styling inherited from the base sheet. */
+    font-family: var(--mono); font-size: 11px; line-height: 1;
+    text-transform: none; letter-spacing: 0;
+    transition: background .1s, border-color .1s, color .1s;
+  }
+  .df .viewed:hover { border-color: var(--faint); color: var(--text); }
+  .df .viewed.on {
+    background: color-mix(in srgb, var(--added) 16%, transparent);
+    border-color: color-mix(in srgb, var(--added) 55%, transparent);
+    color: var(--added);
+    padding-left: 7px;
+  }
+
+  /* The real input stays and stays focusable — it is what a keyboard and a
+     screen reader use. It is simply not what is drawn. */
+  .df .viewed input {
+    position: absolute; opacity: 0; width: 0; height: 0; margin: 0;
+  }
+  .df .viewed .box { display: flex; align-items: center; color: var(--faint); }
+  .df .viewed.on .box { color: var(--added); }
+  .df .viewed:focus-within {
+    outline: 2px solid var(--accent); outline-offset: 1px;
+  }
+
+  /* A file that has been read stays in the list, dimmed, so the shape of the
+     change does not change as it is reviewed. */
+  .df:has(.viewed.on) .df-head { opacity: .72; }
 
   /* ---- a comment pinned to a line ---- */
   .dl { position: relative; }
@@ -1443,6 +1558,13 @@ export class PageRepo extends LoomElement {
   /// not a diff anyone reads top to bottom, and rendering it costs the same
   /// whether or not they do.
   @reactive accessor wholeFile: Record<string, boolean> = {};
+  /// How many of a change's files to render. A commit touching two hundred
+  /// files is a page nobody reads top to bottom, and laying all of it out
+  /// before anything is usable is the pop-in.
+  @reactive accessor filesShown = FILE_PAGE;
+  /// Files marked read, by content hash. Loaded once per page rather than
+  /// read from storage on every render.
+  @reactive accessor viewed: Record<string, true> = readViewed();
   /// Which issues the list is showing. Part of the query URL, so changing it
   /// refetches rather than filtering a list that was never loaded.
   @reactive accessor issueFilter: "open" | "closed" | "all" = "open";
@@ -1773,6 +1895,8 @@ export class PageRepo extends LoomElement {
 
     this.copied = false;
     this.copiedKey = "";
+    this.filesShown = FILE_PAGE;
+    this.wholeFile = {};
     this.topicDraft = null;
     this.notice = "";
     this.busy = false;
@@ -2267,42 +2391,99 @@ export class PageRepo extends LoomElement {
     return <div class="panel commits">{out}</div>;
   }
 
+  /// One commit: what it says, what it touched, and what it points at.
+  ///
+  /// Built from the same pieces a merge request is — the breadcrumb, the file
+  /// tree beside the diff, the sidebar of facts — because it is the same
+  /// question asked of one commit rather than a range, and answering it in a
+  /// different shape made the two feel like different programs.
   private renderCommitDetail() {
     const d = this.detail!;
     const at = this.loc!;
     const body = d.message.split("\n").slice(1).join("\n").trim();
     const browse = `/${at.owner}/${at.name}/tree/${d.hash}`;
+    const history = `/${at.owner}/${at.name}/commits/${this.refName()}`;
+    const files = this.patch?.files ?? [];
 
     return (
-      <div>
-        {/* One block, not two stacked boxes: the message is the headline, the
-            metadata is a quiet line under it, and the actions sit on the
-            baseline of the headline where the eye already is. */}
-        <div class="chead">
-          <div class="chead-top">
-            <h2 class="csummary">{d.summary || "(no message)"}</h2>
+      <div class="wrap">
+        <div class="subject">
+          <div class="crumbs">
+            <a href={history} onClick={linkHandler(history)}>history</a>
+            <span class="sep">/</span>
+            <span class="cur">{d.short}</span>
+          </div>
+
+          <div class="sline">
+            <h1>{d.summary || "(no message)"}</h1>
+            {d.parents.length > 1 ? (
+              <span class="mstate merged">
+                <loom-icon name="merge" size={11}></loom-icon>merge
+              </span>
+            ) : null}
+            <span class="grow"></span>
             <a class="btn" href={browse} onClick={linkHandler(browse)}>
               <loom-icon name="folder" size={12}></loom-icon> browse files
             </a>
           </div>
-          {body ? <pre class="cbody">{body}</pre> : null}
-          <div class="cmeta">
+
+          {/* One sentence: who, when, and what it is. These were a separate
+              bar of disconnected fragments under the header, which read as a
+              toolbar that had lost its buttons. */}
+          <div class="sby">
+            <fkit-avatar name={authorName(d.author)} size={20}></fkit-avatar>
             <span class="who">{authorName(d.author)}</span>
-            <span>{relativeTime(d.timestamp)}</span>
-            <span class="hash">{d.short}</span>
-            {d.parents.length > 1 ? <span class="tag on">merge</span> : null}
-            {d.parents.map((pp, i) => {
-              const href = `/${at.owner}/${at.name}/commit/${pp}`;
-              return (
-                <span class="parent">
-                  {d.parents.length > 1 ? `parent ${i + 1}` : "parent"}{" "}
-                  <a href={href} onClick={linkHandler(href)}>{pp.slice(0, 10)}</a>
+            <span>committed {relativeTime(d.timestamp)}</span>
+            <span class="dot">·</span>
+            <span class="ex mono">{d.short}</span>
+            {d.parents.length > 0 ? (
+              <>
+                <span class="dot">·</span>
+                <span class="ex">
+                  {d.parents.length > 1 ? "parents " : "parent "}
+                  {d.parents.map((pp, i) => {
+                    const href = `/${at.owner}/${at.name}/commit/${pp}`;
+                    return (
+                      <>
+                        {i > 0 ? " " : ""}
+                        <a class="exlink" href={href} onClick={linkHandler(href)}>
+                          {pp.slice(0, 10)}
+                        </a>
+                      </>
+                    );
+                  })}
                 </span>
-              );
-            })}
+              </>
+            ) : (
+              <>
+                <span class="dot">·</span>
+                <span class="ex">the first commit</span>
+              </>
+            )}
           </div>
         </div>
-        {this.renderPatch(d)}
+
+        {body ? <div class="sdesc">{body}</div> : null}
+
+        <div class="review">
+          {/* Drawn at its final size while the patch is in flight, so the diff
+              beside it does not jump down the page when the files land. */}
+          <fkit-file-tree
+            loading={this.patch === null}
+            files={files.map((f) => ({
+              path: f.path,
+              status: f.status,
+              added: f.added,
+              removed: f.removed,
+            }))}
+            active={this.viewing}
+            onPick={(e: Event) => this.jumpToFile((e as CustomEvent<string>).detail)}
+          ></fkit-file-tree>
+
+          <div>
+            {this.renderPatch(d)}
+          </div>
+        </div>
       </div>
     );
   }
@@ -2336,7 +2517,12 @@ export class PageRepo extends LoomElement {
       }
       hidden = total - used;
     }
-    const isOpen = !this.collapsed[f.path];
+    // A file's identity for "have I read this" is its content, so the mark
+    // survives an unrelated push and vanishes the moment this file changes.
+    const mark = f.new_hash ?? f.old_hash ?? f.path;
+    const seen = !!this.viewed[mark];
+    // Marking it read collapses it; that is the point of marking it.
+    const isOpen = !this.collapsed[f.path] && !seen;
     const lang = languageFor(f.path);
     const ref = atRef ?? this.detail?.hash ?? this.refName();
     const href = `/${at.owner}/${at.name}/blob/${ref}/${f.path}`;
@@ -2369,6 +2555,38 @@ export class PageRepo extends LoomElement {
             {f.added > 0 ? <span class="plus">+{f.added}</span> : null}
             {f.removed > 0 ? <span class="minus">{`−${f.removed}`}</span> : null}
           </span>
+
+          {/* Not gated on being able to comment: marking a file read is a
+              note to yourself, kept in your own browser, and is as useful
+              reading a commit as reviewing a change. */}
+          {this.session.isAuthed ? (
+            <label class={`viewed ${seen ? "on" : ""}`} title="Mark this file as read">
+              <input
+                type="checkbox"
+                checked={seen}
+                onChange={() => {
+                  const next = { ...this.viewed };
+                  if (seen) {
+                    delete next[mark];
+                  } else {
+                    next[mark] = true;
+                  }
+                  this.viewed = next;
+                  writeViewed(next);
+                }}
+              />
+              {/* A mark only once there is something to mark. An icon in the
+                  unchecked state has to stand for "not done", and every glyph
+                  that tries reads as a control that is broken rather than
+                  one that is off. */}
+              {seen ? (
+                <span class="box">
+                  <loom-icon name="check" size={11}></loom-icon>
+                </span>
+              ) : null}
+              viewed
+            </label>
+          ) : null}
         </div>
 
         {!isOpen ? null : f.too_large ? (
@@ -2515,6 +2733,42 @@ export class PageRepo extends LoomElement {
           <a class="btn" href={whatIsNew} onClick={linkHandler(whatIsNew)}>
             see what is new
           </a>
+        ) : null}
+      </div>
+    );
+  }
+
+  /// A change's files, a screenful at a time.
+  ///
+  /// Rendering two hundred diffs before any of them can be read is what makes
+  /// a large change arrive as a lurch. The rest are one button away, and the
+  /// button says how many so nobody has to guess whether it is worth pressing.
+  private renderFiles(all: FileDiff[], atRef: string, extra?: (f: FileDiff) => unknown) {
+    // Sorted by the tree's own ordering function, so the list beside the tree
+    // is the list the tree is showing. Sorting them separately and hoping they
+    // agree is how picking the third row lands on the twentieth diff.
+    const files = inTreeOrder(all);
+    const shown = files.slice(0, this.filesShown);
+    const hidden = files.length - shown.length;
+
+    return (
+      <div>
+        {shown.map((f) => (
+          <>
+            {this.renderFileDiff(f, atRef)}
+            {extra ? extra(f) : null}
+          </>
+        ))}
+
+        {hidden > 0 ? (
+          <button
+            type="button"
+            class="more files"
+            onClick={() => (this.filesShown += FILE_PAGE)}
+          >
+            <loom-icon name="chevron" size={12}></loom-icon>
+            show {hidden.toLocaleString()} more {hidden === 1 ? "file" : "files"}
+          </button>
         ) : null}
       </div>
     );
@@ -2920,7 +3174,7 @@ export class PageRepo extends LoomElement {
             </span>
           ) : null}
         </div>
-        {this.patch.files.map((f) => this.renderFileDiff(f))}
+        {this.renderFiles(this.patch.files, this.detail?.hash ?? this.refName())}
       </div>
     );
   }
@@ -3979,14 +4233,7 @@ fkit push</pre>
                   onPick={(e: Event) => this.jumpToFile((e as CustomEvent<string>).detail)}
                 ></fkit-file-tree>
 
-                <div>
-                  {c.files.map((f) => (
-                    <>
-                      {this.renderFileDiff(f, m.source_branch)}
-                      {this.renderOutdated(f)}
-                    </>
-                  ))}
-                </div>
+                {this.renderFiles(c.files, m.source_branch, (f) => this.renderOutdated(f))}
               </div>
               )
             ) : null}
@@ -4121,10 +4368,26 @@ fkit push</pre>
   }
 
   /// Scroll a file into view when it is picked from the tree.
+  ///
+  /// A file past the render cap has no anchor to scroll to yet, so the cap is
+  /// raised far enough to include it first. Without this, picking the
+  /// twentieth file of a large change silently did nothing — the tree listed
+  /// it, and clicking it went nowhere.
   private jumpToFile(path: string) {
     this.viewing = path;
-    const el = this.shadowRoot?.querySelector(`[data-file="${CSS.escape(path)}"]`);
-    el?.scrollIntoView({ behavior: "smooth", block: "start" });
+
+    const files = inTreeOrder(this.patch?.files ?? this.mr?.comparison?.files ?? []);
+    const at = files.findIndex((f) => f.path === path);
+    if (at >= this.filesShown) {
+      this.filesShown = at + 1;
+    }
+
+    // After the render that the line above may have caused, so the anchor
+    // exists by the time it is looked for.
+    requestAnimationFrame(() => {
+      const el = this.shadowRoot?.querySelector(`[data-file="${CSS.escape(path)}"]`);
+      el?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
   }
 
   /// Comments written against a version of this file that no longer exists.
@@ -5012,21 +5275,48 @@ fkit push</pre>
     const r = this.repo;
 
     if (!r) {
+      // The owner and the name are in the URL, so the header does not have to
+      // wait for the server to know what it says. Rendering it immediately,
+      // at its final size, is what stops everything below being shoved down
+      // when the repository arrives — that one movement was most of the
+      // page's layout shift.
       return (
         <div class="wrap">
           <div class="head">
-            <div class="title">
-              <span class="sk" style="width:14px;height:14px"></span>
-              <span class="sk tall" style="width:200px"></span>
-              <span class="sk" style="width:48px"></span>
+            <div class="rhead">
+              <fkit-avatar name={`${at.owner}/${at.name}`} glyph="repo" size={34}></fkit-avatar>
+              <div class="rmid">
+                <h1 class="p">
+                  <span class="t">
+                    <span class="own">{at.owner}</span>
+                    <span class="sl">/</span>
+                    <span class="nm">{at.name}</span>
+                  </span>
+                </h1>
+              </div>
+              <span class="rmeta"></span>
             </div>
-            <div class="tabs" style="gap:14px;padding:5px 0 9px">
-              <span class="sk" style="width:36px"></span>
-              <span class="sk" style="width:48px"></span>
+            <div class="desc"><span class="sk" style="width:min(46%,340px)"></span></div>
+            <div class="tabs">
+              {["files", "history", "issues", "merges", "compare"].map((t) => (
+                <a class={t === "files" ? "on" : ""} href="#" onClick={(e: Event) => e.preventDefault()}>
+                  <loom-icon
+                    name={
+                      t === "files" ? "file"
+                        : t === "history" ? "history"
+                          : t === "issues" ? "alert"
+                            : t === "merges" ? "merge"
+                              : "compare"
+                    }
+                    size={12}
+                  ></loom-icon>
+                  {t}
+                </a>
+              ))}
             </div>
           </div>
           <div class="panel files">
-            {[0, 1, 2, 3, 4].map(() => (
+            {[0, 1, 2, 3, 4, 5, 6, 7].map(() => (
               <div class="r sk-row">
                 <span class="sk" style="width:13px;height:13px"></span>
                 <span class="sk" style="width:min(70%,150px)"></span>
