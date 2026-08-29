@@ -23,6 +23,7 @@ import {
   humanSize,
   syncUrl,
   relativeTime,
+  type Comment,
   type GcReport,
   type BlobResponse,
   type TreeResponse,
@@ -584,6 +585,71 @@ const sheet = css`
     margin: 12px 0 0; line-height: 1.5; max-width: 78ch;
   }
 
+  /* ---- reviewing a change ----------------------------------------------
+   *
+   * A file tree beside the diff rather than above it. Twenty stacked panels
+   * told you nothing about the shape of a change and gave you no way to reach
+   * the one file you came for; the tree is the map, and it stays put while the
+   * diff scrolls under it.
+   */
+  .review {
+    display: grid;
+    grid-template-columns: 264px minmax(0, 1fr);
+    gap: 18px;
+    align-items: start;
+    margin-top: 14px;
+  }
+  @media (max-width: 1000px) {
+    .review { grid-template-columns: 1fr; }
+    .review fkit-file-tree { position: static; }
+  }
+  .review fkit-file-tree { position: sticky; top: 52px; }
+
+  /* Scrolled to from the tree: the sticky header must not land on top of the
+     filename you just asked for. */
+  .df { scroll-margin-top: 56px; }
+
+  /* ---- a comment pinned to a line ---- */
+  .dl { position: relative; }
+  /* The gutter button only appears on the row under the pointer — a plus on
+     every line of a thousand-line diff is noise, not an affordance. */
+  .dl .addc {
+    position: absolute; left: 2px; top: 50%; transform: translateY(-50%);
+    width: 17px; height: 17px; padding: 0; display: none;
+    align-items: center; justify-content: center;
+    border: 0; border-radius: 3px; cursor: pointer;
+    background: var(--accent); color: var(--bg); z-index: 2;
+  }
+  .dl:hover .addc { display: flex; }
+  .dl .addc:hover { filter: brightness(1.12); }
+
+  .thread {
+    padding: 10px 12px 12px calc(var(--gutter, 96px));
+    border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+    display: flex; flex-direction: column; gap: 9px;
+  }
+  .thread .stale {
+    font-family: var(--sans); font-size: 11.5px; color: var(--modified);
+  }
+  .thread-out {
+    display: flex; flex-direction: column; gap: 9px;
+    padding: 11px 12px; border-top: 1px solid var(--border);
+    background: var(--surface);
+  }
+  .thread-out .where {
+    font-size: 11.5px; color: var(--muted); font-family: var(--sans);
+  }
+  .thread-out .where b { font-family: var(--mono); font-weight: 400; color: var(--text); }
+
+  /* ---- the conversation under a merge request or an issue ---- */
+  .talk { display: flex; flex-direction: column; gap: 12px; margin-top: 18px; }
+  .talk .none {
+    font-family: var(--sans); font-size: 12.5px; color: var(--faint);
+    padding: 4px 0;
+  }
+
   /* ---- setup instructions ---- */
   /* A centred column: the panel is full width but the instructions are a
      reading measure, and left-anchoring them left a dead half-screen. */
@@ -946,6 +1012,13 @@ export class PageRepo extends LoomElement {
   /// The last collection report, kept so a dry run can be read before the
   /// real one is asked for.
   @reactive accessor gcReport: GcReport | null = null;
+
+  /// Which line is being written on. Keyed `path:side:line` so one composer
+  /// is open at a time — two half-written comments on one screen is a way to
+  /// lose one.
+  @reactive accessor writingAt = "";
+  /// Which file the tree should highlight.
+  @reactive accessor viewing = "";
   /**
    * The line diff, which can be real work on a large commit. It is its own
    * query so the summary is not waiting behind it — and being keyed by the
@@ -1005,6 +1078,23 @@ export class PageRepo extends LoomElement {
     init: { credentials: "same-origin" },
   })
   accessor mrQuery!: ApiState<MergeRequestDetail>;
+
+  @query<Comment[]>({
+    url: (el: PageRepo) =>
+      `/api/repos/${el.loc!.owner}/${el.loc!.name}/merges/${
+        el.loc!.view.kind === "merge" ? el.loc!.view.number : 0
+      }/comments`,
+    enabled: (el: PageRepo) =>
+      Boolean(el.loc && el.repoQuery.data && el.loc.view.kind === "merge"),
+    init: { credentials: "same-origin" },
+  })
+  accessor commentsQuery!: ApiState<Comment[]>;
+
+  /// Null while unknown, which is not the same as "nobody has said anything"
+  /// — the difference decides whether the page shows a skeleton or a prompt.
+  private get comments(): Comment[] | null {
+    return this.commentsQuery.data ?? null;
+  }
 
   private get mr(): MergeRequestDetail | null {
     return this.mrQuery.data ?? null;
@@ -1669,13 +1759,16 @@ export class PageRepo extends LoomElement {
   /** One file's diff: a header strip, then its hunks. */
   private renderFileDiff(f: FileDiff, atRef?: string) {
     const at = this.loc!;
+    // Only a merge request has somewhere to attach a line comment, and only a
+    // signed-in viewer can write one.
+    const canTalk = this.comments !== null && this.session.isAuthed;
     const isOpen = !this.collapsed[f.path];
     const lang = languageFor(f.path);
     const ref = atRef ?? this.detail?.hash ?? this.refName();
     const href = `/${at.owner}/${at.name}/blob/${ref}/${f.path}`;
 
     return (
-      <div class="df" loom-key={f.path}>
+      <div class="df" loom-key={f.path} data-file={f.path}>
         <div class="df-head">
           <button
             class="bare df-toggle"
@@ -1727,15 +1820,37 @@ export class PageRepo extends LoomElement {
                   // Highlighting is per line here: a hunk is a fragment, so
                   // multi-line constructs have no context to carry anyway.
                   const toks = highlight(l.text, lang)[0] ?? [];
+                  // A comment belongs to a side: on a removed line it is about
+                  // the old file, on anything else about the new one.
+                  const side: "old" | "new" = l.op === "-" ? "old" : "new";
+                  const no = side === "old" ? l.old_no : l.new_no;
+                  const blob = side === "old" ? f.old_hash : f.new_hash;
+                  const key = no && blob ? `${f.path}:${side}:${no}` : "";
+                  const here = key ? this.lineComments(f, side, no!) : [];
+
                   return (
-                    <div class={`dl ${cls}`}>
-                      <span class="no">{l.old_no ?? ""}</span>
-                      <span class="no">{l.new_no ?? ""}</span>
-                      <span class="mk">{l.op}</span>
-                      <span class="dsrc">
-                        {toks.length === 0 ? " " : toks.map((t) => <span class={t.c}>{t.t}</span>)}
-                      </span>
-                    </div>
+                    <>
+                      <div class={`dl ${cls}`}>
+                        {canTalk && key ? (
+                          <button
+                            class="addc"
+                            title="Comment on this line"
+                            onClick={() => (this.writingAt = this.writingAt === key ? "" : key)}
+                          >
+                            <loom-icon name="plus" size={11}></loom-icon>
+                          </button>
+                        ) : null}
+                        <span class="no">{l.old_no ?? ""}</span>
+                        <span class="no">{l.new_no ?? ""}</span>
+                        <span class="mk">{l.op}</span>
+                        <span class="dsrc">
+                          {toks.length === 0 ? " " : toks.map((t) => <span class={t.c}>{t.t}</span>)}
+                        </span>
+                      </div>
+                      {here.length || this.writingAt === key
+                        ? this.renderThread(here, key, blob ?? "", f.path, side, no ?? 0)
+                        : null}
+                    </>
                   );
                 })}
               </div>
@@ -1744,6 +1859,121 @@ export class PageRepo extends LoomElement {
         )}
       </div>
     );
+  }
+
+  /// Comments anchored to one line of one side of a file.
+  ///
+  /// Matched on the *content* hash, not the path: the same file at a different
+  /// version is a different blob, so a comment written against an older
+  /// version simply does not appear here — which is what makes it possible to
+  /// say it is outdated rather than draw it against a line it never described.
+  private lineComments(f: FileDiff, side: "old" | "new", line: number): Comment[] {
+    const blob = side === "old" ? f.old_hash : f.new_hash;
+    if (!blob) return [];
+    return (this.comments ?? []).filter(
+      (c) => c.blob === blob && c.side === side && c.line === line,
+    );
+  }
+
+  /// Comments on a file whose content has moved on since they were written.
+  private staleComments(f: FileDiff): Comment[] {
+    const live = new Set([f.old_hash, f.new_hash].filter(Boolean) as string[]);
+    return (this.comments ?? []).filter(
+      (c) => c.file_path === f.path && c.blob && !live.has(c.blob),
+    );
+  }
+
+  /// A line's thread, and the box to add to it.
+  private renderThread(
+    here: Comment[],
+    key: string,
+    blob: string,
+    path: string,
+    side: "old" | "new",
+    line: number,
+  ) {
+    const me = this.session.current?.username;
+    const open = this.writingAt === key;
+
+    return (
+      <div class="thread">
+        {here.map((c) => (
+          <fkit-comment
+            loom-key={c.id}
+            author={c.author ?? ""}
+            when={relativeTime(c.created_at)}
+            body={c.body}
+            edited={!!c.edited_at}
+            mine={c.author === me}
+          >
+            {c.author === me ? (
+              <span slot="actions">
+                <button class="bare danger" onClick={() => void this.removeComment(c.id)}>
+                  delete
+                </button>
+              </span>
+            ) : null}
+          </fkit-comment>
+        ))}
+
+        {open ? (
+          <fkit-composer
+            compact
+            label="Comment"
+            placeholder={`Comment on line ${line}`}
+            busy={this.busy}
+            onSend={(e: Event) =>
+              void this.postComment((e as CustomEvent<string>).detail, {
+                file_path: path,
+                line,
+                side,
+                blob,
+              })
+            }
+          >
+            <button slot="extra" class="bare" onClick={() => (this.writingAt = "")}>
+              cancel
+            </button>
+          </fkit-composer>
+        ) : null}
+      </div>
+    );
+  }
+
+  /// Post a comment on the merge request being viewed.
+  ///
+  /// The composer is cleared only after the request lands, so a failed post
+  /// never costs someone what they wrote.
+  private async postComment(body: string, anchor?: {
+    file_path: string; line: number; side: "old" | "new"; blob: string;
+  }) {
+    const at = this.loc!;
+    const v = at.view;
+    if (v.kind !== "merge") return;
+    await this.act(async () => {
+      await api.commentOnMerge(at.owner, at.name, v.number, { body, ...(anchor ?? {}) });
+      await this.commentsQuery.refetch();
+      this.writingAt = "";
+      for (const el of this.shadowRoot?.querySelectorAll("fkit-composer") ?? []) {
+        (el as HTMLElement & { clear(): void }).clear();
+      }
+    });
+  }
+
+  private async removeComment(id: string) {
+    const at = this.loc!;
+    if (at.view.kind !== "merge") return;
+    const ok = await confirmAction({
+      title: "Delete this comment?",
+      body: "It is removed for everyone. This cannot be undone.",
+      confirm: "Delete",
+      danger: true,
+    });
+    if (!ok) return;
+    await this.act(async () => {
+      await api.deleteComment(at.owner, at.name, id);
+      await this.commentsQuery.refetch();
+    });
   }
 
   private renderPatch(d: CommitDetail) {
@@ -2332,17 +2562,127 @@ fkit push</pre>
             ) : null}
 
             {c.files.length > 0 ? (
-              <div>
-                <div class="patch-bar">
-                  <span>{c.files.length} file(s) changed</span>
-                  <span class="plus">+{c.files.reduce((a, f) => a + f.added, 0)}</span>
-                  <span class="minus">{`\u2212${c.files.reduce((a, f) => a + f.removed, 0)}`}</span>
+              <div class="review">
+                <fkit-file-tree
+                  files={c.files.map((f) => ({
+                    path: f.path,
+                    status: f.status,
+                    added: f.added,
+                    removed: f.removed,
+                  }))}
+                  active={this.viewing}
+                  onPick={(e: Event) => this.jumpToFile((e as CustomEvent<string>).detail)}
+                ></fkit-file-tree>
+
+                <div>
+                  {c.files.map((f) => (
+                    <>
+                      {this.renderFileDiff(f, m.source_branch)}
+                      {this.renderOutdated(f)}
+                    </>
+                  ))}
                 </div>
-                {c.files.map((f) => this.renderFileDiff(f, m.source_branch))}
               </div>
             ) : null}
+
+            {this.renderConversation(m.number)}
           </div>
         )}
+      </div>
+    );
+  }
+
+  /// Scroll a file into view when it is picked from the tree.
+  private jumpToFile(path: string) {
+    this.viewing = path;
+    const el = this.shadowRoot?.querySelector(`[data-file="${CSS.escape(path)}"]`);
+    el?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  /// Comments written against a version of this file that no longer exists.
+  ///
+  /// Shown under the file rather than beside a line, because the line they
+  /// described is gone. Drawing them against whatever now occupies that line
+  /// number would be worse than not drawing them at all.
+  private renderOutdated(f: FileDiff) {
+    const stale = this.staleComments(f);
+    if (stale.length === 0) return null;
+    const me = this.session.current?.username;
+
+    return (
+      <div class="thread-out">
+        <div class="where">
+          {stale.length} {stale.length === 1 ? "comment" : "comments"} on an earlier version of{" "}
+          <b>{f.path}</b>. The lines they were written against have changed.
+        </div>
+        {stale.map((c) => (
+          <fkit-comment
+            loom-key={c.id}
+            author={c.author ?? ""}
+            when={`${relativeTime(c.created_at)} · line ${c.line}`}
+            body={c.body}
+            edited={!!c.edited_at}
+            mine={c.author === me}
+          >
+            {c.author === me ? (
+              <span slot="actions">
+                <button class="bare danger" onClick={() => void this.removeComment(c.id)}>
+                  delete
+                </button>
+              </span>
+            ) : null}
+          </fkit-comment>
+        ))}
+      </div>
+    );
+  }
+
+  /// The comments that are about the change as a whole rather than a line.
+  private renderConversation(number: number) {
+    const all = this.comments;
+    const talk = (all ?? []).filter((c) => !c.blob);
+    const me = this.session.current?.username;
+
+    return (
+      <div class="talk">
+        <div class="patch-bar">
+          <span>Conversation</span>
+          {all ? <span class="muted">{talk.length}</span> : null}
+        </div>
+
+        {all === null ? (
+          <span class="sk" style="width:200px"></span>
+        ) : talk.length === 0 ? (
+          <div class="none">Nothing said yet about this change as a whole.</div>
+        ) : (
+          talk.map((c) => (
+            <fkit-comment
+              loom-key={c.id}
+              author={c.author ?? ""}
+              when={relativeTime(c.created_at)}
+              body={c.body}
+              edited={!!c.edited_at}
+              mine={c.author === me}
+            >
+              {c.author === me ? (
+                <span slot="actions">
+                  <button class="bare danger" onClick={() => void this.removeComment(c.id)}>
+                    delete
+                  </button>
+                </span>
+              ) : null}
+            </fkit-comment>
+          ))
+        )}
+
+        {this.session.isAuthed ? (
+          <fkit-composer
+            label="Comment"
+            placeholder="Leave a comment on this merge request"
+            busy={this.busy}
+            onSend={(e: Event) => void this.postComment((e as CustomEvent<string>).detail)}
+          ></fkit-composer>
+        ) : null}
       </div>
     );
   }

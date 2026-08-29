@@ -18,6 +18,8 @@ import "./components/fkit-toggle";
 import "./components/fkit-settings";
 import "./components/fkit-tags";
 import "./components/fkit-avatar";
+import "./components/fkit-discussion";
+import "./components/fkit-file-tree";
 import "./icons";
 
 import "./session";

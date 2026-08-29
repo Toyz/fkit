@@ -43,6 +43,45 @@ export interface Repo {
   tags: number;
 }
 
+export interface Issue {
+  number: number;
+  title: string;
+  body: string | null;
+  state: "open" | "closed";
+  author: string | null;
+  closed_at: string | null;
+  created_at: string;
+  updated_at: string;
+  comments: number;
+}
+
+export interface Comment {
+  id: string;
+  author: string | null;
+  body: string;
+  /** All four together, or all absent on a conversation comment. */
+  file_path: string | null;
+  line: number | null;
+  side: "old" | "new" | null;
+  /**
+   * The hash of the file this was written against. The diff matches it against
+   * what it is rendering; no match means the file changed since, and the
+   * comment is shown where it was written rather than moved somewhere wrong.
+   */
+  blob: string | null;
+  created_at: string;
+  edited_at: string | null;
+}
+
+export interface NewComment {
+  body: string;
+  file_path?: string;
+  line?: number;
+  side?: "old" | "new";
+  blob?: string;
+  commit?: string;
+}
+
 export interface GcReport {
   dry_run: boolean;
   total: number;
@@ -136,6 +175,9 @@ export interface FileDiff {
   hunks: Hunk[];
   old_size: number;
   new_size: number;
+  /** Each side's content hash; what a line comment anchors to. */
+  old_hash: string | null;
+  new_hash: string | null;
 }
 
 export interface Patch {
@@ -469,6 +511,50 @@ export const api = {
     request<Repo>(`/repos/${owner}/${name}`, { method: "PATCH", body: body(input) }),
   deleteRepo: (owner: string, name: string) =>
     request<{ ok: boolean }>(`/repos/${owner}/${name}`, { method: "DELETE" }),
+
+  issues: (owner: string, name: string, state: "open" | "closed" | "all" = "open") =>
+    request<Issue[]>(`/repos/${owner}/${name}/issues?state=${state}`),
+  issue: (owner: string, name: string, number: number) =>
+    request<Issue>(`/repos/${owner}/${name}/issues/${number}`),
+  createIssue: (owner: string, name: string, input: { title: string; body?: string }) =>
+    request<Issue>(`/repos/${owner}/${name}/issues`, { method: "POST", body: body(input) }),
+  editIssue: (
+    owner: string,
+    name: string,
+    number: number,
+    input: { title?: string; body?: string },
+  ) =>
+    request<Issue>(`/repos/${owner}/${name}/issues/${number}`, {
+      method: "PATCH",
+      body: body(input),
+    }),
+  setIssueState: (owner: string, name: string, number: number, open: boolean) =>
+    request<Issue>(
+      `/repos/${owner}/${name}/issues/${number}/${open ? "reopen" : "close"}`,
+      { method: "POST" },
+    ),
+
+  issueComments: (owner: string, name: string, number: number) =>
+    request<Comment[]>(`/repos/${owner}/${name}/issues/${number}/comments`),
+  mergeComments: (owner: string, name: string, number: number) =>
+    request<Comment[]>(`/repos/${owner}/${name}/merges/${number}/comments`),
+  commentOnIssue: (owner: string, name: string, number: number, input: NewComment) =>
+    request<Comment>(`/repos/${owner}/${name}/issues/${number}/comments`, {
+      method: "POST",
+      body: body(input),
+    }),
+  commentOnMerge: (owner: string, name: string, number: number, input: NewComment) =>
+    request<Comment>(`/repos/${owner}/${name}/merges/${number}/comments`, {
+      method: "POST",
+      body: body(input),
+    }),
+  editComment: (owner: string, name: string, id: string, text: string) =>
+    request<Comment>(`/repos/${owner}/${name}/comments/${id}`, {
+      method: "PATCH",
+      body: body({ body: text }),
+    }),
+  deleteComment: (owner: string, name: string, id: string) =>
+    request<{ ok: boolean }>(`/repos/${owner}/${name}/comments/${id}`, { method: "DELETE" }),
 
   refs: (owner: string, name: string) => request<Ref[]>(`/repos/${owner}/${name}/refs`),
 
