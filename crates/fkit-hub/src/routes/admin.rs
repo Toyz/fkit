@@ -24,6 +24,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/admin/settings", get(get_settings).patch(patch_settings))
         .route("/admin/stats", get(stats))
+        .route("/admin/cache", get(cache).delete(drop_cache))
         .route("/admin/users", get(list_users))
         .route("/admin/users/{id}", patch(patch_user))
         .route("/admin/users/{id}", delete(delete_user))
@@ -146,6 +147,60 @@ async fn stats(State(state): State<AppState>, viewer: Viewer) -> AppResult<Json<
         open_merge_requests: one("SELECT count(*) FROM merge_requests WHERE state = 'open'").await,
         disk_bytes: dir_size(&state.data_dir.join("repos")),
     }))
+}
+
+/// What the object cache is holding, and whether it is earning its memory.
+///
+/// Worth exposing because the alternative is guessing. A process that settles
+/// well above its idle size looks exactly like a leak from the outside, and
+/// the only way to tell the difference is to ask the cache what it is doing.
+#[derive(Serialize)]
+struct CacheView {
+    /// "memory", or "memory, then <host>" when a shared tier is configured.
+    backend: String,
+    entries: usize,
+    bytes: usize,
+    capacity: usize,
+    hits: u64,
+    misses: u64,
+    /// Hits as a percentage of lookups. `null` before anything has been asked
+    /// for — zero would read as "not working" rather than "not yet used".
+    hit_rate: Option<f64>,
+    /// How full it is, as a percentage of the configured capacity.
+    fill: f64,
+}
+
+async fn cache(State(state): State<AppState>, viewer: Viewer) -> AppResult<Json<CacheView>> {
+    require_admin(&viewer).await?;
+    let s = state.object_cache.stats();
+    let lookups = s.hits + s.misses;
+
+    Ok(Json(CacheView {
+        backend: state.cache_backend.clone(),
+        entries: s.entries,
+        bytes: s.bytes,
+        capacity: s.capacity,
+        hits: s.hits,
+        misses: s.misses,
+        hit_rate: (lookups > 0).then(|| s.hits as f64 * 100.0 / lookups as f64),
+        fill: if s.capacity == 0 {
+            0.0
+        } else {
+            s.bytes as f64 * 100.0 / s.capacity as f64
+        },
+    }))
+}
+
+/// Empty the cache.
+///
+/// Not a correctness tool — a cached object can never be stale, because its
+/// key is a digest of its value. It is here to hand the memory back without a
+/// restart, and to make a cold measurement possible.
+async fn drop_cache(State(state): State<AppState>, viewer: Viewer) -> AppResult<Json<CacheView>> {
+    let u = require_admin(&viewer).await?;
+    state.object_cache.clear();
+    super::audit(&state, Some(u.id), None, "cache.clear", serde_json::json!({})).await;
+    cache(State(state), viewer).await
 }
 
 fn dir_size(dir: &std::path::Path) -> u64 {

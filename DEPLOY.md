@@ -130,6 +130,78 @@ There is deliberately no `--insecure`. Adding a root is a decision about who you
 trust; skipping verification is a decision to trust the network, and the sync
 protocol sends your access token in its opening frame.
 
+## The object cache
+
+The hub holds decompressed objects in memory so a hot one is not read and
+inflated twice. **This is on by default and needs no setup**, and it is why a
+busy server settles well above its idle size — 64 MiB of cache by default, on
+top of the process itself. Admin → Overview reports what it is holding and its
+hit rate, so you can tell a working cache from a leak without guessing.
+
+Content addressing is what makes this simple: a key is a digest of its value,
+so a cached object can never be stale. There is no invalidation, only eviction,
+which is a size and an age:
+
+```toml
+[cache]
+memory_mb = 64      # 0 disables the cache entirely
+ttl_secs  = 1800
+```
+
+### A shared tier, when it is worth one
+
+Several hub processes each keep their own memory cache, and each pays its own
+misses. A shared tier in Valkey or Redis lets them answer each other's.
+
+**Most servers should not do this.** On one host with local storage, a round
+trip to Redis costs more than the disk read it would replace — measured at
+7 µs to read and inflate an object locally against 100–500 µs for the round
+trip. It pays when a miss is genuinely expensive: several processes, or object
+storage slower than a local disk. Memory is always the near tier either way, so
+a shared one only ever answers what memory missed.
+
+It is **off at compile time**, so the client is not linked into a binary that
+will not use it:
+
+```sh
+cargo build --release -p fkit-hub --features redis-cache
+```
+
+Then point it at one:
+
+```toml
+[cache]
+memory_mb = 64
+ttl_secs  = 1800
+redis_url = "redis://valkey:6379"
+```
+
+With `docker-compose`, that is one more service:
+
+```yaml
+  valkey:
+    image: valkey/valkey:8-alpine
+    restart: unless-stopped
+    # No volume: everything in here is a cache of content that is already on
+    # disk, so losing it costs one slow request and nothing else.
+    command: ["valkey-server", "--save", "", "--maxmemory", "512mb",
+              "--maxmemory-policy", "allkeys-lru"]
+```
+
+`--save ""` turns off persistence and `allkeys-lru` lets it evict under
+pressure. Both are right for a cache and wrong for a database — nothing here is
+the only copy of anything.
+
+The startup log says which tier it got, and the admin panel says it too:
+
+```
+INFO fkit_hub: object cache: memory + shared at redis://valkey:6379
+```
+
+If the server cannot reach it, that is a warning and not a failure — the hub
+starts on memory alone. A cache that is unavailable should never be the reason
+a repository cannot be read.
+
 ## Mirroring this repository into fkit
 
 `.github/workflows/mirror-to-fkit.yml` pushes every update to `main` into the

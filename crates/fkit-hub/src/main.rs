@@ -94,7 +94,7 @@ async fn main() -> Result<()> {
     .await
     .context("loading instance settings")?;
 
-    let object_cache = build_object_cache(&cfg);
+    let (object_cache, cache_backend) = build_object_cache(&cfg);
 
     let state = AppState {
         db,
@@ -106,6 +106,7 @@ async fn main() -> Result<()> {
         limiter: std::sync::Arc::new(ratelimit::MemoryLimiter::default()),
         trust_proxy: cfg.trust_proxy,
         object_cache,
+        cache_backend,
     };
 
     let api = Router::new()
@@ -338,7 +339,14 @@ async fn shutdown() {
 /// fatal. The server is completely functional without it — it is an
 /// optimisation, and refusing to start over one would trade the whole service
 /// for a faster one.
-fn build_object_cache(cfg: &config::Config) -> std::sync::Arc<dyn fkit_core::cache::ObjectCache> {
+/// The cache, and a description of where it actually holds things.
+///
+/// The description is carried rather than inferred: what a caller can see is
+/// an `Arc<dyn ObjectCache>`, and by then the configuration that decided
+/// between one tier and two is gone.
+fn build_object_cache(
+    cfg: &config::Config,
+) -> (std::sync::Arc<dyn fkit_core::cache::ObjectCache>, String) {
     use fkit_core::cache::{MemoryCache, ObjectCache};
     use std::sync::Arc;
     use std::time::Duration;
@@ -347,19 +355,25 @@ fn build_object_cache(cfg: &config::Config) -> std::sync::Arc<dyn fkit_core::cac
     let near: Arc<dyn ObjectCache> = Arc::new(MemoryCache::new(cfg.cache_memory_bytes, ttl));
 
     let Some(url) = cfg.cache_redis_url.as_deref() else {
-        return near;
+        return (near, "memory".into());
     };
+
+    // The URL can carry a password; only the host is worth showing.
+    let where_far = url.rsplit('@').next().unwrap_or(url).to_string();
 
     #[cfg(feature = "redis-cache")]
     {
         match fkit_core::cache::RedisCache::connect(url, "fkit:obj:", ttl) {
             Ok(far) => {
                 tracing::info!("object cache: memory + shared at {url}");
-                Arc::new(fkit_core::cache::Tiered::new(near, Arc::new(far)))
+                (
+                    Arc::new(fkit_core::cache::Tiered::new(near, Arc::new(far))),
+                    format!("memory, then {where_far}"),
+                )
             }
             Err(e) => {
                 tracing::warn!("shared object cache at {url} unavailable ({e}); memory only");
-                near
+                (near, format!("memory ({where_far} is unreachable)"))
             }
         }
     }
@@ -370,6 +384,6 @@ fn build_object_cache(cfg: &config::Config) -> std::sync::Arc<dyn fkit_core::cac
             "a shared object cache is configured ({url}) but this binary was built \
              without the `redis-cache` feature; using memory only"
         );
-        near
+        (near, format!("memory (built without support for {where_far})"))
     }
 }

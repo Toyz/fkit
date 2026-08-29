@@ -33,6 +33,10 @@ pub struct AppState {
     /// move out of this process without any read path changing — see
     /// [`fkit_core::cache`].
     pub object_cache: Arc<dyn fkit_core::cache::ObjectCache>,
+    /// Where that cache holds things, for the admin panel to report. Carried
+    /// rather than inferred: by the time anyone has the `Arc`, the config that
+    /// chose between one tier and two is gone.
+    pub cache_backend: String,
 }
 
 impl AppState {

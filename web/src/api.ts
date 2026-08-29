@@ -440,6 +440,26 @@ export interface MergeRequestDetail extends MergeRequest {
   can_merge: boolean;
 }
 
+/**
+ * What the object cache is holding.
+ *
+ * Exposed because a process that settles well above its idle size looks
+ * exactly like a leak from outside, and asking the cache is the only way to
+ * tell the difference.
+ */
+export interface CacheStats {
+  /** "memory", or "memory, then <host>" when a shared tier is configured. */
+  backend: string;
+  entries: number;
+  bytes: number;
+  capacity: number;
+  hits: number;
+  misses: number;
+  /** Null until something has been looked up. */
+  hit_rate: number | null;
+  fill: number;
+}
+
 export interface SessionInfo {
   id: string;
   user_agent: string | null;
@@ -823,6 +843,8 @@ export const api = {
   updateAdminSettings: (input: Partial<InstanceSettings>) =>
     request<InstanceSettings>("/admin/settings", { method: "PATCH", body: body(input) }),
   adminStats: () => request<AdminStats>("/admin/stats"),
+  cacheStats: () => request<CacheStats>("/admin/cache"),
+  clearCache: () => request<CacheStats>("/admin/cache", { method: "DELETE" }),
   adminEmail: () => request<EmailStatus>("/admin/email"),
   updateAdminEmail: (input: {
     email_from?: string;

@@ -21,6 +21,7 @@ import {
   humanSize,
   relativeTime,
   type AdminStats,
+  type CacheStats,
   type AdminUser,
   type EmailStatus,
   type Invite,
@@ -177,6 +178,7 @@ export class PageAdmin extends LoomElement {
   @reactive accessor section: Section = "overview";
   @reactive accessor settings: InstanceSettings | null = null;
   @reactive accessor stats: AdminStats | null = null;
+  @reactive accessor cache: CacheStats | null = null;
   @reactive accessor users: AdminUser[] | null = null;
   @reactive accessor email: EmailStatus | null = null;
   @reactive accessor invites: Invite[] | null = null;
@@ -213,6 +215,7 @@ export class PageAdmin extends LoomElement {
     try {
       if (this.section === "overview" || this.stats === null) {
         this.stats = await api.adminStats();
+        this.cache = await api.cacheStats().catch(() => null);
       }
       if (this.settings === null) this.settings = await api.adminSettings();
       if (this.section === "users") this.users = await api.adminUsers();
@@ -280,6 +283,79 @@ export class PageAdmin extends LoomElement {
     );
   }
 
+  /**
+   * The object cache.
+   *
+   * The number people actually want is the hit rate: memory held with nothing
+   * to show for it is waste, and memory held at 90% hits is the whole point.
+   * "Held" rather than "used", because this memory is deliberate — the reason
+   * this panel exists is that it otherwise reads as a leak.
+   */
+  private renderCache() {
+    const c = this.cache;
+    return (
+      <fkit-section
+        heading="Object cache"
+        blurb={
+          "Decompressed objects, so a hot one is not read and inflated twice. " +
+          "A cached object can never be stale — its key is a digest of its " +
+          "value — so this is bounded by size and age rather than invalidated."
+        }
+      >
+        <fkit-list>
+          {c === null ? (
+            <fkit-empty><span class="sk" style="width:200px"></span></fkit-empty>
+          ) : (
+            <div class="stat-grid">
+              <div class="stat-cell">
+                <b>{c.hit_rate === null ? "—" : `${c.hit_rate.toFixed(1)}%`}</b>
+                <span>hit rate</span>
+              </div>
+              <div class="stat-cell">
+                <b>{humanSize(c.bytes)}</b>
+                <span>of {humanSize(c.capacity)} held</span>
+              </div>
+              <div class="stat-cell">
+                <b>{c.entries.toLocaleString()}</b>
+                <span>objects</span>
+              </div>
+              <div class="stat-cell">
+                <b>{c.hits.toLocaleString()}</b>
+                <span>hits</span>
+              </div>
+              <div class="stat-cell">
+                <b>{c.misses.toLocaleString()}</b>
+                <span>misses</span>
+              </div>
+            </div>
+          )}
+        </fkit-list>
+
+        {c ? (
+          <fkit-actions>
+            <span class="held">
+              held in <b>{c.backend}</b>
+              {c.fill >= 0.5 ? ` · ${c.fill.toFixed(0)}% full` : null}
+            </span>
+            <span class="grow"></span>
+            <button
+              class="bare"
+              disabled={this.busy}
+              title="hand the memory back; nothing else changes"
+              onClick={() =>
+                void this.act(async () => {
+                  this.cache = await api.clearCache();
+                })
+              }
+            >
+              <loom-icon name="trash" size={12}></loom-icon> clear
+            </button>
+          </fkit-actions>
+        ) : null}
+      </fkit-section>
+    );
+  }
+
   private overview() {
     const s = this.stats;
     const cells: [string, string][] = s
@@ -311,6 +387,8 @@ export class PageAdmin extends LoomElement {
             )}
           </fkit-list>
         </fkit-section>
+
+        {this.renderCache()}
 
         <fkit-section heading="How this server is set up">
           <fkit-list>
