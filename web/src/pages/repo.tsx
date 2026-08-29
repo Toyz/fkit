@@ -34,6 +34,7 @@ import {
   type Entry,
   type Collaborator,
   type Comparison,
+  type Upstream,
   type CrossRef,
   type FileDiff,
   type MergeRequest,
@@ -79,6 +80,18 @@ type View =
  * is three chances for one to encode a segment differently from the others —
  * which would quietly give that query a cache key of its own.
  */
+/**
+ * Split `owner/name:branch` into its parts.
+ *
+ * A branch may contain slashes but not a colon, so the separator is
+ * unambiguous and a plain `main` is simply a branch here.
+ */
+function splitRefSpec(spec: string): { repo: string | null; branch: string } {
+  const i = spec.indexOf(":");
+  if (i < 0) return { repo: null, branch: spec };
+  return { repo: spec.slice(0, i), branch: spec.slice(i + 1) };
+}
+
 /** Two comments on the same line of the same version of the same file. */
 function sameAnchor(a: Comment, b: Comment): boolean {
   return (
@@ -289,12 +302,85 @@ const commitSheet = css`
 
 const sheet = css`
   /* Header reads like a path, because that is what it is. */
-  .head { border-bottom: 1px solid var(--border); margin-bottom: 12px; }
-  .title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding-bottom: 8px; }
-  .title .ic { color: var(--faint); display: flex; }
-  .title .p { font-size: 15px; font-weight: 600; }
-  .title .p .own { color: var(--muted); font-weight: 400; }
-  .desc { font-family: var(--sans); color: var(--muted); font-size: 12px; margin: -4px 0 8px; }
+  .head { border-bottom: 1px solid var(--border); margin-bottom: 14px; }
+
+  /* Tile, name, and what is true of it — the same three-part header the
+     settings, profile and issue pages use, so a repository does not announce
+     itself in a different voice from everything else. */
+  .rhead {
+    display: grid; grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: center; gap: 12px;
+    padding: 4px 0 8px;
+  }
+  .rmid { min-width: 0; }
+  .rmeta { display: flex; align-items: center; gap: 8px; flex: none; }
+
+  .rhead .p {
+    font-size: 18px; font-weight: 500; letter-spacing: -0.01em; margin: 0;
+    display: flex; min-width: 0;
+  }
+  /* The accent sits under the name itself, exactly as it does under a section
+     heading — the mark that says which page you are on. */
+  .rhead .p .t {
+    position: relative; display: inline-flex; align-items: baseline;
+    min-width: 0; padding-bottom: 3px;
+  }
+  .rhead .p .t::after {
+    content: ""; position: absolute; left: 0; right: 0; bottom: 0;
+    height: 2px; background: var(--accent);
+  }
+  .rhead .p a { text-decoration: none; }
+  .rhead .p .own { color: var(--muted); }
+  .rhead .p .own:hover { color: var(--accent); }
+  .rhead .p .sl { color: var(--faint); margin: 0 3px; }
+  .rhead .p .nm { color: var(--text); overflow: hidden; text-overflow: ellipsis; }
+  .rhead .p .nm:hover { color: var(--accent); }
+
+  .rhead .from {
+    font-family: var(--sans); font-size: 11.5px; color: var(--faint);
+    margin-top: 4px;
+  }
+  .rhead .from a { color: var(--muted); }
+  .rhead .from a:hover { color: var(--accent); }
+
+  .desc {
+    font-family: var(--sans); color: var(--muted); font-size: 12.5px;
+    margin: 0 0 10px; max-width: 90ch; line-height: 1.5;
+  }
+
+  /* Seeing something because you run the server, rather than because it was
+     shared with you. Amber rather than red: it is not an error, it is a
+     privilege being exercised. */
+  .admin-note {
+    display: flex; align-items: flex-start; gap: 9px;
+    padding: 9px 12px; margin-bottom: 12px;
+    border: 1px solid color-mix(in srgb, var(--modified) 40%, transparent);
+    border-radius: var(--radius);
+    background: color-mix(in srgb, var(--modified) 7%, transparent);
+    font-family: var(--sans); font-size: 12px; color: var(--muted);
+    line-height: 1.5;
+  }
+  .admin-note loom-icon { flex: none; margin-top: 1px; color: var(--modified); }
+  .admin-note b { color: var(--text); font-weight: 600; }
+
+  /* How far a fork has drifted, and the two things to do about it. */
+  .drift {
+    display: flex; align-items: center; gap: 9px; flex-wrap: wrap;
+    padding: 7px 12px; margin-bottom: 12px;
+    border: 1px solid var(--border); border-radius: var(--radius);
+    background: var(--surface);
+    font-family: var(--sans); font-size: 12px; color: var(--muted);
+  }
+  .drift.behind { border-color: color-mix(in srgb, var(--modified) 35%, var(--border)); }
+  .drift loom-icon { flex: none; color: var(--faint); }
+  .drift b { color: var(--text); font-weight: 600; }
+  .drift .grow { flex: 1; }
+  .drift a.btn { font-size: 11.5px; }
+
+  @media (max-width: 700px) {
+    .rhead { grid-template-columns: auto minmax(0, 1fr); }
+    .rmeta { grid-column: 1 / -1; }
+  }
 
   .tabs { display: flex; gap: 2px; }
   .tabs a {
@@ -1342,6 +1428,9 @@ export class PageRepo extends LoomElement {
   /// The last collection report, kept so a dry run can be read before the
   /// real one is asked for.
   @reactive accessor gcReport: GcReport | null = null;
+  /// How far this fork has drifted from its parent. Null while unknown or
+  /// when this is not a fork.
+  @reactive accessor drift: Upstream | null = null;
 
   /// Which line is being written on. Keyed `path:side:line` so one composer
   /// is open at a time — two half-written comments on one screen is a way to
@@ -1393,7 +1482,13 @@ export class PageRepo extends LoomElement {
       const d = el.repoQuery.data?.default_branch ?? "main";
       const base = v.kind === "compare" ? v.base || d : d;
       const head = v.kind === "compare" ? v.head || d : d;
-      return `/api/repos/${el.loc!.owner}/${el.loc!.name}/compare/${encodeURIComponent(base)}/${encodeURIComponent(head)}`;
+      // Query rather than path: either side may be `owner/name:branch`, and a
+      // percent-encoded slash does not survive every proxy between here and
+      // the server.
+      return (
+        `/api/repos/${el.loc!.owner}/${el.loc!.name}/compare` +
+        `?base=${encodeURIComponent(base)}&head=${encodeURIComponent(head)}`
+      );
     },
     enabled: (el: PageRepo) =>
       Boolean(el.loc && el.repoQuery.data && el.loc.view.kind === "compare"),
@@ -1609,6 +1704,23 @@ export class PageRepo extends LoomElement {
     if (wide.ref === v.ref) return at;
 
     return { ...at, view: { kind: v.kind, ref: wide.ref, path: wide.path } };
+  }
+
+  /// A fork's distance from its parent, fetched once the repository is known.
+  ///
+  /// Its own request rather than a field on the repository: answering it is a
+  /// graph walk, and only a fork has anything to say.
+  @watch("repoQuery")
+  onRepoForDrift() {
+    this.drift = null;
+    const r = this.repoQuery.data;
+    if (!r?.forked_from || !this.loc) return;
+    const at = this.loc;
+    void api
+      .upstream(at.owner, at.name)
+      .then((u) => (this.drift = u))
+      // Decoration: the page is worth showing without it.
+      .catch(() => (this.drift = null));
   }
 
   /** A repository that does not exist is a 404, not an error banner. */
@@ -2337,6 +2449,70 @@ export class PageRepo extends LoomElement {
     );
   }
 
+  /// How far this fork has drifted, and what to do about it.
+  ///
+  /// The two facts are different questions: commits the parent has that this
+  /// one does not is a reason to pull, and commits this one has that the
+  /// parent does not is a reason to propose. So each gets its own sentence and
+  /// its own action rather than one line of arithmetic.
+  private renderDrift(r: Repo, at: { owner: string; name: string }) {
+    const d = this.drift;
+    if (!d) return null;
+
+    // The two questions run in opposite directions, and getting that backwards
+    // shows an empty diff and says nothing to merge.
+    //
+    // "Behind" means the parent has commits this fork does not, so the
+    // comparison happens *here* with the parent as the head. "Ahead" is the
+    // reverse: it happens on the parent, with this fork as the head.
+    const mine = `${at.owner}/${at.name}`;
+    const whatIsNew = `/${mine}/compare/${d.branch}...${d.parent}:${d.parent_branch}`;
+    const propose = `/${d.parent}/compare/${d.parent_branch}...${mine}:${d.branch}`;
+
+    if (d.level) {
+      return (
+        <div class="drift">
+          <loom-icon name="check" size={12}></loom-icon>
+          <span>
+            This branch is level with <b>{d.parent}:{d.parent_branch}</b>.
+          </span>
+        </div>
+      );
+    }
+
+    return (
+      <div class={`drift ${d.behind > 0 ? "behind" : ""}`}>
+        <loom-icon name={d.behind > 0 ? "alert" : "commit"} size={12}></loom-icon>
+        <span>
+          This branch is{" "}
+          {d.ahead > 0 ? (
+            <>
+              <b>{d.ahead}</b> {d.ahead === 1 ? "commit" : "commits"} ahead
+            </>
+          ) : null}
+          {d.ahead > 0 && d.behind > 0 ? " and " : null}
+          {d.behind > 0 ? (
+            <>
+              <b>{d.behind}</b> {d.behind === 1 ? "commit" : "commits"} behind
+            </>
+          ) : null}{" "}
+          <b>{d.parent}:{d.parent_branch}</b>.
+        </span>
+        <span class="grow"></span>
+        {d.ahead > 0 && r.access !== "none" ? (
+          <a class="btn" href={propose} onClick={linkHandler(propose)}>
+            propose these changes
+          </a>
+        ) : null}
+        {d.behind > 0 ? (
+          <a class="btn" href={whatIsNew} onClick={linkHandler(whatIsNew)}>
+            see what is new
+          </a>
+        ) : null}
+      </div>
+    );
+  }
+
   /// The three ways to look at a merge request.
   ///
   /// The counts are the point: how much was said, and how much changed, are
@@ -2898,7 +3074,14 @@ export class PageRepo extends LoomElement {
                   )}
                 </div>
               </div>
-              {!c.up_to_date && this.repo!.access !== "read" ? (
+              {/* Write access is needed to propose a branch that is already
+                  here. One from another fork needs only read, which is the
+                  whole point of forking — the server applies the same rule. */}
+              {!c.up_to_date &&
+              this.session.isAuthed &&
+              (this.repo!.access === "admin" ||
+                this.repo!.access === "write" ||
+                (v.head.includes(":") && this.repo!.access === "read")) ? (
                 <button
                   class="primary"
                   disabled={this.busy}
@@ -4091,16 +4274,24 @@ fkit push</pre>
   }
 
   /// Create a request from the compare view and go straight to it.
+  /// Open a request for whatever the compare view is currently showing.
+  ///
+  /// Either side may name another fork as `owner/name:branch`, which is how a
+  /// fork proposes its own work upstream — so the head is split back apart
+  /// here rather than being passed through as a branch name that does not
+  /// exist in this repository.
   private async openRequest(base: string, head: string) {
     const at = this.loc!;
-    const title = `Merge ${head} into ${base}`;
+    const src = splitRefSpec(head);
+    const title = `Merge ${src.branch} into ${base}`;
     this.busy = true;
     this.error = "";
     try {
       const m = await api.createMerge(at.owner, at.name, {
         title,
-        source_branch: head,
-        target_branch: base,
+        source_branch: src.branch,
+        ...(src.repo ? { source_repo: src.repo } : {}),
+        target_branch: splitRefSpec(base).branch,
       });
       go(`/${at.owner}/${at.name}/merges/${m.number}`);
     } catch (e) {
@@ -4857,47 +5048,66 @@ fkit push</pre>
     return (
       <div class="wrap">
         <div class="head">
-          <div class="title">
-            <span class="ic"><loom-icon name={r.visibility === "private" ? "lock" : "repo"} size={14}></loom-icon></span>
-            <span class="p">
-              <a class="own" href="/" onClick={linkHandler("/")}>{r.owner}</a>
-              <span class="own">/</span>
-              <a
-                href={`/${r.owner}/${r.name}`}
-                onClick={linkHandler(`/${r.owner}/${r.name}`)}
-                style="color:var(--text)"
-              >
-                {r.name}
-              </a>
-            </span>
-            <span class="tag">{r.visibility}</span>
-            {r.access !== "read" ? <span class="tag on">{r.access}</span> : null}
-            <span class="grow"></span>
-            {this.session.isAuthed ? (
-              <button
-                type="button"
-                class="bare"
-                disabled={this.busy}
-                title="Take your own copy of this repository"
-                onClick={() =>
-                  void this.act(async () => {
-                    const made = await api.fork(at.owner, at.name);
-                    go(`/${made.full_name}`);
-                  })
-                }
-              >
-                <loom-icon name="merge" size={12}></loom-icon> fork
-              </button>
-            ) : null}
-          </div>
-          {r.forked_from ? (
-            <div class="from">
-              forked from{" "}
-              <a href={`/${r.forked_from}`} onClick={linkHandler(`/${r.forked_from}`)}>
-                {r.forked_from}
-              </a>
+          {/* The same header the rest of the site uses: a tile, a name, the
+              accent under the word, and what is true of it parked at the right
+              of the rule. A repository is told apart from another by the same
+              derived colour that tells two people apart. */}
+          <div class="rhead">
+            <fkit-avatar
+              name={`${r.owner}/${r.name}`}
+              glyph={r.visibility === "private" ? "lock" : "repo"}
+              size={34}
+            ></fkit-avatar>
+
+            <div class="rmid">
+              <h1 class="p">
+                <span class="t">
+                  <a class="own" href={`/${r.owner}`} onClick={linkHandler(`/${r.owner}`)}>
+                    {r.owner}
+                  </a>
+                  <span class="sl">/</span>
+                  <a
+                    class="nm"
+                    href={`/${r.owner}/${r.name}`}
+                    onClick={linkHandler(`/${r.owner}/${r.name}`)}
+                  >
+                    {r.name}
+                  </a>
+                </span>
+              </h1>
+              {r.forked_from ? (
+                <div class="from">
+                  forked from{" "}
+                  <a href={`/${r.forked_from}`} onClick={linkHandler(`/${r.forked_from}`)}>
+                    {r.forked_from}
+                  </a>
+                </div>
+              ) : null}
             </div>
-          ) : null}
+
+            <span class="rmeta">
+              {r.visibility === "private" ? <span class="tag">private</span> : null}
+              {r.access === "admin" || r.access === "write" ? (
+                <span class="tag on">{r.access}</span>
+              ) : null}
+              {this.session.isAuthed ? (
+                <button
+                  type="button"
+                  disabled={this.busy}
+                  title="Take your own copy of this repository"
+                  onClick={() =>
+                    void this.act(async () => {
+                      const made = await api.fork(at.owner, at.name);
+                      go(`/${made.full_name}`);
+                    })
+                  }
+                >
+                  <loom-icon name="merge" size={12}></loom-icon> fork
+                </button>
+              ) : null}
+            </span>
+          </div>
+
           {r.description ? <div class="desc">{r.description}</div> : null}
           <div class="tabs">
             {tabs.map(([key, label, ic, href, count]) => (
@@ -4911,6 +5121,21 @@ fkit push</pre>
             ))}
           </div>
         </div>
+
+        {/* Reading someone's private work because you administer the server
+            is a power worth being told you are using. Said every time rather
+            than once, because the point is that it is unusual. */}
+        {r.via_admin ? (
+          <div class="admin-note">
+            <loom-icon name="shield" size={13}></loom-icon>
+            <span>
+              <b>{r.owner}</b> has not shared this repository with you. You are seeing
+              it because you administer this server, and that is recorded.
+            </span>
+          </div>
+        ) : null}
+
+        {this.renderDrift(r, at)}
 
         {this.error ? <div class="error">{this.error}</div> : null}
 

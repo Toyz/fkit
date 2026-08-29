@@ -53,6 +53,30 @@ impl Access {
 /// `token_can_write` is the *ceiling* imposed by the credential itself: a
 /// read-only personal access token cannot write even for a repository owner.
 /// A credential may narrow access; it may never widen it.
+/// Would this viewer see nothing here if they did not administer the server?
+///
+/// Asked separately from [`resolve`] rather than threaded through it, because
+/// only one page needs the answer and every caller of `resolve` would
+/// otherwise have to carry it.
+pub async fn only_via_site_admin(
+    db: &sqlx::PgPool,
+    repo: &RepoRow,
+    viewer_id: Option<Uuid>,
+    viewer_is_admin: bool,
+) -> AppResult<bool> {
+    let Some(uid) = viewer_id else { return Ok(false) };
+    if !viewer_is_admin || repo.owner_id == uid || repo.visibility == "public" {
+        return Ok(false);
+    }
+    let role: Option<(String,)> =
+        sqlx::query_as("SELECT role FROM collaborators WHERE repo_id = $1 AND user_id = $2")
+            .bind(repo.id)
+            .bind(uid)
+            .fetch_optional(db)
+            .await?;
+    Ok(role.is_none())
+}
+
 pub async fn resolve(
     db: &sqlx::PgPool,
     repo: &RepoRow,

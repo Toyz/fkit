@@ -31,6 +31,12 @@ pub fn routes() -> Router<AppState> {
         .route("/repos/{owner}/{name}/lastcommits/{ref}/{*path}", get(last_commits_path))
         .route("/repos/{owner}/{name}/raw/{ref}/{*path}", get(raw))
         .route("/repos/{owner}/{name}/patch/{hash}", get(patch))
+        // Two spellings on purpose. The path form is the readable one and
+        // still serves a plain `main`; the query form is the one that survives
+        // a proxy, because a spec like `aria/fkit:main` contains a slash and
+        // `%2F` does not reliably reach here intact — a dev server and most
+        // reverse proxies normalise it back into a path separator.
+        .route("/repos/{owner}/{name}/compare", get(compare_query))
         .route("/repos/{owner}/{name}/compare/{base}/{head}", get(compare))
 }
 
@@ -378,6 +384,60 @@ async fn patch(
 }
 
 /// Compare two refs — the merge preview.
+/// Resolve one side of a comparison, which may name another fork.
+///
+/// `main` is a ref in this repository. `aria/fkit:main` is a ref in that one —
+/// the spelling a fork's page needs in order to say how far it has drifted, or
+/// to propose its own branch. Only within the network: two repositories that
+/// never shared a history do not share a store, so the objects on one side
+/// would simply not be there.
+async fn resolve_side(
+    state: &AppState,
+    viewer: &Viewer,
+    here: &RepoRow,
+    spec: &str,
+) -> AppResult<Hash> {
+    // A colon separates the repository from the ref. Branch names may contain
+    // slashes but not colons, so this split is unambiguous.
+    let Some((repo_spec, r)) = spec.split_once(':') else {
+        return resolve_ref(state, here, spec).await;
+    };
+    let Some((o, n)) = repo_spec.split_once('/') else {
+        return Err(AppError::BadRequest(
+            "a cross-repository ref is owner/name:branch".into(),
+        ));
+    };
+
+    let (other, access, _) = super::load_repo(state, viewer, o, n).await?;
+    crate::perms::require_read(access, o, n)?;
+    if other.network_id != here.network_id {
+        return Err(AppError::BadRequest(format!(
+            "{o}/{n} is not a fork of this repository"
+        )));
+    }
+    resolve_ref(state, &other, r).await
+}
+
+#[derive(Deserialize)]
+struct CompareQuery {
+    base: String,
+    head: String,
+}
+
+async fn compare_query(
+    State(state): State<AppState>,
+    viewer: Viewer,
+    Path((owner, name)): Path<(String, String)>,
+    Query(q): Query<CompareQuery>,
+) -> AppResult<Json<content::Comparison>> {
+    compare(
+        State(state),
+        viewer,
+        Path((owner, name, q.base, q.head)),
+    )
+    .await
+}
+
 async fn compare(
     State(state): State<AppState>,
     viewer: Viewer,
@@ -386,8 +446,8 @@ async fn compare(
     let (repo, _, _) = super::load_repo(&state, &viewer, &owner, &name).await?;
     let store = state.store_for_network(repo.network_id).map_err(AppError::Internal)?;
 
-    let base_id = resolve_ref(&state, &repo, &base).await?;
-    let head_id = resolve_ref(&state, &repo, &head).await?;
+    let base_id = resolve_side(&state, &viewer, &repo, &base).await?;
+    let head_id = resolve_side(&state, &viewer, &repo, &head).await?;
 
     Ok(Json(content::compare(&store, &base, base_id, &head, head_id)?))
 }

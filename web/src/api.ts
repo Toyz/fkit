@@ -46,6 +46,17 @@ export interface Repo {
   open_merges: number;
   /** `owner/name` this was forked from, when it was. */
   forked_from: string | null;
+  /** True when server administration is the only reason you can see this. */
+  via_admin: boolean;
+}
+
+export interface Upstream {
+  parent: string;
+  branch: string;
+  parent_branch: string;
+  ahead: number;
+  behind: number;
+  level: boolean;
 }
 
 export interface Label {
@@ -657,6 +668,9 @@ export const api = {
       method: "POST",
       body: body(as ? { name: as } : {}),
     }),
+  /** How far a fork has drifted from what it was forked from. Null when not a fork. */
+  upstream: (owner: string, name: string) =>
+    request<Upstream | null>(`/repos/${owner}/${name}/upstream`),
   forks: (owner: string, name: string) => request<Repo[]>(`/repos/${owner}/${name}/forks`),
 
   refs: (owner: string, name: string) => request<Ref[]>(`/repos/${owner}/${name}/refs`),

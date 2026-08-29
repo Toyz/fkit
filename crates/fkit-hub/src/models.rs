@@ -113,6 +113,11 @@ pub struct RepoView {
     pub open_merges: i64,
     /// `owner/name` of what this was forked from, when it was.
     pub forked_from: Option<String>,
+    /// True when the only reason this viewer can see the repository is that
+    /// they administer the server — not ownership, not a grant, and not the
+    /// repository being public. Reading someone's private work is a power
+    /// worth being told you are using.
+    pub via_admin: bool,
     /// Not serialised: the listing needs it to find the objects, the client
     /// has no use for it, and it is an internal identifier.
     #[serde(skip)]

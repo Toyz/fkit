@@ -27,6 +27,7 @@ pub fn routes() -> Router<AppState> {
         .route("/repos/{owner}/{name}/gc", post(collect_garbage))
         .route("/repos/{owner}/{name}/fork", post(fork_repo))
         .route("/repos/{owner}/{name}/forks", get(list_forks))
+        .route("/repos/{owner}/{name}/upstream", get(upstream))
         .route(
             "/repos/{owner}/{name}/collaborators",
             get(list_collaborators).post(add_collaborator),
@@ -333,6 +334,51 @@ async fn get_repo(
     // nothing because this endpoint skipped the step that fills them in.
     let mut views = vec![super::repo_view(&repo, &owner_lc, access)];
     super::attach_heads(&state, &mut views).await;
+
+    let (uid, is_admin) = match &viewer.user {
+        Some(u) => (Some(u.id), u.is_admin),
+        None => (None, false),
+    };
+    views[0].via_admin =
+        crate::perms::only_via_site_admin(&state.db, &repo, uid, is_admin).await?;
+
+    // An administrator reading someone's private repository is a power being
+    // exercised, and `perms::resolve` has always claimed it was recorded. It
+    // was not: only writes were. It is now.
+    //
+    // Written from the repository page rather than from every file and commit
+    // request under it, and only when the same administrator has not already
+    // been recorded here in the last hour — otherwise browsing a repository
+    // would bury the log in one person reading it.
+    if views[0].via_admin && let Some(actor) = uid {
+        // `EXISTS` rather than `SELECT 1`, which is int4 and silently failed
+        // to decode as i64 — the error was swallowed and every page view was
+        // recorded. On failure this errs toward writing: an extra audit line
+        // is noise, a missing one is a gap in a record someone may rely on.
+        let (recent,): (bool,) = sqlx::query_as(
+            "SELECT EXISTS(
+                 SELECT 1 FROM audit_log
+                  WHERE action = 'repo.read_as_admin' AND actor_id = $1 AND repo_id = $2
+                    AND created_at > now() - interval '1 hour')",
+        )
+        .bind(actor)
+        .bind(repo.id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or((false,));
+
+        if !recent {
+            super::audit(
+                &state,
+                Some(actor),
+                Some(repo.id),
+                "repo.read_as_admin",
+                serde_json::json!({ "repo": format!("{owner_lc}/{}", repo.name) }),
+            )
+            .await;
+        }
+    }
+
     Ok(Json(views.remove(0)))
 }
 
@@ -724,6 +770,98 @@ async fn list_forks(
         }
     }
     Ok(Json(out))
+}
+
+#[derive(Serialize)]
+struct UpstreamView {
+    /// `owner/name` of what this was forked from.
+    parent: String,
+    /// The branch compared on each side — each repository's own default.
+    branch: String,
+    parent_branch: String,
+    /// Commits this fork has that the parent does not, and the reverse.
+    ahead: usize,
+    behind: usize,
+    /// True when the two point at the same commit.
+    level: bool,
+}
+
+/// How far a fork has drifted from what it was forked from.
+///
+/// Its own endpoint rather than a field on the repository, because answering
+/// it is a graph walk: every page that shows a repository would pay for it,
+/// and only a fork's page has anything to say. Compares each side's default
+/// branch, which is the comparison people mean when they ask.
+async fn upstream(
+    State(state): State<AppState>,
+    viewer: Viewer,
+    Path((owner, name)): Path<(String, String)>,
+) -> AppResult<Json<Option<UpstreamView>>> {
+    let (repo, access, _) = super::load_repo(&state, &viewer, &owner, &name).await?;
+    require_read(access, &owner, &name)?;
+
+    let Some(parent_id) = repo.forked_from else {
+        return Ok(Json(None));
+    };
+
+    let parent: Option<RepoWithOwner> = sqlx::query_as(
+        "SELECT r.*, u.username FROM repos r JOIN users u ON u.id = r.owner_id WHERE r.id = $1",
+    )
+    .bind(parent_id)
+    .fetch_optional(&state.db)
+    .await?;
+    // A parent that was deleted, or that this viewer cannot see, is simply no
+    // upstream as far as this page is concerned.
+    let Some(parent) = parent else { return Ok(Json(None)) };
+
+    let (uid, admin, can_write) = match &viewer.user {
+        Some(u) => (Some(u.id), u.is_admin, u.can_write),
+        None => (None, false, false),
+    };
+    let pa = resolve(&state.db, &parent.repo, uid, admin, can_write, state.policy().require_auth)
+        .await?;
+    if !pa.can_read() {
+        return Ok(Json(None));
+    }
+
+    let mine = ref_target(&state, &repo, &repo.default_branch).await?;
+    let theirs = ref_target(&state, &parent.repo, &parent.repo.default_branch).await?;
+    let (Some(mine), Some(theirs)) = (mine, theirs) else {
+        return Ok(Json(None));
+    };
+
+    if mine == theirs {
+        return Ok(Json(Some(UpstreamView {
+            parent: format!("{}/{}", parent.username, parent.repo.name),
+            branch: repo.default_branch.clone(),
+            parent_branch: parent.repo.default_branch.clone(),
+            ahead: 0,
+            behind: 0,
+            level: true,
+        })));
+    }
+
+    // One store holds both sides, which is what makes this a local walk rather
+    // than a fetch.
+    let store = state
+        .store_for_network(repo.network_id)
+        .map_err(AppError::Internal)?;
+    let c = crate::content::compare(
+        &store,
+        &parent.repo.default_branch,
+        theirs,
+        &repo.default_branch,
+        mine,
+    )?;
+
+    Ok(Json(Some(UpstreamView {
+        parent: format!("{}/{}", parent.username, parent.repo.name),
+        branch: repo.default_branch.clone(),
+        parent_branch: parent.repo.default_branch.clone(),
+        ahead: c.ahead,
+        behind: c.behind,
+        level: false,
+    })))
 }
 
 /// Which ref to remove.

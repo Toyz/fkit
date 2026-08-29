@@ -67,6 +67,7 @@ pub fn repo_view(repo: &RepoRow, owner: &str, access: Access) -> RepoView {
         open_issues: 0,
         open_merges: 0,
         forked_from: None,
+        via_admin: false,
         network_id: repo.network_id,
     }
 }

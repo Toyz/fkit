@@ -1,5 +1,5 @@
 /**
- * Initials in a box.
+ * A derived tile: initials for a person, a glyph for a thing.
  *
  * Not an avatar service: no external request, no tracking, and it works on a
  * server with no route to the internet — which is the kind of server fkit is
@@ -50,6 +50,14 @@ export class FkitAvatar extends LoomElement {
   @prop accessor name = "";
   /** Pixel size of the square. */
   @prop accessor size = 34;
+  /**
+   * Draw this icon instead of initials.
+   *
+   * A repository is not a person and does not have initials — "fk" for
+   * `aria/fkit` says nothing — but it does deserve the same derived colour, so
+   * that two repositories are told apart by the same means two people are.
+   */
+  @prop accessor glyph = "";
 
   /**
    * Two letters. A display name gives one per word ("Ada Lovelace" -> AL); a
@@ -81,7 +89,11 @@ export class FkitAvatar extends LoomElement {
   update() {
     return (
       <span class="a" style={`--sz:${this.size}px;--h:${this.hue()}`}>
-        {this.initials()}
+        {this.glyph ? (
+          <loom-icon name={this.glyph} size={Math.round(this.size * 0.46)}></loom-icon>
+        ) : (
+          this.initials()
+        )}
       </span>
     );
   }
