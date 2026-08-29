@@ -1254,6 +1254,20 @@ const sheet = css`
   .verdict.bad .vmark { color: var(--removed); }
   .vtitle { font-size: 13px; font-weight: 600; }
   .vsub { color: var(--muted); font-size: 11px; margin-top: 3px; }
+  /* The base sheet styles every label as an uppercase caption, which is right
+     for a form field and wrong for a sentence you tick. Reset explicitly
+     rather than relying on where this happens to sit. */
+  .drop {
+    display: inline-flex; align-items: center; gap: 6px; flex: none;
+    height: 26px; padding: 0 10px;
+    border: 1px solid var(--border-hi); border-radius: var(--radius);
+    color: var(--muted); cursor: pointer; user-select: none;
+    font-family: var(--sans); font-size: 11.5px; line-height: 1;
+    text-transform: none; letter-spacing: 0; font-weight: 400;
+  }
+  .drop:hover { border-color: var(--accent); color: var(--text); }
+  .drop input { width: 12px; height: 12px; margin: 0; accent-color: var(--accent); }
+  .drop:focus-within { outline: 2px solid var(--accent); outline-offset: 1px; }
   .howto {
     font-size: 11px; color: var(--muted); background: var(--bg);
     border: 1px solid var(--border); border-radius: var(--radius);
@@ -1733,6 +1747,8 @@ export class PageRepo extends LoomElement {
     return this.mrQuery.data ?? null;
   }
   @reactive accessor busy = false;
+  /** Whether merging should also remove the source branch. */
+  @reactive accessor dropSource = true;
   /**
    * Only an admin may read this. A 403 is a permissions answer rather than a
    * fault, so the render treats "no data" as "none to show" and nothing reads
@@ -3159,6 +3175,23 @@ export class PageRepo extends LoomElement {
     );
   }
 
+  /// A request whose source and target are the same branch in the same
+  /// repository: there is nothing separate to delete.
+  private sameBranch(m: MergeRequestDetail): boolean {
+    return !m.source_repo && m.source_branch === m.target_branch;
+  }
+
+  /// Whether the branch a merged request came from is still around.
+  ///
+  /// Only answerable for a request from this repository — a fork's branches
+  /// are not in this repository's refs, and guessing from their absence would
+  /// offer a delete for something that is not there.
+  private sourceStillHere(m: MergeRequestDetail): boolean {
+    if (m.source_repo || this.repo?.access === "read") return false;
+    if (this.sameBranch(m)) return false;
+    return (this.refs ?? []).some((r) => r.kind !== "tag" && r.name === m.source_branch);
+  }
+
   /// Post a comment on the merge request being viewed.
   ///
   /// The composer is cleared only after the request lands, so a failed post
@@ -4193,11 +4226,33 @@ fkit push</pre>
                       : ""
                   }
                   onClick={() =>
-                    void this.act(() => api.performMerge(at.owner, at.name, m.number))
+                    void this.act(async () => {
+                      const r = await api.performMerge(at.owner, at.name, m.number, {
+                        deleteSource: this.dropSource,
+                      });
+                      await this.refsQuery.refetch();
+                      return r;
+                    })
                   }
                 >
                   {this.busy ? "merging…" : `merge into ${m.target_branch}`}
                 </button>
+              ) : null}
+              {/* Merging makes the source's commits ancestors of the target, so
+                  removing the branch afterwards discards nothing. Offered as a
+                  choice rather than done silently, because a branch someone is
+                  still using is theirs to keep. */}
+              {open && m.can_merge && c.mergeable && !c.up_to_date && !this.sameBranch(m) ? (
+                <label class="drop" title={`delete ${m.source_branch} once this lands`}>
+                  <input
+                    type="checkbox"
+                    checked={this.dropSource}
+                    onChange={(e: Event) =>
+                      (this.dropSource = (e.target as HTMLInputElement).checked)
+                    }
+                  />
+                  delete branch
+                </label>
               ) : null}
               {open && m.can_merge ? (
                 <button
@@ -4206,6 +4261,30 @@ fkit push</pre>
                   onClick={() => void this.act(() => api.closeMerge(at.owner, at.name, m.number))}
                 >
                   close
+                </button>
+              ) : null}
+              {!open && m.state === "merged" && this.sourceStillHere(m) ? (
+                <button
+                  class="bare"
+                  disabled={this.busy}
+                  title={`delete ${m.source_branch}`}
+                  onClick={async () => {
+                    const ok = await confirmAction({
+                      title: `Delete ${m.source_branch}?`,
+                      body:
+                        "This merge request has landed, so its commits are already on " +
+                        `${m.target_branch}. Deleting the branch discards nothing.`,
+                      confirm: "Delete branch",
+                      danger: true,
+                    });
+                    if (!ok) return;
+                    void this.act(async () => {
+                      await api.deleteRef(at.owner, at.name, "branch", m.source_branch);
+                      await this.refsQuery.refetch();
+                    });
+                  }}
+                >
+                  delete branch
                 </button>
               ) : null}
               {!open && m.state === "closed" && m.can_merge === false && this.repo!.access !== "read" ? (

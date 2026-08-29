@@ -183,16 +183,22 @@ struct TreeResponse {
 async fn tree_root(
     State(state): State<AppState>,
     viewer: Viewer,
+    headers: axum::http::HeaderMap,
     Path((owner, name, r)): Path<(String, String, String)>,
 ) -> AppResult<Json<TreeResponse>> {
     let (store, commit, tree) = open(&state, &viewer, &owner, &name, &r).await?;
     let mut entries = content::list_dir(&store, tree, "")?;
-    link_submodules(&state, &viewer, &owner, &name, &mut entries).await;
+    link_submodules(&state, &viewer, host_of(&headers), &owner, &name, &mut entries).await;
     Ok(Json(TreeResponse {
         entries,
         path: String::new(),
         commit: commit.to_hex(),
     }))
+}
+
+/// The host this request was addressed to, if it said.
+fn host_of(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers.get(axum::http::header::HOST).and_then(|v| v.to_str().ok())
 }
 
 /// Point a submodule entry at the repository it pins, when that repository is
@@ -211,6 +217,7 @@ async fn tree_root(
 async fn link_submodules(
     state: &AppState,
     viewer: &Viewer,
+    host: Option<&str>,
     owner: &str,
     name: &str,
     entries: &mut [content::EntryView],
@@ -218,9 +225,20 @@ async fn link_submodules(
     let here = format!("{owner}/{name}");
     for e in entries.iter_mut().filter(|e| e.kind == "submodule") {
         let Some(hint) = e.remote.as_deref() else { continue };
-        let Some(path) = fkit_core::submodule::resolve_relative(&here, hint) else { continue };
+
+        // Relative to this repository, or absolute at the host this request
+        // arrived on. Anything else is a different server and gets no link.
+        //
+        // Host is client-supplied and so cannot be trusted for authorisation,
+        // but it is not being used for any: it only decides whether to attempt
+        // a lookup, and the lookup itself is permission-checked below. A forged
+        // Host can therefore reveal nothing the viewer could not already see.
+        let path = fkit_core::submodule::resolve_relative(&here, hint)
+            .or_else(|| host.and_then(|h| fkit_core::submodule::path_on_host(h, hint)));
+        let Some(path) = path else { continue };
+
         let Some((o, n)) = path.split_once('/') else { continue };
-        if !path.contains('/') || o.is_empty() || n.is_empty() || n.contains('/') {
+        if o.is_empty() || n.is_empty() || n.contains('/') {
             continue;
         }
         if super::load_repo(state, viewer, o, n).await.is_ok() {
@@ -232,12 +250,13 @@ async fn link_submodules(
 async fn tree_path(
     State(state): State<AppState>,
     viewer: Viewer,
+    headers: axum::http::HeaderMap,
     Path((owner, name, r, path)): Path<(String, String, String, String)>,
 ) -> AppResult<Json<TreeResponse>> {
     let (store, commit, tree, path) =
         open_in_path(&state, &viewer, &owner, &name, &r, &path).await?;
     let mut entries = content::list_dir(&store, tree, &path)?;
-    link_submodules(&state, &viewer, &owner, &name, &mut entries).await;
+    link_submodules(&state, &viewer, host_of(&headers), &owner, &name, &mut entries).await;
     Ok(Json(TreeResponse {
         entries,
         path,

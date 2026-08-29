@@ -462,6 +462,9 @@ async fn read_ref(state: &AppState, repo_id: Uuid, branch: &str) -> AppResult<Op
 struct MergeReq {
     #[serde(default)]
     message: Option<String>,
+    /// Remove the source branch once the merge has landed.
+    #[serde(default)]
+    delete_source: Option<bool>,
 }
 
 /// Perform the merge and advance the target branch.
@@ -476,6 +479,11 @@ async fn do_merge(
     let (repo, access, _) = super::load_repo(&state, &viewer, &owner, &name).await?;
     require_write(access)?;
     let u = viewer.require()?;
+
+    let (message_from, drop_source) = match body {
+        Some(Json(b)) => (b.message, b.delete_source.unwrap_or(false)),
+        None => (None, false),
+    };
 
     let row = load(&state, repo.id, number).await?;
     if row.state != "open" {
@@ -549,8 +557,8 @@ async fn do_merge(
             )));
         }
 
-        let message = body
-            .and_then(|Json(b)| b.message)
+        let message = message_from
+            .clone()
             .filter(|m| !m.trim().is_empty())
             .unwrap_or_else(|| {
                 format!(
@@ -603,7 +611,100 @@ async fn do_merge(
     .await?;
     tx.commit().await?;
 
-    finish(&state, &repo, &row, u.id, new_tip, "merged").await
+    let out = finish(&state, &repo, &row, u.id, new_tip, "merged").await?;
+
+    // After the merge, and never able to undo it. A branch that survives when
+    // it should not is one click to remove; a merge rolled back because the
+    // branch would not delete is a much worse trade — the same reasoning that
+    // puts issue-closing after the merge rather than inside it.
+    if drop_source {
+        if let Err(e) = drop_source_branch(&state, &viewer, &repo, &row).await {
+            tracing::warn!("merged #{} but could not delete {}: {e}", row.number, row.source_branch);
+        }
+    }
+
+    Ok(out)
+}
+
+/// Remove the branch a merge request came from, once it has landed.
+///
+/// Every guard that `delete_ref` applies still applies here — a merge is not a
+/// reason to remove the default branch, or one another open request still
+/// needs. The only thing merging changes is that this request no longer counts
+/// as a reason to keep it.
+async fn drop_source_branch(
+    state: &AppState,
+    viewer: &Viewer,
+    repo: &RepoRow,
+    row: &MrRow,
+) -> AppResult<()> {
+    // A cross-fork request's branch belongs to the fork, not to us. Load it as
+    // the viewer so that deleting it needs the same write access that deleting
+    // it directly would.
+    let source_repo_id = row.source_repo_id.unwrap_or(repo.id);
+    let source: RepoRow = sqlx::query_as("SELECT * FROM repos WHERE id = $1")
+        .bind(source_repo_id)
+        .fetch_one(&state.db)
+        .await?;
+
+    if source.id != repo.id {
+        let (owner,): (String,) = sqlx::query_as("SELECT username FROM users WHERE id = $1")
+            .bind(source.owner_id)
+            .fetch_one(&state.db)
+            .await?;
+        let (_, access, _) = super::load_repo(state, viewer, &owner, &source.name).await?;
+        require_write(access)?;
+    }
+
+    if row.source_branch == source.default_branch {
+        return Err(AppError::conflict(format!(
+            "{} is the default branch of {}",
+            row.source_branch, source.name
+        )));
+    }
+    if source.id == repo.id && row.source_branch == row.target_branch {
+        return Err(AppError::conflict("the source and target are the same branch".to_string()));
+    }
+
+    let open: Option<(i32,)> = sqlx::query_as(
+        "SELECT number FROM merge_requests
+         WHERE state = 'open'
+           AND ((repo_id = $1 AND (source_branch = $2 OR target_branch = $2))
+             OR (source_repo_id = $1 AND source_branch = $2))
+         ORDER BY number
+         LIMIT 1",
+    )
+    .bind(source.id)
+    .bind(&row.source_branch)
+    .fetch_optional(&state.db)
+    .await?;
+
+    if let Some((number,)) = open {
+        return Err(AppError::conflict(format!(
+            "merge request #{number} is still open on {}",
+            row.source_branch
+        )));
+    }
+
+    sqlx::query("DELETE FROM refs WHERE repo_id = $1 AND name = $2")
+        .bind(source.id)
+        .bind(&row.source_branch)
+        .execute(&state.db)
+        .await?;
+
+    super::audit(
+        state,
+        viewer.id(),
+        Some(source.id),
+        "ref.delete",
+        serde_json::json!({
+            "kind": "branch",
+            "name": row.source_branch,
+            "reason": format!("merged in #{}", row.number),
+        }),
+    )
+    .await;
+    Ok(())
 }
 
 fn commit_tree(store: &Store, id: Hash) -> AppResult<Hash> {

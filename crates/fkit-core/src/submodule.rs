@@ -169,6 +169,27 @@ pub fn resolve_relative(base: &str, hint: &str) -> Option<String> {
     Some(segs.join("/"))
 }
 
+/// The `owner/repo` path of a URL, when its host is `host`.
+///
+/// Used to decide whether a submodule points back at the server currently
+/// answering: if it does, the pin can be linked to the repository it names
+/// rather than left as a bare URL. Scheme is ignored beyond being one we
+/// serve, since `wss://` and `https://` reach the same place.
+pub fn path_on_host(host: &str, url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    if !matches!(scheme, "ws" | "wss" | "http" | "https") {
+        return None;
+    }
+    let (authority, path) = rest.split_once('/')?;
+    // Userinfo is not part of where a URL points.
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    if !authority.eq_ignore_ascii_case(host) {
+        return None;
+    }
+    let path = path.trim_end_matches('/');
+    (!path.is_empty()).then(|| path.to_string())
+}
+
 /// Parse the suggestions file's contents, wherever they were read from.
 ///
 /// Split out because the hub reads it out of a tree rather than off a disk:
@@ -248,27 +269,8 @@ pub fn set_hint(repo: &Repo, path: &str, what: Option<Suggestion>) -> Result<()>
         return Ok(());
     }
     let mut body = String::from(
-        "\
-# Submodules used by this project.\n\
-#\n\
-# One line each:\n\
-#\n\
-#     <path in this repository> = <url>@<revision>\n\
-#\n\
-# for example\n\
-#\n\
-#     vendor/loom = wss://example.com/alice/loom@<64 hex characters>\n\
-#\n\
-# The revision after the @ is the exact commit of that repository which this\n\
-# one is pinned to, so a submodule bump reads as an ordinary one-line change.\n\
-# The commit itself is what actually carries the pin — this line is rewritten\n\
-# to match whenever it moves, and `fkit submodule` reports it if the two ever\n\
-# disagree.\n\
-#\n\
-# The url may instead be relative to this repository's own remote, written\n\
-# `../loom`, which keeps a fork on another host fetching from that host rather\n\
-# than from the original. `fkit submodule set-remote <path> <url>` points one\n\
-# somewhere else for this machine only, and does not touch this file.\n",
+        "# Submodules: <path> = <url>@<revision>. The commit is what pins;\n\
+         # this line follows it. `fkit submodule` shows the current state.\n",
     );
     for (p, sug) in &all {
         body.push_str(&format!("{p} = {sug}\n"));
@@ -463,6 +465,27 @@ mod tests {
         };
         let text = format!("path = {}\nremote = {}\npin = {}\n", m.path, m.remote, m.pin);
         assert_eq!(parse(&text), Some(m));
+    }
+
+    #[test]
+    fn a_url_is_recognised_as_pointing_back_at_this_server() {
+        assert_eq!(
+            path_on_host("example.com", "wss://example.com/alice/loom").as_deref(),
+            Some("alice/loom")
+        );
+        // Same place, different scheme.
+        assert_eq!(
+            path_on_host("h:7500", "ws://h:7500/alice/loom").as_deref(),
+            Some("alice/loom")
+        );
+        assert_eq!(
+            path_on_host("example.com", "wss://user@example.com/alice/loom").as_deref(),
+            Some("alice/loom")
+        );
+        // A different host is somebody else's server, port included.
+        assert_eq!(path_on_host("example.com", "wss://other.test/alice/loom"), None);
+        assert_eq!(path_on_host("h:7500", "wss://h:7501/alice/loom"), None);
+        assert_eq!(path_on_host("example.com", "../loom"), None);
     }
 
     #[test]

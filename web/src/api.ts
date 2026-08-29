@@ -753,10 +753,15 @@ export const api = {
       target_branch: string;
     },
   ) => request<MergeRequest>(`/repos/${owner}/${name}/merges`, { method: "POST", body: body(input) }),
-  performMerge: (owner: string, name: string, number: number, message?: string) =>
+  performMerge: (
+    owner: string,
+    name: string,
+    number: number,
+    opts: { message?: string; deleteSource?: boolean } = {},
+  ) =>
     request<MergeRequest>(`/repos/${owner}/${name}/merges/${number}/merge`, {
       method: "POST",
-      body: body({ message }),
+      body: body({ message: opts.message, delete_source: opts.deleteSource }),
     }),
   closeMerge: (owner: string, name: string, number: number) =>
     request<MergeRequest>(`/repos/${owner}/${name}/merges/${number}/close`, { method: "POST" }),
