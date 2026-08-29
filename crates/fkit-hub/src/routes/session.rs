@@ -748,6 +748,7 @@ async fn list_tokens(State(state): State<AppState>, viewer: Viewer) -> AppResult
         name: String,
         prefix: String,
         can_write: bool,
+        attributes: bool,
         created_at: chrono::DateTime<Utc>,
         last_used_at: Option<chrono::DateTime<Utc>>,
         expires_at: Option<chrono::DateTime<Utc>>,
@@ -755,7 +756,7 @@ async fn list_tokens(State(state): State<AppState>, viewer: Viewer) -> AppResult
 
     let rows: Vec<Row> =
         sqlx::query_as(
-            "SELECT id, name, prefix, can_write, created_at, last_used_at, expires_at
+            "SELECT id, name, prefix, can_write, attributes, created_at, last_used_at, expires_at
              FROM access_tokens WHERE user_id = $1 ORDER BY created_at DESC",
         )
         .bind(u.id)
@@ -769,6 +770,7 @@ async fn list_tokens(State(state): State<AppState>, viewer: Viewer) -> AppResult
                 name: r.name,
                 prefix: r.prefix,
                 can_write: r.can_write,
+                attributes: r.attributes,
                 created_at: r.created_at,
                 last_used_at: r.last_used_at,
                 expires_at: r.expires_at,
@@ -795,8 +797,9 @@ async fn create_token(
     let expires = body.expires_in_days.map(|d| Utc::now() + Duration::days(d));
 
     sqlx::query(
-        "INSERT INTO access_tokens (id, user_id, name, prefix, token_hash, can_write, expires_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        "INSERT INTO access_tokens
+             (id, user_id, name, prefix, token_hash, can_write, attributes, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
     )
     .bind(id)
     .bind(u.id)
@@ -804,17 +807,25 @@ async fn create_token(
     .bind(&minted.prefix)
     .bind(&minted.hash)
     .bind(body.can_write)
+    // On by default: the ordinary case is someone pushing their own work. A
+    // mirror is the exception and has to say so.
+    .bind(body.attributes.unwrap_or(true))
     .bind(expires)
     .execute(&state.db)
     .await?;
 
     super::audit(&state, Some(u.id), None, "token.create",
-        serde_json::json!({ "name": name, "can_write": body.can_write })).await;
+        serde_json::json!({
+            "name": name,
+            "can_write": body.can_write,
+            "attributes": body.attributes.unwrap_or(true),
+        })).await;
 
     Ok((
         StatusCode::CREATED,
         Json(NewTokenView {
             token: TokenView {
+                attributes: body.attributes.unwrap_or(true),
                 id,
                 name: name.to_string(),
                 prefix: minted.prefix,

@@ -69,6 +69,19 @@ const sheet = css`
     font-size: 12px; color: var(--muted); cursor: pointer; user-select: none;
   }
 
+  /* Attribution sits under the row rather than in it. It is the rarer
+     choice, and a second toggle beside the first made the row wrap on a
+     narrow window and read as two equal decisions, which they are not. */
+  .mint-link {
+    display: flex; align-items: center; gap: 7px;
+    margin: -6px 0 14px; cursor: pointer; user-select: none;
+    /* Same reset as .mint-push: the base sheet makes a label an upper-case
+       caption, which is right above a field and wrong beside a switch. */
+    text-transform: none; letter-spacing: 0; font-weight: 400;
+    font-size: 12px; color: var(--muted);
+  }
+  .mint-link .why { color: var(--faint); }
+
   /* The token that was just made. Accented because it is the one thing on
      this page that cannot be recovered by reloading. */
   .minted {
@@ -188,6 +201,10 @@ export class PageSettings extends SettingsBase {
   @reactive accessor fresh: NewToken | null = null;
   @reactive accessor sessions: SessionInfo[] | null = null;
   @reactive accessor canWrite = true;
+  // Not named `attributes`: every custom element already has an `attributes`
+  // property, and shadowing it on the class is a real collision, not a
+  // stylistic one.
+  @reactive accessor linkCommits = true;
   @reactive accessor copied = false;
 
   /// What the profile form currently holds, so the preview beside it can show
@@ -435,7 +452,14 @@ export class PageSettings extends SettingsBase {
               const name = input.value.trim();
               if (!name) return;
               void this.act(async () => {
-                this.fresh = await api.createToken({ name, can_write: this.canWrite });
+                this.fresh = await api.createToken({
+                  name,
+                  can_write: this.canWrite,
+                  // A read-only token pushes nothing, so it has nothing to
+                  // attribute. Send the honest value rather than a stale one
+                  // left behind by a toggle the user could not see.
+                  attributes: this.canWrite && this.linkCommits,
+                });
                 this.copied = false;
                 this.tokens = await api.tokens();
                 input.value = "";
@@ -462,6 +486,20 @@ export class PageSettings extends SettingsBase {
             </button>
           </form>
 
+          {/* Only shown for a token that can push: a read-only token never
+              delivers a commit, so there is nothing for it to attribute. */}
+          {this.canWrite ? (
+            <label class="mint-link">
+              <fkit-toggle
+                checked={this.linkCommits}
+                label="link commits to my account"
+                onToggle={(e: Event) => (this.linkCommits = (e as CustomEvent<boolean>).detail)}
+              ></fkit-toggle>
+              link commits to my account
+              <span class="why">— off for a mirror of someone else's work</span>
+            </label>
+          ) : null}
+
           {/* The token belongs directly under the thing that made it, not in a
               section above it. It is the form's output. */}
           {this.fresh ? (
@@ -472,6 +510,9 @@ export class PageSettings extends SettingsBase {
                 <span class={`tag ${this.fresh.can_write ? "on" : ""}`}>
                   {this.fresh.can_write ? "read + write" : "read"}
                 </span>
+                {this.fresh.can_write && !this.fresh.attributes ? (
+                  <span class="tag">unlinked</span>
+                ) : null}
                 <span class="grow"></span>
                 <span class="once">copy it now — it is not shown again</span>
               </div>
@@ -503,6 +544,11 @@ export class PageSettings extends SettingsBase {
                   <span class={`tag ${t.can_write ? "on" : ""}`}>
                     {t.can_write ? "read + write" : "read"}
                   </span>
+                  {t.can_write && !t.attributes ? (
+                    <span class="tag" title="Commits pushed with this token are not linked to your account">
+                      unlinked
+                    </span>
+                  ) : null}
                   <button
                     class="danger bare"
                     disabled={this.busy}

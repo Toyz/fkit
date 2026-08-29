@@ -346,14 +346,23 @@ pub fn mint_token() -> AppResult<IssuedToken> {
     })
 }
 
+/// A token's owner, and the two things the token itself decides.
+pub struct TokenAuth {
+    pub user: UserRow,
+    pub can_write: bool,
+    /// Link what this token pushes to its owner. Off for a mirror, which
+    /// carries other people's history.
+    pub attributes: bool,
+}
+
 /// Verify `fkit_pat_<prefix>_<secret>` in one indexed lookup.
-pub async fn lookup_token(db: &sqlx::PgPool, presented: &str) -> Option<(UserRow, bool)> {
+pub async fn lookup_token(db: &sqlx::PgPool, presented: &str) -> Option<TokenAuth> {
     if !presented.starts_with(TOKEN_PREFIX) {
         return None;
     }
 
-    let row: (Uuid, Uuid, bool) = sqlx::query_as(
-        "SELECT t.id, t.user_id, t.can_write FROM access_tokens t
+    let row: (Uuid, Uuid, bool, bool) = sqlx::query_as(
+        "SELECT t.id, t.user_id, t.can_write, t.attributes FROM access_tokens t
          WHERE t.token_hash = $1 AND (t.expires_at IS NULL OR t.expires_at > now())",
     )
     .bind(token_digest(presented))
@@ -372,7 +381,7 @@ pub async fn lookup_token(db: &sqlx::PgPool, presented: &str) -> Option<(UserRow
         .fetch_optional(db)
         .await
         .ok()??;
-    Some((user, row.2))
+    Some(TokenAuth { user, can_write: row.2, attributes: row.3 })
 }
 
 // ---- the request extractor ----------------------------------------------
@@ -436,7 +445,8 @@ impl FromRequestParts<AppState> for Viewer {
             .map(str::to_string);
 
         if let Some(tok) = bearer
-            && let Some((user, can_write)) = lookup_token(&state.db, &tok).await
+            && let Some(TokenAuth { user, can_write, .. }) =
+                lookup_token(&state.db, &tok).await
         {
             return Ok(Viewer {
                 user: Some(ViewerUser {

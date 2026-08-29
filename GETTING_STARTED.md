@@ -182,6 +182,22 @@ all.
 A read-only token cannot push, even to your own repositories — narrowing is the
 only thing a token can do.
 
+### Whose commits are these
+
+A commit's author name and email are just text you typed; anyone can put anyone
+in there. So the hub does not attribute commits by matching that email against
+accounts. It records who *pushed* them, which it knows for certain, because the
+push was authenticated by your token.
+
+Your account link therefore follows your token, not your `author.name`. Change
+your author string, push from a different machine, use a different email — the
+commits still land on your profile. The author string is still shown exactly as
+written; the account link sits beside it.
+
+Untick **link commits to my account** when generating a token if that token is
+going to push somebody else's history — a mirror of a GitHub repository, say.
+Commits pushed with it stay flat: author string only, no account behind it.
+
 ```sh
 $ fkit push
 pushing main (de7b2767f8) to ws://localhost:7500/ada/hello

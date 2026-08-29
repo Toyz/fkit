@@ -410,6 +410,13 @@ It **refuses to start** on a non-loopback address without a token unless you pas
 * Server administrators can read every repository. That is deliberate — it is
   what "administrator" means for operations — so it is disclosed in the UI on
   every such view rather than only in an audit table, and recorded in one.
+* Commits link to accounts by **who pushed them**, never by matching the author
+  email. The author string is content — whoever wrote the commit chose it, and
+  it can name anyone — so matching it against accounts puts a real person's
+  profile behind a line that person never wrote. The push is authenticated, so
+  the server knows the answer instead of guessing it. Both are shown: the
+  author string as written, and the account beside it. A token can decline to
+  link, which is what a mirror of someone else's history should use.
 * `server.trust_proxy` must stay **off** on a directly-exposed server. The
   header it believes is client-supplied, so trusting it there lets anyone mint
   a new identity per request and skip rate limiting entirely.

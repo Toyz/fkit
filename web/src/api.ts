@@ -29,6 +29,8 @@ export interface Head {
   summary: string;
   author: string;
   timestamp: number;
+  /** The account that pushed it, when the server knows. */
+  pushed_by?: string;
 }
 
 export interface Repo {
@@ -188,10 +190,14 @@ export interface Commit {
   short: string;
   tree: string;
   parents: string[];
+  /** What the commit says. Free text, written by whoever made it. */
   author: string;
   timestamp: number;
   message: string;
   summary: string;
+  /** The account that pushed it, when the server knows. Absent for commits
+   *  pushed before this existed, and for mirrors, which decline to link. */
+  pushed_by?: string;
 }
 
 export interface Change {
@@ -245,6 +251,7 @@ export interface Token {
   name: string;
   prefix: string;
   can_write: boolean;
+  attributes: boolean;
   created_at: string;
   last_used_at: string | null;
   expires_at: string | null;
@@ -893,7 +900,12 @@ export const api = {
 
   // tokens
   tokens: () => request<Token[]>("/tokens"),
-  createToken: (input: { name: string; can_write: boolean; expires_in_days?: number }) =>
+  createToken: (input: {
+    name: string;
+    can_write: boolean;
+    attributes?: boolean;
+    expires_in_days?: number;
+  }) =>
     request<NewToken>("/tokens", { method: "POST", body: body(input) }),
   revokeToken: (id: string) => request<{ ok: boolean }>(`/tokens/${id}`, { method: "DELETE" }),
 

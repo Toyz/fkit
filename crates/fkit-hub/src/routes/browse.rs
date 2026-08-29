@@ -371,7 +371,9 @@ async fn commits(
 ) -> AppResult<Json<Vec<content::CommitView>>> {
     let (store, commit, _) = open(&state, &viewer, &owner, &name, &r).await?;
     let limit = page.limit.clamp(1, 200);
-    Ok(Json(content::history(&store, commit, limit, page.skip)?))
+    let mut views = content::history(&store, commit, limit, page.skip)?;
+    content::attach_authors(&state.db, &mut views).await;
+    Ok(Json(views))
 }
 
 #[derive(Serialize)]
@@ -392,7 +394,12 @@ async fn commit_detail(
     let c = content::commit_of(&store, id)?;
 
     Ok(Json(CommitDetail {
-        commit: content::to_view(id, &c),
+        commit: {
+            let mut v = [content::to_view(id, &c)];
+            content::attach_authors(&state.db, &mut v).await;
+            let [one] = v;
+            one
+        },
         changes: content::commit_diff(&store, id)?,
     }))
 }
@@ -551,7 +558,9 @@ async fn compare(
     let base_id = resolve_side(&state, &viewer, &repo, &base).await?;
     let head_id = resolve_side(&state, &viewer, &repo, &head).await?;
 
-    Ok(Json(content::compare(&store, &base, base_id, &head, head_id)?))
+    let mut cmp = content::compare(&store, &base, base_id, &head, head_id)?;
+    content::attach_authors(&state.db, &mut cmp.commits).await;
+    Ok(Json(cmp))
 }
 
 #[derive(Serialize)]

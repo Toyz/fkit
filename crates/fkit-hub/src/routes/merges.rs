@@ -418,7 +418,7 @@ async fn detail(
     // request from a fork is not this one. Both resolve in the same store, so
     // the comparison itself needs nothing special.
     let src_id = row.source_repo_id.unwrap_or(repo.id);
-    let comparison = match (
+    let mut comparison = match (
         read_ref(&state, repo.id, &row.target_branch).await?,
         read_ref(&state, src_id, &row.source_branch).await?,
     ) {
@@ -431,6 +431,9 @@ async fn detail(
         )?),
         _ => None,
     };
+    if let Some(c) = comparison.as_mut() {
+        content::attach_authors(&state.db, &mut c.commits).await;
+    }
 
     let can_merge = access.can_write() && row.state == "open";
     let id = row.id;

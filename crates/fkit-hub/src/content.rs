@@ -231,10 +231,70 @@ pub struct CommitView {
     pub short: String,
     pub tree: String,
     pub parents: Vec<String>,
+    /// What the commit claims, which is free text and always shown.
     pub author: String,
     pub timestamp: i64,
     pub message: String,
     pub summary: String,
+    /// The account that delivered it, when one is known.
+    ///
+    /// Filled in separately from the object: this is the one fact about a
+    /// commit that does not live in the commit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pushed_by: Option<String>,
+}
+
+/// Attach the account behind each commit, in one query.
+///
+/// Separate from building the views because it is the only part that needs the
+/// database: a commit object knows what its author typed, and nothing else.
+pub async fn attach_authors(db: &sqlx::PgPool, views: &mut [CommitView]) {
+    let found = authors_of(db, views.iter().map(|v| v.hash.as_str())).await;
+    if found.is_empty() {
+        return;
+    }
+    for v in views.iter_mut() {
+        v.pushed_by = found.get(&v.hash).cloned();
+    }
+}
+
+/// Look up the account behind each of these commit hashes, in one query.
+///
+/// Takes hex because that is what every view already holds, and returns only
+/// the ones that are known — an absent entry means "no linked account", which
+/// is the ordinary state for history pushed before this existed and the
+/// deliberate state for a mirror.
+pub async fn authors_of<'a>(
+    db: &sqlx::PgPool,
+    hashes: impl IntoIterator<Item = &'a str>,
+) -> std::collections::HashMap<String, String> {
+    let raw: Vec<Vec<u8>> = hashes
+        .into_iter()
+        .filter_map(|h| Hash::from_hex(h).map(|h| h.0.to_vec()))
+        .collect();
+    if raw.is_empty() {
+        return Default::default();
+    }
+
+    let rows: Vec<(Vec<u8>, String)> = sqlx::query_as(
+        "SELECT ca.commit_hash, u.username
+           FROM commit_authors ca
+           JOIN users u ON u.id = ca.user_id
+          WHERE ca.commit_hash = ANY($1)",
+    )
+    .bind(&raw)
+    .fetch_all(db)
+    .await
+    // Never fatal. A commit without its account link still shows everything
+    // the commit itself says, which is what it showed before this existed.
+    .unwrap_or_else(|e| {
+        tracing::warn!("looking up commit authors: {e}");
+        Vec::new()
+    });
+
+    rows.into_iter()
+        .map(|(h, name)| (h.iter().map(|b| format!("{b:02x}")).collect(), name))
+        .collect()
 }
 
 pub fn to_view(id: Hash, c: &fkit_core::object::Commit) -> CommitView {
@@ -246,6 +306,7 @@ pub fn to_view(id: Hash, c: &fkit_core::object::Commit) -> CommitView {
         author: c.author.clone(),
         timestamp: c.timestamp,
         summary: c.message.lines().next().unwrap_or_default().to_string(),
+        pushed_by: None,
         message: c.message.clone(),
     }
 }

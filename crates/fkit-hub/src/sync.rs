@@ -68,8 +68,95 @@ struct PgHost {
     repo: RepoRow,
     access: Access,
     user_id: Option<Uuid>,
+    /// Whether the credential that opened this session links what it pushes to
+    /// its owner. Off for a mirror's token.
+    attributes: bool,
     label: String,
     actor: String,
+}
+
+impl PgHost {
+    /// Record which account delivered these commits.
+    ///
+    /// Walks back from the new tip and stops at the first commit already
+    /// recorded: everything behind that one was recorded when *it* arrived, so
+    /// there is nothing further to learn. After the first push this touches
+    /// only what the push actually added.
+    ///
+    /// Deliberately outside `advance_ref`'s transaction. That one holds a lock
+    /// on the ref row and every concurrent push to the branch waits behind it;
+    /// attribution is not worth widening that window, and a push whose
+    /// attribution failed is still a push that happened.
+    fn record_authorship(&self, user_id: Uuid, tip: Hash) {
+        // A first import can be enormous. The cap keeps one push from walking
+        // a hundred thousand commits while the client waits for its reply; the
+        // ones beyond it simply have no linked account, which is the same
+        // state as a commit pushed before this existed.
+        const MAX: usize = 5_000;
+
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![tip];
+        let mut batch: Vec<Vec<u8>> = Vec::new();
+
+        while let Some(h) = stack.pop() {
+            if batch.len() >= MAX {
+                tracing::warn!(
+                    "push to {} attributed the first {MAX} commits; the rest are unlinked",
+                    self.label
+                );
+                break;
+            }
+            if !seen.insert(h) {
+                continue;
+            }
+            // Already attributed means its ancestors are too — stop here
+            // rather than walking history that is already answered.
+            if self.already_attributed(h) {
+                continue;
+            }
+            let Ok(fkit_core::object::Object::Commit(c)) = self.store.get(h) else { continue };
+            batch.push(h.0.to_vec());
+            stack.extend(c.parents);
+        }
+
+        if batch.is_empty() {
+            return;
+        }
+        let n = batch.len();
+
+        // First writer wins. A force-push, or a fork pushing the same commits
+        // somewhere else, must not reattribute what someone else delivered.
+        let done = self.rt.block_on(
+            sqlx::query(
+                "INSERT INTO commit_authors (commit_hash, user_id, repo_id)
+                 SELECT h, $2, $3 FROM UNNEST($1::bytea[]) AS h
+                 ON CONFLICT (commit_hash) DO NOTHING",
+            )
+            .bind(&batch)
+            .bind(user_id)
+            .bind(self.repo.id)
+            .execute(&self.state.db),
+        );
+
+        match done {
+            Ok(r) => tracing::debug!("attributed {} of {n} commit(s)", r.rows_affected()),
+            // Never fatal: the push has already landed, and an unlinked commit
+            // shows its author string exactly as it did before.
+            Err(e) => tracing::warn!("could not attribute commits for {}: {e}", self.label),
+        }
+    }
+
+    fn already_attributed(&self, h: Hash) -> bool {
+        self.rt
+            .block_on(
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM commit_authors WHERE commit_hash = $1)",
+                )
+                .bind(h.0.to_vec())
+                .fetch_one(&self.state.db),
+            )
+            .unwrap_or(false)
+    }
 }
 
 impl RepoHost for PgHost {
@@ -184,6 +271,14 @@ impl RepoHost for PgHost {
             "push {}/{branch} -> {} by {} ({} objects, {} bytes)",
             self.label, tip.short(), self.actor, stats.objects, stats.bytes
         );
+        // A mirror carries other people's history. Stamping this account on
+        // all of it would be worse than leaving it flat: a wrong name with a
+        // face and a profile link behind it reads as fact.
+        if let Some(uid) = self.user_id
+            && self.attributes
+        {
+            self.record_authorship(uid, tip);
+        }
     }
 
     fn on_pull(&self, branch: &str, stats: &TransferStats) {
@@ -283,9 +378,16 @@ async fn authorise(
 
     let repo = repo.ok_or_else(hidden)?;
 
-    let (uid, admin, can_write, actor) = match &viewer {
-        Some((u, w)) => (Some(u.id), u.is_admin, *w, u.username.clone()),
-        None => (None, false, false, "anonymous".to_string()),
+    let (uid, admin, can_write, attributes, actor) = match &viewer {
+        Some(t) => (
+            Some(t.user.id),
+            t.user.is_admin,
+            t.can_write,
+            t.attributes,
+            t.user.username.clone(),
+        ),
+        // Anonymous cannot push, so attribution never arises.
+        None => (None, false, false, false, "anonymous".to_string()),
     };
 
     let access = resolve(&state.db, &repo, uid, admin, can_write, state.policy().require_auth)
@@ -306,6 +408,7 @@ async fn authorise(
         repo,
         access,
         user_id: uid,
+        attributes,
         actor,
     })
 }

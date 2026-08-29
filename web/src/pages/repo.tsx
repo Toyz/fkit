@@ -238,6 +238,62 @@ function parse(): { owner: string; name: string; view: View } | null {
  * `feature/x` would lose the ability to browse a directory called `x` on
  * `feature`, and every link that already worked would change meaning.
  */
+/* Two different things get called "the author" of a commit, and this file is
+   careful to keep them apart.
+
+   The author string is content. Whoever made the commit typed it, it is hashed
+   into the commit along with everything else, and it can say anything at all.
+   Matching it against account emails — which is how every other forge draws a
+   face beside a commit — puts a real person's profile behind a name that
+   person never wrote.
+
+   The account is authentication. The server watched the push arrive over a
+   session or a token belonging to exactly one account, so it is not a guess.
+
+   So: the author string is always shown, because it is what the commit says.
+   The account is shown as a link, because it is what is true. Where they agree
+   there is one name and it links. Where they disagree both appear, because
+   dropping either one would be a claim the server has no business making. */
+
+/** The name a commit puts on itself. A link when an account stands behind it. */
+function commitWho(c: { author: string; pushed_by?: string }) {
+  const claimed = authorName(c.author);
+  if (!c.pushed_by || !sameName(claimed, c.pushed_by)) {
+    return <span class="who-name">{claimed}</span>;
+  }
+  return profileLink(c.pushed_by);
+}
+
+/** The account behind a commit, when it is not already the name shown. */
+function pushedBy(c: { author: string; pushed_by?: string }) {
+  if (!c.pushed_by || sameName(authorName(c.author), c.pushed_by)) return null;
+  return (
+    <span class="who-via">
+      {" · pushed by "}
+      {profileLink(c.pushed_by)}
+    </span>
+  );
+}
+
+function profileLink(user: string) {
+  const href = `/${user}`;
+  return (
+    <a
+      class="who-link"
+      href={href}
+      onClick={linkHandler(href)}
+      title={`${user} pushed this commit`}
+    >
+      {user}
+    </a>
+  );
+}
+
+/** Loose enough that "Helba" and "helba" are one person, strict otherwise. */
+function sameName(claimed: string, account: string): boolean {
+  return claimed.trim().toLowerCase() === account.trim().toLowerCase();
+}
+
 function widenRef(known: string[], ref: string, path: string): { ref: string; path: string } {
   if (!ref || !path || known.includes(ref)) return { ref, path };
 
@@ -328,6 +384,17 @@ const commitSheet = css`
   }
   .m:hover { color: var(--accent); }
   .by { color: var(--faint); font-size: 11px; font-family: var(--sans); }
+
+  /* An account link, wherever a commit's byline is drawn. Same weight as the
+     text around it: it is a fact, not a call to action. */
+  .who-link {
+    color: inherit;
+    text-decoration: underline;
+    text-decoration-color: color-mix(in srgb, currentColor 32%, transparent);
+    text-underline-offset: 2px;
+  }
+  .who-link:hover { color: var(--accent); text-decoration-color: currentColor; }
+  .who-via { color: var(--faint); }
 
   .acts { display: flex; align-items: center; gap: 10px; }
   .sha {
@@ -479,7 +546,7 @@ const sheet = css`
     border-bottom: 0;
     border-radius: var(--radius) var(--radius) 0 0;
   }
-  .latest .who { color: var(--text); flex: none; }
+  .latest .who { color: var(--text); flex: none; white-space: nowrap; }
   .latest .msg {
     color: var(--muted); font-family: var(--sans);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -2427,7 +2494,10 @@ export class PageRepo extends LoomElement {
 
     return (
       <div class="latest">
-        <span class="who">{authorName(head.author)}</span>
+        <span class="who">
+          {commitWho(head)}
+          {pushedBy(head)}
+        </span>
         <a class="msg" href={commit} onClick={linkHandler(commit)} title={head.summary}>
           {head.summary || "(no message)"}
         </a>
@@ -2941,7 +3011,8 @@ export class PageRepo extends LoomElement {
               {c.summary || "(no message)"}
             </a>
             <span class="by">
-              {authorName(c.author)} committed {relativeTime(c.timestamp)}
+              {commitWho(c)} committed {relativeTime(c.timestamp)}
+              {pushedBy(c)}
             </span>
           </span>
           <span class="acts">
@@ -3144,9 +3215,13 @@ export class PageRepo extends LoomElement {
               bar of disconnected fragments under the header, which read as a
               toolbar that had lost its buttons. */}
           <div class="sby">
-            <fkit-avatar name={authorName(d.author)} size={20}></fkit-avatar>
-            <span class="who">{authorName(d.author)}</span>
+            {/* The face follows the account where there is one: it is the
+                only identity here the server can vouch for. The claimed author
+                name stays in the sentence beside it. */}
+            <fkit-avatar name={d.pushed_by ?? authorName(d.author)} size={20}></fkit-avatar>
+            <span class="who">{commitWho(d)}</span>
             <span>committed {relativeTime(d.timestamp)}</span>
+            {pushedBy(d)}
             <span class="dot">·</span>
             <span class="ex mono">{d.short}</span>
             {d.parents.length > 0 ? (
@@ -4115,7 +4190,10 @@ export class PageRepo extends LoomElement {
                       <a class="m" href={href} onClick={linkHandler(href)}>
                         {cm.summary || "(no message)"}
                       </a>
-                      <span class="by">{authorName(cm.author)} · {relativeTime(cm.timestamp)}</span>
+                      <span class="by">
+                        {commitWho(cm)} · {relativeTime(cm.timestamp)}
+                        {pushedBy(cm)}
+                      </span>
                       <a class="sha" href={href} onClick={linkHandler(href)}>{cm.short}</a>
                     </div>
                   );
@@ -5094,7 +5172,10 @@ fkit push</pre>
                       <a class="m" href={href} onClick={linkHandler(href)}>
                         {cm.summary || "(no message)"}
                       </a>
-                      <span class="by">{authorName(cm.author)} · {relativeTime(cm.timestamp)}</span>
+                      <span class="by">
+                        {commitWho(cm)} · {relativeTime(cm.timestamp)}
+                        {pushedBy(cm)}
+                      </span>
                       <a class="sha" href={href} onClick={linkHandler(href)}>{cm.short}</a>
                     </div>
                   );

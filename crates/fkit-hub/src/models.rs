@@ -139,8 +139,14 @@ pub struct HeadView {
     pub short: String,
     /// First line of the message.
     pub summary: String,
+    /// What the commit claims.
     pub author: String,
     pub timestamp: i64,
+    /// The account that pushed it, where one is known. Filled in by the ref
+    /// listing, which is scoped to one repository; a listing of many
+    /// repositories leaves it empty rather than paying for the lookup.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pushed_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -157,6 +163,8 @@ pub struct TokenView {
     pub name: String,
     pub prefix: String,
     pub can_write: bool,
+    /// Whether what this token pushes links to the account.
+    pub attributes: bool,
     pub created_at: DateTime<Utc>,
     pub last_used_at: Option<DateTime<Utc>>,
     pub expires_at: Option<DateTime<Utc>>,
@@ -217,6 +225,10 @@ pub struct CreateTokenReq {
     pub name: String,
     #[serde(default = "default_true")]
     pub can_write: bool,
+    /// Link commits pushed with this token to the account. Defaults on; off
+    /// for a mirror, which carries somebody else's history.
+    #[serde(default)]
+    pub attributes: Option<bool>,
     #[serde(default)]
     pub expires_in_days: Option<i64>,
 }

@@ -1017,7 +1017,7 @@ pub async fn refs_of(state: &AppState, repo: &RepoRow) -> AppResult<Vec<RefView>
 
     let store = state.store_for_network(repo.network_id).ok();
 
-    Ok(rows
+    let mut views: Vec<RefView> = rows
         .into_iter()
         .filter_map(|(n, t, u)| {
             let h = Hash(t.try_into().ok()?);
@@ -1035,7 +1035,23 @@ pub async fn refs_of(state: &AppState, repo: &RepoRow) -> AppResult<Vec<RefView>
                 name,
             })
         })
-        .collect())
+        .collect();
+
+    // One lookup for every branch and tag at once. A repository has a handful
+    // of refs, so this is cheap, and it is the head commit the repository page
+    // puts a name on.
+    let found = crate::content::authors_of(
+        &state.db,
+        views.iter().filter_map(|v| v.head.as_ref()).map(|h| h.commit.as_str()),
+    )
+    .await;
+    for v in views.iter_mut() {
+        if let Some(h) = v.head.as_mut() {
+            h.pushed_by = found.get(&h.commit).cloned();
+        }
+    }
+
+    Ok(views)
 }
 
 /// Summarise the commit a ref points at. `None` if the object is missing or is
@@ -1052,6 +1068,7 @@ pub fn head_view(store: &fkit_core::Store, hash: Hash) -> Option<crate::models::
         summary: c.message.lines().next().unwrap_or_default().to_string(),
         author: c.author,
         timestamp: c.timestamp,
+        pushed_by: None,
     })
 }
 

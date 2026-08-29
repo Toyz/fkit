@@ -177,6 +177,9 @@ pub async fn attach_heads(state: &AppState, views: &mut [RepoView]) {
             summary: c.message.lines().next().unwrap_or_default().to_string(),
             author: c.author,
             timestamp: c.timestamp,
+            // A listing of many repositories spans many stores; the account
+            // link is a per-repository detail and is filled in there.
+            pushed_by: None,
         });
     }
 }
