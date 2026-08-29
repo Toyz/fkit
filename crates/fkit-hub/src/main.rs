@@ -110,6 +110,7 @@ async fn main() -> Result<()> {
         .merge(routes::repos::routes())
         .merge(routes::browse::routes())
         .merge(routes::merges::routes())
+        .merge(routes::issues::routes())
         .merge(routes::admin::routes());
 
     // Read policy for the startup banner before the router takes ownership.

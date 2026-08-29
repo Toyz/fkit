@@ -188,12 +188,7 @@ async fn create(
         .bind(repo.id)
         .fetch_one(&mut *tx)
         .await?;
-    let next: (i32,) = sqlx::query_as(
-        "SELECT COALESCE(MAX(number), 0) + 1 FROM merge_requests WHERE repo_id = $1",
-    )
-    .bind(repo.id)
-    .fetch_one(&mut *tx)
-    .await?;
+    let next = (super::next_number(&mut tx, repo.id).await?,);
 
     let id = Uuid::new_v4();
     let res = sqlx::query(

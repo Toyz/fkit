@@ -275,6 +275,15 @@ pub struct FileDiff {
     /// Language hint for the client's highlighter.
     pub old_size: u64,
     pub new_size: u64,
+    /// The two sides' content hashes, absent where the file did not exist.
+    ///
+    /// A line comment anchors to one of these rather than to a commit. The
+    /// diff is recomputed live from two branches, so a comment pinned to a
+    /// commit slides onto an unrelated line as soon as anyone pushes; pinned
+    /// to the content it was written against, it stays put for as long as
+    /// that content does, and is plainly absent once it does not.
+    pub old_hash: Option<String>,
+    pub new_hash: Option<String>,
 }
 
 fn read_blob_by_hash(store: &Store, h: Hash) -> Vec<u8> {
@@ -336,6 +345,8 @@ fn diff_file_list(
             out.push(FileDiff {
                 path, status, added: 0, removed: 0, binary: false, truncated: false,
                 too_large: true, only_line_endings: false, hunks: vec![], old_size, new_size,
+                old_hash: before.map(|e| e.hash.to_hex()),
+                new_hash: after.map(|e| e.hash.to_hex()),
             });
             continue;
         }
@@ -355,6 +366,8 @@ fn diff_file_list(
             only_line_endings: d.only_line_endings,
             old_size,
             new_size,
+            old_hash: before.map(|e| e.hash.to_hex()),
+            new_hash: after.map(|e| e.hash.to_hex()),
             hunks: d
                 .hunks
                 .into_iter()

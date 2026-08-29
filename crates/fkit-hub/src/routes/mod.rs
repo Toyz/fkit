@@ -2,6 +2,7 @@
 
 pub mod admin;
 pub mod browse;
+pub mod issues;
 pub mod merges;
 pub mod repos;
 pub mod session;
@@ -124,6 +125,28 @@ pub async fn attach_heads(state: &AppState, views: &mut [RepoView]) {
             timestamp: c.timestamp,
         });
     }
+}
+
+/// The next `#N` for a repository.
+///
+/// One counter across issues and merge requests, because `#4` has to name one
+/// thing. Callers hold `FOR UPDATE` on the repo row: Postgres refuses that
+/// alongside an aggregate, and locking the parent is what actually serialises
+/// numbering for this repository anyway.
+pub async fn next_number(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    repo_id: uuid::Uuid,
+) -> Result<i32, sqlx::Error> {
+    let (n,): (i32,) = sqlx::query_as(
+        "SELECT COALESCE(GREATEST(
+             (SELECT MAX(number) FROM merge_requests WHERE repo_id = $1),
+             (SELECT MAX(number) FROM issues WHERE repo_id = $1)
+         ), 0) + 1",
+    )
+    .bind(repo_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(n)
 }
 
 pub async fn audit(
