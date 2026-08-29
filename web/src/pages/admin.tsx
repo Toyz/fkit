@@ -14,6 +14,7 @@ import { linkHandler, go } from "../nav";
 import { confirmAction } from "../components/fkit-dialog";
 import { notify } from "../components/fkit-notice";
 import "../components/fkit-toggle";
+import "../components/fkit-avatar";
 import "../components/fkit-select";
 import "../components/fkit-choice";
 import {
@@ -55,11 +56,12 @@ const sheet = css`
     /* Every column is fixed except the two text ones. An auto-width action
        column measured its own contents, so the empty header cell resolved
        narrower than the data cells and every heading sat right of its column. */
-    grid-template-columns: minmax(120px, 1.1fr) minmax(0, 1.6fr) 52px 96px 104px 120px;
-    gap: 12px; align-items: center;
-    height: 34px; padding: 0 14px;
+    grid-template-columns: minmax(150px, 1.1fr) minmax(0, 1.5fr) 64px 104px 132px 132px;
+    gap: 14px; align-items: center;
+    height: 44px; padding: 0 14px;
     border-top: 1px solid var(--border);
   }
+  .urow:not(.head):hover { background: var(--raised); }
   .urow.head {
     height: 26px; border-top: 0;
     color: var(--faint); font-size: 10.5px;
@@ -69,13 +71,38 @@ const sheet = css`
   /* The list draws the box; the first row must not draw a line against it. */
   fkit-list .urow:first-child { border-top: 0; }
   .urow > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .urow .un { font-size: 12.5px; display: flex; align-items: center; gap: 7px; }
+  /* People get faces. Every other list of accounts on the site has them, and
+     without one this read as a table of rows rather than a list of people. */
+  .urow .un { font-size: 12.5px; display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .urow .un .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .urow .un fkit-avatar { flex: none; }
   .urow .ue { color: var(--muted); font-size: 11.5px; }
   .urow .num { color: var(--faint); font-size: 11.5px; text-align: right;
-               font-variant-numeric: tabular-nums; }
+               font-variant-numeric: tabular-nums; padding-right: 4px; }
   .urow .when { color: var(--faint); font-size: 11px; }
   .urow .mid { display: flex; justify-content: center; overflow: visible; }
-  .urow .acts { display: flex; gap: 12px; justify-content: flex-end; overflow: visible; }
+  /* Real buttons rather than bare words: these disable and delete accounts,
+     and the pair used to sit at the same weight as the text beside them. */
+  .urow .acts { display: flex; gap: 6px; justify-content: flex-end; overflow: visible; }
+  .urow .acts button {
+    font: inherit; font-size: 11.5px; font-family: var(--mono);
+    padding: 3px 8px; border-radius: var(--radius); cursor: pointer;
+    border: 1px solid transparent; background: none; color: var(--muted);
+  }
+  .urow .acts button:hover:not(:disabled) {
+    border-color: var(--border-hi); background: var(--bg); color: var(--text);
+  }
+  .urow .acts button.danger:hover:not(:disabled) {
+    border-color: color-mix(in srgb, var(--removed) 55%, transparent);
+    color: var(--removed);
+  }
+  .urow .acts button:disabled { opacity: .35; cursor: default; }
+
+  /* Filter. Worth having before the list is long enough to need scrolling —
+     an administrator usually arrives looking for one person by name. */
+  .ufilter { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+  .ufilter input { flex: 1; font-size: 12px; }
+  .ufilter .count { color: var(--faint); font-size: 11.5px; flex: none; }
   .urow.off .un { color: var(--faint); }
   .urow.off .ue, .urow.off .num, .urow.off .when { opacity: .55; }
   @media (max-width: 900px) {
@@ -181,6 +208,7 @@ export class PageAdmin extends LoomElement {
   @reactive accessor stats: AdminStats | null = null;
   @reactive accessor cache: CacheStats | null = null;
   @reactive accessor users: AdminUser[] | null = null;
+  @reactive accessor userFilter = "";
   @reactive accessor email: EmailStatus | null = null;
   @reactive accessor invites: Invite[] | null = null;
   /** The link is readable exactly once, right after it is made. */
@@ -875,6 +903,12 @@ export class PageAdmin extends LoomElement {
     const me = this.session.current;
     const rows = this.users ?? [];
     const admins = rows.filter((u) => u.is_admin && u.is_active).length;
+    const q = this.userFilter.trim().toLowerCase();
+    const shown = q
+      ? rows.filter(
+          (u) => u.username.toLowerCase().includes(q) || u.email.toLowerCase().includes(q),
+        )
+      : rows;
     return (
       <fkit-page
         heading="Users"
@@ -885,6 +919,23 @@ export class PageAdmin extends LoomElement {
         }
       >
         <fkit-section blurb="The last active administrator cannot be demoted, disabled or deleted — a server with no administrator cannot be recovered from the web.">
+          {rows.length > 6 ? (
+            <div class="ufilter">
+              <input
+                type="search"
+                placeholder="filter by name or email"
+                value={this.userFilter}
+                aria-label="Filter users"
+                onInput={(e: Event) => (this.userFilter = (e.target as HTMLInputElement).value)}
+              />
+              <span class="count">
+                {shown.length === rows.length
+                  ? `${rows.length} shown`
+                  : `${shown.length} of ${rows.length}`}
+              </span>
+            </div>
+          ) : null}
+
           <fkit-list>
             {/* A header row, so the toggle column does not need the word
                 "admin" repeated on every line to say what it is. */}
@@ -900,7 +951,7 @@ export class PageAdmin extends LoomElement {
             {this.users === null
               ? [0, 1, 2].map(() => (
                   <div class="urow sk-row">
-                    <span><span class="sk tall" style="width:70px"></span></span>
+                    <span class="un"><span class="sk" style="width:22px;height:22px"></span><span class="sk" style="width:70px"></span></span>
                     <span><span class="sk" style="width:130px"></span></span>
                     <span class="num"><span class="sk" style="width:18px"></span></span>
                     <span><span class="sk" style="width:74px"></span></span>
@@ -908,24 +959,40 @@ export class PageAdmin extends LoomElement {
                     <span></span>
                   </div>
                 ))
-              : rows.map((u) => this.userRow(u, u.id === me?.id))}
+              : shown.length === 0
+                ? <fkit-empty>Nobody matches "{this.userFilter}".</fkit-empty>
+                : shown.map((u) => this.userRow(u, u.id === me?.id))}
           </fkit-list>
-
-          <p class="rolekey">
-            <b>observer</b> reads what is public, opens issues and comments ·{" "}
-            <b>member</b> also creates and owns repositories ·{" "}
-            <b>admin</b> also administers this server
-          </p>
         </fkit-section>
       </fkit-page>
     );
   }
 
+  /** What each role is allowed to do, shown inside the picker itself. */
+  private static readonly ROLES = [
+    {
+      value: "observer",
+      label: "observer",
+      hint: "Reads what is public, opens issues and comments. Cannot create repositories.",
+    },
+    {
+      value: "member",
+      label: "member",
+      hint: "Everything an observer can do, and creates and owns repositories.",
+    },
+    {
+      value: "admin",
+      label: "admin",
+      hint: "Everything a member can do, and administers this server — including reading every repository on it.",
+    },
+  ];
+
   private userRow(u: AdminUser, self: boolean) {
     return (
       <div class={`urow ${u.is_active ? "" : "off"}`} loom-key={u.id}>
         <span class="un">
-          {u.username}
+          <fkit-avatar name={u.username} size={22}></fkit-avatar>
+          <span class="nm">{u.username}</span>
           {self ? <span class="tag on">you</span> : null}
           {u.is_active ? null : <span class="tag">disabled</span>}
         </span>
@@ -935,31 +1002,26 @@ export class PageAdmin extends LoomElement {
         <span class="mid">
           {/* A toggle could only say administrator or not, and "not" meant
               "can create repositories", which is a second decision it was
-              making silently. */}
-          <select
-            class="role"
+              making silently. The picker carries what each role means, so the
+              page does not need a key underneath explaining all three. */}
+          <fkit-select
+            value={u.site_role}
             disabled={self || this.busy}
-            aria-label={`role: ${u.username}`}
-            onChange={(e: Event) =>
+            options={PageAdmin.ROLES}
+            onPick={(e: Event) =>
               void this.act(async () => {
                 await api.updateAdminUser(u.id, {
-                  site_role: (e.target as HTMLSelectElement).value as SiteRole,
+                  site_role: (e as CustomEvent<string>).detail as SiteRole,
                 });
                 this.users = await api.adminUsers();
               })
             }
-          >
-            {(["observer", "member", "admin"] as SiteRole[]).map((r) => (
-              <option value={r} selected={u.site_role === r}>
-                {r}
-              </option>
-            ))}
-          </select>
+          ></fkit-select>
         </span>
         <span class="acts">
           <button
-            class="link-btn"
             disabled={self || this.busy}
+            title={u.is_active ? `Disable ${u.username}` : `Enable ${u.username}`}
             onClick={() =>
               void this.act(async () => {
                 await api.updateAdminUser(u.id, { is_active: !u.is_active });
@@ -970,8 +1032,9 @@ export class PageAdmin extends LoomElement {
             {u.is_active ? "disable" : "enable"}
           </button>
           <button
-            class="link-btn danger"
+            class="danger"
             disabled={self || this.busy}
+            title={`Delete ${u.username}`}
             onClick={async () => {
               const ok = await confirmAction({
                 title: `Delete ${u.username}?`,

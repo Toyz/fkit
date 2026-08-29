@@ -8,7 +8,7 @@ use crate::ratelimit::{client_ip, Quota};
 use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, patch};
 use axum::{Json, Router};
 use chrono::{Duration, Utc};
 use std::net::SocketAddr;
@@ -29,7 +29,7 @@ pub fn routes() -> Router<AppState> {
         .route("/auth/sessions", get(list_sessions).delete(revoke_other_sessions))
         .route("/auth/sessions/{id}", delete(revoke_session))
         .route("/tokens", get(list_tokens).post(create_token))
-        .route("/tokens/{id}", delete(revoke_token))
+        .route("/tokens/{id}", patch(update_token).delete(revoke_token))
 }
 
 
@@ -838,6 +838,60 @@ async fn create_token(
             secret: minted.secret,
         }),
     ))
+}
+
+/// Change what an existing token does, without reissuing it.
+///
+/// Only the two things that are not the secret itself. A token's scope was
+/// otherwise fixed at creation, so deciding afterwards that a machine's pushes
+/// should stop landing on your profile — or start — meant revoking it and
+/// reconfiguring everything that used it.
+///
+/// `can_write` is deliberately not here: a token is a credential that may
+/// already be sitting in somebody's CI, and widening one in place is a
+/// different decision from minting a new one.
+async fn update_token(
+    State(state): State<AppState>,
+    viewer: Viewer,
+    Path(id): Path<Uuid>,
+    Json(body): Json<UpdateTokenReq>,
+) -> AppResult<Json<serde_json::Value>> {
+    let u = viewer.require()?;
+
+    if let Some(name) = &body.name
+        && name.trim().is_empty()
+    {
+        return Err(AppError::bad("a token needs a name"));
+    }
+
+    let done = sqlx::query(
+        "UPDATE access_tokens
+            SET name       = COALESCE($3, name),
+                attributes = COALESCE($4, attributes)
+          WHERE id = $1 AND user_id = $2",
+    )
+    .bind(id)
+    .bind(u.id)
+    .bind(body.name.as_ref().map(|n| n.trim().to_string()))
+    .bind(body.attributes)
+    .execute(&state.db)
+    .await?;
+
+    // Scoped to the owner, so a token that is not theirs is indistinguishable
+    // from one that does not exist.
+    if done.rows_affected() == 0 {
+        return Err(AppError::not_found("no such token"));
+    }
+
+    super::audit(
+        &state,
+        Some(u.id),
+        None,
+        "token.update",
+        serde_json::json!({ "id": id, "name": body.name, "attributes": body.attributes }),
+    )
+    .await;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 async fn revoke_token(

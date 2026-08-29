@@ -907,6 +907,8 @@ export const api = {
     expires_in_days?: number;
   }) =>
     request<NewToken>("/tokens", { method: "POST", body: body(input) }),
+  updateToken: (id: string, input: { name?: string; attributes?: boolean }) =>
+    request<{ ok: boolean }>(`/tokens/${id}`, { method: "PATCH", body: body(input) }),
   revokeToken: (id: string) => request<{ ok: boolean }>(`/tokens/${id}`, { method: "DELETE" }),
 
   // collaborators

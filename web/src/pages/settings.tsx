@@ -52,6 +52,10 @@ function tokenMeta(t: Token): string {
   return bits.join(" · ");
 }
 
+/** Said the same way in the mint form and on every existing token. */
+const LINK_HINT =
+  "Link commits pushed with this token to your account. Turn it off for a mirror of someone else's work.";
+
 const sheet = css`
   .panel-body { padding: 14px; }
   form.stack { display: flex; flex-direction: column; gap: 12px; }
@@ -81,6 +85,13 @@ const sheet = css`
     font-size: 12px; color: var(--muted);
   }
   .mint-link .why { color: var(--faint); }
+
+  /* Per-token, in the row it belongs to. */
+  .linktog {
+    display: flex; align-items: center; gap: 6px;
+    text-transform: none; letter-spacing: 0; font-weight: 400;
+    font-size: 11.5px; color: var(--muted); cursor: pointer; user-select: none;
+  }
 
   /* The token that was just made. Accented because it is the one thing on
      this page that cannot be recovered by reloading. */
@@ -544,10 +555,26 @@ export class PageSettings extends SettingsBase {
                   <span class={`tag ${t.can_write ? "on" : ""}`}>
                     {t.can_write ? "read + write" : "read"}
                   </span>
-                  {t.can_write && !t.attributes ? (
-                    <span class="tag" title="Commits pushed with this token are not linked to your account">
-                      unlinked
-                    </span>
+                  {/* Editable in place. A token's scope is otherwise fixed at
+                      creation, so changing your mind about whether a machine's
+                      pushes land on your profile meant revoking it and
+                      reconfiguring everything that used it. */}
+                  {t.can_write ? (
+                    <label class="linktog" title={LINK_HINT}>
+                      <fkit-toggle
+                        checked={t.attributes}
+                        label={`link commits pushed with ${t.name} to my account`}
+                        onToggle={(e: Event) =>
+                          void this.act(async () => {
+                            await api.updateToken(t.id, {
+                              attributes: (e as CustomEvent<boolean>).detail,
+                            });
+                            this.tokens = await api.tokens();
+                          })
+                        }
+                      ></fkit-toggle>
+                      {t.attributes ? "linked" : "unlinked"}
+                    </label>
                   ) : null}
                   <button
                     class="danger bare"

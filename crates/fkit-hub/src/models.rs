@@ -237,6 +237,15 @@ fn default_true() -> bool {
     true
 }
 
+/// What can be changed about a token after it exists. Absent means unchanged.
+#[derive(Debug, Deserialize)]
+pub struct UpdateTokenReq {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub attributes: Option<bool>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AddCollaboratorReq {
     pub username: String,

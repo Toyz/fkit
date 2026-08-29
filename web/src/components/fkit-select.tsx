@@ -45,12 +45,29 @@ const sheet = css`
     display: grid; grid-template-columns: 14px minmax(0, 1fr);
     align-items: start; gap: 8px; padding: 6px 10px; cursor: pointer; font-size: 12px;
   }
+  /* A definite width once any option carries a hint. Sizing to max-content
+     measures the text as if it never wrapped, and the max-width then clips
+     that overflow instead of making it wrap, so the hints came out cut off
+     mid-sentence. */
+  .pop.hinted { width: 320px; }
+
+  /* Anchored to the trigger's left edge by default. Against the right edge of
+     the window that puts the popup off-screen — which is where a control in
+     the last column of a table always sits — so it anchors right instead. */
+  .pop.flip-x { left: auto; right: 0; }
+  /* Same for a trigger near the bottom of the window. */
+  .pop.flip-y { top: auto; bottom: calc(100% + 4px); }
+
+  .pop.flip-x { left: auto; right: 0; }
+  /* Same for a trigger near the bottom of the window. */
+  .pop.flip-y { top: auto; bottom: calc(100% + 4px); }
+
   .opt:hover, .opt.active { background: var(--raised); }
   .opt .tick { color: var(--accent); display: flex; padding-top: 2px; }
   .opt.on .lab { color: var(--accent); }
   .opt .hint {
     display: block; color: var(--muted); font-size: 11px; font-family: var(--sans);
-    margin-top: 2px; line-height: 1.4;
+    margin-top: 2px; line-height: 1.4; white-space: normal;
   }
 `;
 
@@ -62,6 +79,13 @@ export class FkitSelect extends LoomElement {
 
   @reactive accessor open = false;
   @reactive accessor active = 0;
+
+  /** Which way the popup had to open to stay on screen. */
+  @reactive accessor flipX = false;
+  @reactive accessor flipY = false;
+
+  /** Widest the popup is allowed to get, matching the sheet's default. */
+  static readonly MAX_W = 320;
 
   @mount
   init() {
@@ -92,6 +116,24 @@ export class FkitSelect extends LoomElement {
     };
   }
 
+  /**
+   * Decide which way to open, before opening.
+   *
+   * Measured against the trigger rather than the popup because the popup does
+   * not exist yet: its widest possible size is known, and opening in the wrong
+   * place for one frame and correcting is worse than being conservative.
+   */
+  private measure() {
+    const r = this.getBoundingClientRect();
+    const margin = 8;
+    this.flipX = r.left + FkitSelect.MAX_W > window.innerWidth - margin;
+    // Roughly what the tallest sensible list needs; a longer one scrolls the
+    // page rather than being pinned to a corner.
+    const need = Math.min(this.options.length * 52 + 12, 280);
+    this.flipY =
+      r.bottom + need > window.innerHeight - margin && r.top - need > margin;
+  }
+
   private choose(value: string) {
     this.open = false;
     if (value !== this.value) {
@@ -106,7 +148,9 @@ export class FkitSelect extends LoomElement {
         <button
           class={`trigger ${this.open ? "open" : ""}`}
           onClick={() => {
-            this.open = !this.open;
+            const opening = !this.open;
+            if (opening) this.measure();
+            this.open = opening;
             this.active = Math.max(0, this.options.findIndex((o) => o.value === this.value));
           }}
         >
@@ -115,7 +159,11 @@ export class FkitSelect extends LoomElement {
         </button>
 
         {this.open ? (
-          <div class="pop">
+          <div
+            class={`pop ${this.options.some((o) => o.hint) ? "hinted" : ""} ${
+              this.flipX ? "flip-x" : ""
+            } ${this.flipY ? "flip-y" : ""}`}
+          >
             {this.options.map((o, i) => (
               <div
                 class={`opt ${o.value === this.value ? "on" : ""} ${i === this.active ? "active" : ""}`}
