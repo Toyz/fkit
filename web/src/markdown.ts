@@ -80,12 +80,32 @@ function inline(text: string, ctx?: MarkdownContext): string {
   );
 }
 
+/**
+ * A heading's fragment id.
+ *
+ * The same rule GitHub uses, so a link copied from there — or written by
+ * someone who assumed it — lands on the right heading: lower-case, spaces to
+ * hyphens, and anything that is not a letter, digit, hyphen or underscore
+ * dropped. Inline markup is stripped first, or `## `code` here` would slugify
+ * the tags.
+ */
+export function slug(text: string): string {
+  return text
+    .replace(/<[^>]*>/g, "")
+    .replace(/&[a-z]+;|&#\d+;/gi, "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^\w\- ]+/g, "")
+    .replace(/\s+/g, "-");
+}
+
 export function renderMarkdown(src: string, ctx?: MarkdownContext): string {
   const lines = escapeHtml(src.replace(/\r\n/g, "\n")).split("\n");
   const out: string[] = [];
 
   let i = 0;
   let listType: "ul" | "ol" | null = null;
+  const slugs = new Map<string, number>();
 
   const closeList = () => {
     if (listType) {
@@ -122,7 +142,27 @@ export function renderMarkdown(src: string, ctx?: MarkdownContext): string {
     if (heading) {
       closeList();
       const level = heading[1].length;
-      out.push(`<h${level}>${inline(heading[2], ctx)}</h${level}>`);
+      const body = inline(heading[2], ctx);
+
+      // Two headings can slugify the same; a document with "## Usage" twice
+      // would otherwise have one id pointing at two places and links that go
+      // to whichever the browser found first.
+      let id = slug(body);
+      if (id) {
+        const seen = slugs.get(id) ?? 0;
+        slugs.set(id, seen + 1);
+        if (seen > 0) id = `${id}-${seen}`;
+      }
+
+      // The anchor is a real link so it can be copied, middle-clicked and
+      // bookmarked; it is hidden until the heading is hovered.
+      out.push(
+        id
+          ? `<h${level} id="${id}">` +
+              `<a class="anchor" href="#${id}" aria-label="Link to this section">#</a>` +
+              `${body}</h${level}>`
+          : `<h${level}>${body}</h${level}>`,
+      );
       i++;
       continue;
     }

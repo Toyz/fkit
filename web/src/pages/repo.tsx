@@ -1538,6 +1538,22 @@ const sheet = css`
   .md { padding: 20px 24px; overflow-x: auto; font-family: var(--sans); font-size: 14px; line-height: 1.65; max-width: 900px; }
   .md h1, .md h2 { border-bottom: 1px solid var(--border); padding-bottom: .25em; margin: 1.4em 0 .6em; }
   .md h1:first-child { margin-top: 0; }
+
+  /* The heading anchor sits in the margin so it never reflows the text when it
+     appears, the way a leading "#" inside the line would. */
+  .md :is(h1, h2, h3, h4, h5, h6) { position: relative; }
+  .md .anchor {
+    position: absolute; left: -0.85em; top: 0;
+    color: var(--faint); text-decoration: none;
+    opacity: 0; transition: opacity .12s;
+  }
+  .md :is(h1, h2, h3, h4, h5, h6):hover .anchor,
+  .md .anchor:focus-visible { opacity: 1; }
+  .md .anchor:hover { color: var(--accent); }
+  /* A heading that was just jumped to is worth pointing at for a moment. */
+  .md :is(h1, h2, h3, h4, h5, h6):target { scroll-margin-top: 12px; }
+  .md :is(h1, h2, h3, h4, h5, h6):target .anchor { opacity: 1; color: var(--accent); }
+  @media (prefers-reduced-motion: reduce) { .md .anchor { transition: none; } }
   .md h3, .md h4 { margin: 1.3em 0 .4em; }
   .md p { margin: 0 0 .9em; }
   .md code { font-family: var(--mono); font-size: .85em; background: var(--raised); padding: .1em .35em; border-radius: var(--radius-sm); }
@@ -1967,6 +1983,87 @@ export class PageRepo extends LoomElement {
    * re-runs — which is the manual `reload()` sequencing, done by the decorator.
    */
   @reactive accessor loc = parse();
+
+  /**
+   * Make `#fragment` links work inside rendered markdown.
+   *
+   * The browser resolves a fragment against the *document*, and this page's
+   * content lives in a shadow root — so a heading id in a README is invisible
+   * to it and clicking a link in a table of contents changed the URL and
+   * nothing else. Both the click and any later hashchange are handled here,
+   * looking the target up in the shadow root where it actually is.
+   */
+  @mount
+  fragments() {
+    const jump = () => this.jumpToHash();
+
+    const onClick = (e: Event) => {
+      const a = e
+        .composedPath()
+        .find((n): n is HTMLAnchorElement => n instanceof HTMLAnchorElement);
+      const href = a?.getAttribute("href");
+      if (!href?.startsWith("#")) return;
+      e.preventDefault();
+      // Push, so the back button steps through the sections someone visited.
+      history.pushState(null, "", href);
+      this.jumpToHash("smooth");
+    };
+
+    this.addEventListener("click", onClick);
+    window.addEventListener("hashchange", jump);
+    return () => {
+      this.removeEventListener("click", onClick);
+      window.removeEventListener("hashchange", jump);
+    };
+  }
+
+  /**
+   * Scroll to whatever the current fragment names, if it is on this page.
+   *
+   * The heading may not exist yet: the document is fetched, and rendering is
+   * scheduled rather than synchronous. Rather than guess a number of frames,
+   * this watches the shadow root and jumps the moment the target appears,
+   * giving up after a few seconds so a fragment naming nothing does not leave
+   * an observer running.
+   *
+   * Instant by default — arriving at a URL should land where it says — and
+   * smooth only when someone clicked, where the movement shows them where
+   * they went.
+   */
+  private jumpToHash(behavior: ScrollBehavior = "auto") {
+    const id = decodeURIComponent(location.hash.slice(1));
+    const root = this.shadowRoot;
+    if (!id || !root) return;
+
+    this.pendingJump?.();
+    const find = () => root.querySelector(`#${CSS.escape(id)}`);
+
+    const now = find();
+    if (now) {
+      now.scrollIntoView({ block: "start", behavior });
+      return;
+    }
+
+    let timer = 0;
+    const observer = new MutationObserver(() => {
+      const el = find();
+      if (!el) return;
+      stop();
+      el.scrollIntoView({ block: "start", behavior });
+    });
+    const stop = () => {
+      observer.disconnect();
+      clearTimeout(timer);
+      if (this.pendingJump === stop) this.pendingJump = null;
+    };
+    timer = window.setTimeout(stop, 5000);
+
+    this.pendingJump = stop;
+    observer.observe(root, { childList: true, subtree: true });
+  }
+
+  /** Cancels an in-flight wait, so two fragments in a row cannot both fire. */
+  private pendingJump: (() => void) | null = null;
 
   @mount
   init() {
@@ -3897,7 +3994,10 @@ export class PageRepo extends LoomElement {
       .blob(at.owner, at.name, this.refName(), path)
       .then((b) => {
         // Guard against a slow response for a tab the reader has left.
-        if (this.docPath === path) this.doc = b.content ?? "(not a text file)";
+        if (this.docPath === path) {
+          this.doc = b.content ?? "(not a text file)";
+          if (location.hash) this.jumpToHash();
+        }
       })
       .catch((e) => {
         if (this.docPath === path) this.doc = `Could not load ${path}: ${(e as Error).message}`;
