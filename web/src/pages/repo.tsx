@@ -2408,6 +2408,7 @@ fkit push</pre>
 
     const tabs: [string, string, string][] = [
       ["general", "general", "settings"],
+      ["branches", "branches", "branch"],
       ["access", "access", "lock"],
       ["setup", "push & clone", "link"],
       ["danger", "danger zone", "alert"],
@@ -2430,6 +2431,7 @@ fkit push</pre>
 
         <div class="sec">
           {section === "general" ? this.settingsGeneral(r, at) : null}
+          {section === "branches" ? this.settingsBranches(r, at) : null}
           {section === "access" ? this.settingsAccess(r, at) : null}
           {section === "setup" ? (
             <fkit-page heading="Push & clone" value={syncUrl(r.owner, r.name)}>
@@ -2529,6 +2531,109 @@ fkit push</pre>
               }}
             ></fkit-select>
           </fkit-field>
+        </fkit-section>
+      </fkit-page>
+    );
+  }
+
+  /// Branches and tags, and the only place either can be removed.
+  ///
+  /// Deleting a ref removes a name, not history: the commits stay in the
+  /// store, addressable by hash. That is worth saying on the page, because
+  /// "delete branch" reads as destructive and here it very nearly is not.
+  private settingsBranches(r: Repo, at: { owner: string; name: string }) {
+    const branches = this.branches();
+    const tags = this.tags();
+    const loading = this.refs === null;
+
+    const remove = (kind: "branch" | "tag", name: string, why: string) => async () => {
+      const ok = await confirmAction({
+        title: `Delete ${kind} ${name}?`,
+        body: why,
+        confirm: `Delete ${kind}`,
+        danger: true,
+      });
+      if (!ok) return;
+      await this.act(async () => {
+        await api.deleteRef(at.owner, at.name, kind, name);
+        await this.refsQuery.refetch();
+      }, `${name} deleted`);
+    };
+
+    return (
+      <fkit-page>
+        <fkit-section
+          heading="Branches"
+          value={loading ? "" : `${branches.length} · default ${r.default_branch}`}
+          blurb="Deleting a branch removes the name. The commits it pointed at stay in the store and are still reachable by hash, so this is not a way to erase work."
+        >
+          <fkit-list>
+            {loading ? (
+              <fkit-empty><span class="sk" style="width:200px"></span></fkit-empty>
+            ) : (
+              branches.map((b) => (
+                <fkit-row
+                  loom-key={b.name}
+                  icon="branch"
+                  current={b.is_default}
+                  name={b.name}
+                  meta={b.head ? `${b.short} · ${b.head.summary}` : b.short}
+                >
+                  {b.is_default ? <span class="tag on">default</span> : null}
+                  <button
+                    class="danger bare"
+                    // The default branch is what a clone checks out; removing
+                    // it would leave the repository pointing at nothing, so
+                    // the server refuses it and so does the button.
+                    disabled={b.is_default || this.busy}
+                    title={b.is_default ? "Choose a different default branch first" : ""}
+                    onClick={remove(
+                      "branch",
+                      b.name,
+                      `The branch name goes; its commits stay in the store. Anyone who has ${b.name} checked out keeps their copy.`,
+                    )}
+                  >
+                    Delete
+                  </button>
+                </fkit-row>
+              ))
+            )}
+          </fkit-list>
+        </fkit-section>
+
+        <fkit-section
+          heading="Tags"
+          value={loading ? "" : `${tags.length}`}
+          blurb="A tag names one commit and is not expected to move."
+        >
+          <fkit-list>
+            {loading ? (
+              <fkit-empty><span class="sk" style="width:200px"></span></fkit-empty>
+            ) : tags.length === 0 ? (
+              <fkit-empty>No tags. Push one with fkit tag.</fkit-empty>
+            ) : (
+              tags.map((t) => (
+                <fkit-row
+                  loom-key={t.name}
+                  icon="tag"
+                  name={t.name}
+                  meta={t.head ? `${t.short} · ${t.head.summary}` : t.short}
+                >
+                  <button
+                    class="danger bare"
+                    disabled={this.busy}
+                    onClick={remove(
+                      "tag",
+                      t.name,
+                      `The tag name goes; the commit it points at stays in the store.`,
+                    )}
+                  >
+                    Delete
+                  </button>
+                </fkit-row>
+              ))
+            )}
+          </fkit-list>
         </fkit-section>
       </fkit-page>
     );

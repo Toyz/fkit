@@ -459,6 +459,19 @@ export const api = {
 
   refs: (owner: string, name: string) => request<Ref[]>(`/repos/${owner}/${name}/refs`),
 
+  /**
+   * Remove a branch or a tag.
+   *
+   * The name travels in the body, not the path: a branch may be called
+   * `feature/thing`, and a slash in a path segment is a routing problem
+   * nobody needs. Only the name goes — the commits stay in the store.
+   */
+  deleteRef: (owner: string, name: string, kind: "branch" | "tag", ref: string) =>
+    request<{ ok: boolean }>(`/repos/${owner}/${name}/refs`, {
+      method: "DELETE",
+      body: body({ kind, name: ref }),
+    }),
+
   // content
   tree: (owner: string, name: string, ref: string, path = "") =>
     request<TreeResponse>(

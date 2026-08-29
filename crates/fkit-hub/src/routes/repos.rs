@@ -3,7 +3,7 @@
 use crate::auth::Viewer;
 use crate::error::{AppError, AppResult};
 use crate::models::*;
-use crate::perms::{require_admin, resolve};
+use crate::perms::{require_admin, require_write, resolve};
 use crate::state::AppState;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -11,7 +11,7 @@ use axum::response::IntoResponse;
 use axum::routing::{delete, get, patch};
 use axum::{Json, Router};
 use fkit_core::hash::Hash;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub fn routes() -> Router<AppState> {
@@ -21,7 +21,7 @@ pub fn routes() -> Router<AppState> {
         .route("/repos/{owner}/{name}", get(get_repo))
         .route("/repos/{owner}/{name}", patch(update_repo))
         .route("/repos/{owner}/{name}", delete(delete_repo))
-        .route("/repos/{owner}/{name}/refs", get(list_refs))
+        .route("/repos/{owner}/{name}/refs", get(list_refs).delete(delete_ref))
         .route("/repos/{owner}/{name}/stats", get(repo_stats))
         .route(
             "/repos/{owner}/{name}/collaborators",
@@ -442,6 +442,107 @@ async fn delete_repo(
 
     super::audit(&state, viewer.id(), None, "repo.delete",
         serde_json::json!({ "name": format!("{owner}/{name}") })).await;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// Which ref to remove.
+///
+/// The name travels in the body rather than the path because a branch may be
+/// called `feature/thing`, and a slash in a path segment is a routing problem
+/// nobody needs to have.
+#[derive(Deserialize)]
+struct DeleteRefIn {
+    /// "branch" or "tag".
+    kind: String,
+    /// The bare name, exactly as [`RefView`] reports it.
+    name: String,
+}
+
+/// Delete a branch or a tag.
+///
+/// Only the ref goes. The commits it pointed at are still in the store and
+/// still reachable by hash — a name is a pointer here, and removing a pointer
+/// is not a way to destroy history. Reclaiming unreferenced objects is a
+/// separate, deliberate operation.
+///
+/// This is write access, not admin: someone who can create a branch by pushing
+/// it should be able to tidy it up again.
+async fn delete_ref(
+    State(state): State<AppState>,
+    viewer: Viewer,
+    Path((owner, name)): Path<(String, String)>,
+    Json(input): Json<DeleteRefIn>,
+) -> AppResult<Json<serde_json::Value>> {
+    let (repo, access, _) = super::load_repo(&state, &viewer, &owner, &name).await?;
+    require_write(access)?;
+
+    let bare = input.name.trim();
+    if bare.is_empty() {
+        return Err(AppError::BadRequest("no ref name given".into()));
+    }
+
+    let is_tag = match input.kind.as_str() {
+        "tag" => true,
+        "branch" => false,
+        _ => return Err(AppError::BadRequest("kind must be \"branch\" or \"tag\"".into())),
+    };
+    let stored = if is_tag {
+        format!("{}{bare}", fkit_core::session::TAG_PREFIX)
+    } else {
+        bare.to_string()
+    };
+
+    // The default branch is what a clone checks out and what every URL naming
+    // no ref resolves to. Removing it leaves the repository pointing at
+    // nothing, so it has to be reassigned first.
+    if !is_tag && bare == repo.default_branch {
+        return Err(AppError::Conflict(format!(
+            "{bare} is the default branch — choose a different default first"
+        )));
+    }
+
+    // A merge request stores its branches by name, not by foreign key, so
+    // deleting one out from under an open request would leave a proposal whose
+    // diff cannot be computed and whose merge cannot run.
+    if !is_tag {
+        let open: Option<(i32,)> = sqlx::query_as(
+            "SELECT number FROM merge_requests
+             WHERE repo_id = $1 AND state = 'open'
+               AND (source_branch = $2 OR target_branch = $2)
+             ORDER BY number
+             LIMIT 1",
+        )
+        .bind(repo.id)
+        .bind(bare)
+        .fetch_optional(&state.db)
+        .await?;
+
+        if let Some((number,)) = open {
+            return Err(AppError::Conflict(format!(
+                "merge request #{number} is open on {bare} — merge or close it first"
+            )));
+        }
+    }
+
+    let done = sqlx::query("DELETE FROM refs WHERE repo_id = $1 AND name = $2")
+        .bind(repo.id)
+        .bind(&stored)
+        .execute(&state.db)
+        .await?;
+
+    if done.rows_affected() == 0 {
+        return Err(AppError::not_found(format!("no such {}: {bare}", input.kind)));
+    }
+
+    super::audit(
+        &state,
+        viewer.id(),
+        Some(repo.id),
+        "ref.delete",
+        serde_json::json!({ "kind": input.kind, "name": bare }),
+    )
+    .await;
+
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 

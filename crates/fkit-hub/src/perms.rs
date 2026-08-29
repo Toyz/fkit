@@ -113,7 +113,6 @@ pub fn require_read(access: Access, owner: &str, name: &str) -> AppResult<()> {
 
 /// Once read access is established the viewer already knows the repository
 /// exists, so a write refusal can honestly say 403.
-#[allow(dead_code)] // used by write-over-HTTP routes; sync writes go through RepoHost
 pub fn require_write(access: Access) -> AppResult<()> {
     if access.can_write() {
         Ok(())
