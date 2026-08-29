@@ -312,6 +312,28 @@ async fn do_merge(
         )));
     }
 
+    // A review comment is a question, and a merge request should not land
+    // with questions outstanding. Only line comments count: a remark about
+    // the change as a whole has nothing to be resolved against, so treating
+    // it as a blocker would make "resolve" mean "acknowledge", which is a
+    // different and much weaker thing.
+    let (open_threads,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(DISTINCT (file_path, side, line, blob))
+           FROM comments
+          WHERE merge_request_id = $1 AND blob IS NOT NULL AND resolved_at IS NULL",
+    )
+    .bind(row.id)
+    .fetch_one(&state.db)
+    .await?;
+
+    if open_threads > 0 {
+        return Err(AppError::conflict(format!(
+            "{open_threads} unresolved comment {} on this change — resolve {} before merging",
+            if open_threads == 1 { "thread" } else { "threads" },
+            if open_threads == 1 { "it" } else { "them" },
+        )));
+    }
+
     let target = read_ref(&state, repo.id, &row.target_branch)
         .await?
         .ok_or_else(|| AppError::conflict(format!("branch {} is gone", row.target_branch)))?;

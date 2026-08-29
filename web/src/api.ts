@@ -74,6 +74,9 @@ export interface Comment {
   blob: string | null;
   created_at: string;
   edited_at: string | null;
+  /** Set once the thread has been dealt with. Line comments only. */
+  resolved_at: string | null;
+  resolver: string | null;
 }
 
 export interface NewComment {
@@ -551,6 +554,24 @@ export const api = {
       method: "POST",
       body: body(input),
     }),
+  /**
+   * Mark every comment on one line of one version of a file resolved.
+   *
+   * A thread is not a row — it is the comments sharing an anchor — so this is
+   * addressed the same way a comment is written: by where it points.
+   */
+  resolveThread: (
+    owner: string,
+    name: string,
+    number: number,
+    at: { file_path: string; line: number; side: "old" | "new"; blob: string },
+    resolved: boolean,
+  ) =>
+    request<{ ok: boolean; resolved: boolean }>(
+      `/repos/${owner}/${name}/merges/${number}/resolve`,
+      { method: "POST", body: body({ ...at, resolved }) },
+    ),
+
   editComment: (owner: string, name: string, id: string, text: string) =>
     request<Comment>(`/repos/${owner}/${name}/comments/${id}`, {
       method: "PATCH",

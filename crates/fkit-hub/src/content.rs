@@ -19,7 +19,21 @@ fn view(store: &Store) -> View<'_> {
     View { store, overlay: Default::default() }
 }
 
+/// Read a commit by hash.
+///
+/// A hash that is well-formed but absent is a 404, not a 500. Any 64 hex
+/// characters parse, so `resolve_ref` hands one through whenever a URL names a
+/// commit this repository does not have — a link to a branch someone deleted
+/// and collected, a hash from another repository, a typo that stays valid hex.
+/// That is a missing page, and reporting it as an internal error says the
+/// server broke when it did not.
 pub fn commit_of(store: &Store, id: Hash) -> AppResult<fkit_core::object::Commit> {
+    if !store.has(id) {
+        return Err(AppError::not_found(format!(
+            "no commit {} in this repository",
+            id.short()
+        )));
+    }
     match store.get(id).map_err(AppError::Internal)? {
         Object::Commit(c) => Ok(c),
         other => Err(AppError::bad(format!(

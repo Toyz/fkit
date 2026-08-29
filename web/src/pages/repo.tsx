@@ -606,6 +606,34 @@ const sheet = css`
   }
   .tabs a.on .tabn { background: var(--accent-weak); color: var(--accent); }
 
+  /* The header an issue and a merge request share. */
+  .subject { margin-bottom: 16px; }
+  .crumbs {
+    display: flex; align-items: center; gap: 7px;
+    font-size: 11.5px; color: var(--faint); margin-bottom: 7px;
+  }
+  .crumbs a { color: var(--muted); text-decoration: none; }
+  .crumbs a:hover { color: var(--accent); }
+  .crumbs .cur { color: var(--text); }
+
+  .sline {
+    display: flex; align-items: baseline; gap: 11px; flex-wrap: wrap;
+    padding-bottom: 9px; border-bottom: 1px solid var(--border);
+  }
+  .sline h1 {
+    font-size: 19px; font-weight: 500; letter-spacing: -0.01em;
+    margin: 0; overflow-wrap: anywhere;
+  }
+
+  .sby {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    margin-top: 9px; font-size: 12px; color: var(--muted);
+    font-family: var(--sans);
+  }
+  .sby .who { color: var(--text); font-weight: 600; text-decoration: none; }
+  .sby .who:hover { color: var(--accent); }
+  .sby .ex { color: var(--faint); font-family: var(--mono); font-size: 11.5px; }
+
   /* ---- issues ---- */
   .seg { display: flex; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
   .seg button {
@@ -624,9 +652,11 @@ const sheet = css`
   .issue-line .sub { font-size: 11.5px; color: var(--faint); }
   .cbadge { display: flex; align-items: center; gap: 4px; color: var(--faint); font-size: 11.5px; }
 
-  .issue-meta {
-    font-family: var(--sans); font-size: 12px; color: var(--muted);
-    margin: -4px 0 4px;
+  /* A merge request's description sits under its header, not in a comment
+     box: it is the request itself, not something said about it. */
+  .sdesc {
+    font-family: var(--sans); font-size: 13px; color: var(--text);
+    line-height: 1.6; margin: 0 0 16px; white-space: pre-wrap;
   }
   .new-issue fkit-field:last-of-type { margin-bottom: 0; }
 
@@ -667,6 +697,15 @@ const sheet = css`
   }
   .dl:hover .addc { display: flex; }
   .dl .addc:hover { filter: brightness(1.12); }
+
+  .thread.done { background: color-mix(in srgb, var(--added) 5%, var(--surface)); }
+  .tbar {
+    display: flex; align-items: center; gap: 7px;
+    font-size: 11.5px; color: var(--muted); font-family: var(--sans);
+  }
+  .tbar .grow { flex: 1; }
+  .thread.done .tbar { color: var(--added); }
+  .tbar .opn { color: var(--muted); }
 
   .thread {
     padding: 10px 12px 12px calc(var(--gutter, 96px));
@@ -1062,6 +1101,8 @@ export class PageRepo extends LoomElement {
   /// is open at a time — two half-written comments on one screen is a way to
   /// lose one.
   @reactive accessor writingAt = "";
+  /// Resolved threads collapse; this remembers the ones re-opened by hand.
+  @reactive accessor shownThreads: Record<string, boolean> = {};
   /// Which issues the list is showing. Part of the query URL, so changing it
   /// refetches rather than filtering a list that was never loaded.
   @reactive accessor issueFilter: "open" | "closed" | "all" = "open";
@@ -1945,6 +1986,54 @@ export class PageRepo extends LoomElement {
     );
   }
 
+  /// The header an issue and a merge request share.
+  ///
+  /// Both are "a numbered thing someone opened, which is in some state" — the
+  /// same four facts in the same place, so they are written once. Getting back
+  /// to the list is a link rather than the browser's back button, because
+  /// arriving from a notification is as common as arriving from the list.
+  private subjectHead(o: {
+    kind: "issues" | "merges";
+    number: number;
+    title: string;
+    state: string;
+    author: string | null;
+    created_at: string;
+    /// Anything only one of the two has: the branches, the merge commit.
+    extra?: unknown;
+  }) {
+    const at = this.loc!;
+    const list = `/${at.owner}/${at.name}/${o.kind}`;
+
+    return (
+      <div class="subject">
+        <div class="crumbs">
+          <a href={list} onClick={linkHandler(list)}>{o.kind}</a>
+          <span class="sep">/</span>
+          <span class="cur">#{o.number}</span>
+        </div>
+
+        <div class="sline">
+          <h1>{o.title}</h1>
+          {this.stateTag(o.state)}
+        </div>
+
+        <div class="sby">
+          <fkit-avatar name={o.author ?? ""} size={20}></fkit-avatar>
+          <a
+            class="who"
+            href={`/${o.author ?? ""}`}
+            onClick={linkHandler(`/${o.author ?? ""}`)}
+          >
+            {o.author ?? "someone"}
+          </a>
+          <span>opened this {relativeTime(o.created_at)}</span>
+          {o.extra ? <span class="ex">{o.extra}</span> : null}
+        </div>
+      </div>
+    );
+  }
+
   /// One comment, with the actions its author gets.
   ///
   /// Written once because the merge request conversation, a line thread and an
@@ -2051,10 +2140,62 @@ export class PageRepo extends LoomElement {
     line: number,
   ) {
     const open = this.writingAt === key;
+    const done = here.length > 0 && here.every((c) => c.resolved_at);
+    const shut = done && !this.shownThreads[key];
+
+    const flip = (resolved: boolean) =>
+      void this.act(async () => {
+        const v = this.loc!.view;
+        if (v.kind !== "merge") return;
+        await api.resolveThread(
+          this.loc!.owner,
+          this.loc!.name,
+          v.number,
+          { file_path: path, line, side, blob },
+          resolved,
+        );
+        await this.commentsQuery.refetch();
+      });
 
     return (
-      <div class="thread">
-        {here.map((c) => this.renderComment(c, () => this.commentsQuery.refetch()))}
+      <div class={`thread ${done ? "done" : ""}`}>
+        {here.length > 0 ? (
+          <div class="tbar">
+            {done ? (
+              <>
+                <loom-icon name="check" size={12}></loom-icon>
+                <span>
+                  Resolved{here[0].resolver ? ` by ${here[0].resolver}` : ""}
+                </span>
+              </>
+            ) : (
+              <span class="opn">
+                {here.length} {here.length === 1 ? "comment" : "comments"}
+              </span>
+            )}
+            <span class="grow"></span>
+            {done ? (
+              <button
+                type="button"
+                class="bare"
+                onClick={() =>
+                  (this.shownThreads = { ...this.shownThreads, [key]: !this.shownThreads[key] })
+                }
+              >
+                {shut ? "show" : "hide"}
+              </button>
+            ) : null}
+            {this.session.isAuthed ? (
+              <button type="button" class="bare" disabled={this.busy} onClick={() => flip(!done)}>
+                {done ? "unresolve" : "resolve"}
+              </button>
+            ) : null}
+          </div>
+        ) : null}
+
+        {shut
+          ? null
+          : here.map((c) => this.renderComment(c, () => this.commentsQuery.refetch()))}
 
         {open ? (
           <fkit-composer
@@ -2611,26 +2752,35 @@ fkit push</pre>
 
     return (
       <div class="wrap">
-        <fkit-section
-          heading={i ? i.title : "Issue"}
-          value={i ? `#${i.number}` : ""}
-        >
-          {i ? (
+        {i ? (
+          this.subjectHead({
+            kind: "issues",
+            number: i.number,
+            title: i.title,
+            state: i.state,
+            author: i.author,
+            created_at: i.created_at,
+            extra: i.state === "closed" && i.closed_at
+              ? `closed ${relativeTime(i.closed_at)}`
+              : "",
+          })
+        ) : null}
+
+        <fkit-section heading="" value="">
+          {i && this.session.isAuthed ? (
             <span slot="action" class="head-acts">
-              <span class={`tag ${i.state === "open" ? "on" : ""}`}>{i.state}</span>
-              {this.session.isAuthed ? (
-                <button
-                  disabled={this.busy}
-                  onClick={() =>
-                    void this.act(async () => {
-                      await api.setIssueState(at.owner, at.name, i.number, i.state === "closed");
-                      await this.issueQuery.refetch();
-                    })
-                  }
-                >
-                  {i.state === "open" ? "Close issue" : "Reopen"}
-                </button>
-              ) : null}
+              <button
+                type="button"
+                disabled={this.busy}
+                onClick={() =>
+                  void this.act(async () => {
+                    await api.setIssueState(at.owner, at.name, i.number, i.state === "closed");
+                    await this.issueQuery.refetch();
+                  })
+                }
+              >
+                {i.state === "open" ? "Close issue" : "Reopen"}
+              </button>
             </span>
           ) : null}
 
@@ -2638,10 +2788,6 @@ fkit push</pre>
             <span class="sk" style="width:260px"></span>
           ) : (
             <>
-              <div class="issue-meta">
-                {i.author ?? "someone"} opened this {relativeTime(i.created_at)}
-              </div>
-
               <div class="talk">
                 {i.body ? (
                   <fkit-comment
@@ -2788,36 +2934,32 @@ fkit push</pre>
 
     const c = m.comparison;
     const open = m.state === "open";
+    // How many distinct line threads are still open. Counted by anchor,
+    // because a thread is the comments sharing one, not a row of its own.
+    const unresolved = new Set(
+      (this.comments ?? [])
+        .filter((x) => x.blob && !x.resolved_at)
+        .map((x) => `${x.file_path}:${x.side}:${x.line}:${x.blob}`),
+    ).size;
 
     return (
       <div>
-        <div class="chead">
-          <div class="chead-top">
-            <h2 class="csummary">
-              <span class="num">#{m.number}</span> {m.title}
-            </h2>
-            {this.stateTag(m.state)}
-          </div>
-          {m.description ? <pre class="cbody">{m.description}</pre> : null}
-          <div class="cmeta">
-            <span class="who">{m.author ?? "unknown"}</span>
-            <span>opened {relativeTime(m.created_at)}</span>
-            <span class="mbr">
-              {m.source_branch} <span class="faint">into</span> {m.target_branch}
-            </span>
-            {m.merge_commit ? (
-              <span class="parent">
-                merged as{" "}
-                <a
-                  href={`/${at.owner}/${at.name}/commit/${m.merge_commit}`}
-                  onClick={linkHandler(`/${at.owner}/${at.name}/commit/${m.merge_commit}`)}
-                >
-                  {m.merge_commit.slice(0, 10)}
-                </a>
-              </span>
-            ) : null}
-          </div>
-        </div>
+        {this.subjectHead({
+          kind: "merges",
+          number: m.number,
+          title: m.title,
+          state: m.state,
+          author: m.author,
+          created_at: m.created_at,
+          extra: (
+            <>
+              {m.source_branch} into {m.target_branch}
+              {m.merge_commit ? ` · merged as ${m.merge_commit.slice(0, 10)}` : ""}
+            </>
+          ),
+        })}
+
+        {m.description ? <div class="sdesc">{m.description}</div> : null}
 
         {!c ? (
           <div class="panel">
@@ -2830,21 +2972,40 @@ fkit push</pre>
           </div>
         ) : (
           <div>
-            <div class={`verdict ${c.mergeable || c.up_to_date ? "ok" : "bad"}`}>
+            <div
+              class={`verdict ${
+                (c.mergeable || c.up_to_date) && (!open || unresolved === 0) ? "ok" : "bad"
+              }`}
+            >
               <span class="vmark">
-                <loom-icon name={c.mergeable || c.up_to_date ? "check" : "commit"} size={14}></loom-icon>
+                <loom-icon
+                  name={
+                    open && unresolved > 0
+                      ? "alert"
+                      : c.mergeable || c.up_to_date
+                        ? "check"
+                        : "commit"
+                  }
+                  size={14}
+                ></loom-icon>
               </span>
               <div class="grow">
                 <div class="vtitle">
+                  {/* An unanswered question outranks a clean tree: the merge
+                      would succeed and still be the wrong thing to do. */}
                   {!open
                     ? `This request is ${m.state}.`
-                    : c.up_to_date
-                      ? "Already merged — nothing left to apply."
-                      : c.fast_forward
-                        ? "Fast-forward: no merge commit needed."
-                        : c.mergeable
-                          ? "No conflicts. This can be merged."
-                          : `${c.conflicts.length} conflict(s) must be resolved first.`}
+                    : unresolved > 0
+                      ? `${unresolved} unresolved comment ${
+                          unresolved === 1 ? "thread" : "threads"
+                        } — resolve ${unresolved === 1 ? "it" : "them"} before merging.`
+                      : c.up_to_date
+                        ? "Already merged — nothing left to apply."
+                        : c.fast_forward
+                          ? "Fast-forward: no merge commit needed."
+                          : c.mergeable
+                            ? "No conflicts. This can be merged."
+                            : `${c.conflicts.length} conflict(s) must be resolved first.`}
                 </div>
                 <div class="vsub">
                   {c.ahead} commit(s) ahead, {c.behind} behind
@@ -2855,7 +3016,17 @@ fkit push</pre>
               {open && m.can_merge && c.mergeable && !c.up_to_date ? (
                 <button
                   class="primary"
-                  disabled={this.busy}
+                  // Said before the click as well as refused after it. The
+                  // server is the one that decides, but a button that looks
+                  // ready and then errors is worse than one that says why.
+                  disabled={this.busy || unresolved > 0}
+                  title={
+                    unresolved > 0
+                      ? `${unresolved} unresolved comment ${
+                          unresolved === 1 ? "thread" : "threads"
+                        }`
+                      : ""
+                  }
                   onClick={() =>
                     void this.act(() => api.performMerge(at.owner, at.name, m.number))
                   }

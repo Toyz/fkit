@@ -37,6 +37,10 @@ pub fn routes() -> Router<AppState> {
             "/repos/{owner}/{name}/comments/{id}",
             patch(edit_comment).delete(delete_comment),
         )
+        .route(
+            "/repos/{owner}/{name}/merges/{number}/resolve",
+            post(resolve_thread),
+        )
 }
 
 // ---- issues -------------------------------------------------------------
@@ -390,6 +394,8 @@ struct CommentRow {
     blob: Option<Vec<u8>>,
     created_at: DateTime<Utc>,
     edited_at: Option<DateTime<Utc>>,
+    resolved_at: Option<DateTime<Utc>>,
+    resolver: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -407,6 +413,10 @@ pub struct CommentView {
     pub blob: Option<String>,
     pub created_at: DateTime<Utc>,
     pub edited_at: Option<DateTime<Utc>>,
+    /// Set once someone has said this has been dealt with. An open merge
+    /// request will not merge while any line comment is still unresolved.
+    pub resolved_at: Option<DateTime<Utc>>,
+    pub resolver: Option<String>,
 }
 
 impl From<CommentRow> for CommentView {
@@ -421,6 +431,8 @@ impl From<CommentRow> for CommentView {
             blob: r.blob.and_then(|b| <[u8; 32]>::try_from(b).ok()).map(|a| Hash(a).to_hex()),
             created_at: r.created_at,
             edited_at: r.edited_at,
+            resolved_at: r.resolved_at,
+            resolver: r.resolver,
         }
     }
 }
@@ -429,9 +441,11 @@ macro_rules! select_comment {
     ($tail:literal) => {
         concat!(
             "SELECT c.id, u.username AS author, c.body, c.file_path, c.line, c.side, ",
-            "       c.blob, c.created_at, c.edited_at ",
+            "       c.blob, c.created_at, c.edited_at, c.resolved_at, ",
+            "       ru.username AS resolver ",
             "  FROM comments c ",
             "  LEFT JOIN users u ON u.id = c.author_id ",
+            "  LEFT JOIN users ru ON ru.id = c.resolved_by ",
             $tail
         )
     };
@@ -648,6 +662,63 @@ async fn comment_on_merge(
     let u = writer(&viewer)?;
     let out = insert_comment(&state, repo_id, None, Some(id), u.id, input).await?;
     Ok((StatusCode::CREATED, out))
+}
+
+#[derive(Deserialize)]
+struct ResolveThread {
+    file_path: String,
+    line: i32,
+    side: String,
+    /// Hex hash identifying which version of the file the thread is on.
+    blob: String,
+    /// False to reopen it.
+    resolved: bool,
+}
+
+/// Mark every comment on one line of one version of one file resolved.
+///
+/// A thread is not a row here — it is every comment sharing an anchor — so
+/// this updates the set rather than a parent. Anyone who can read the
+/// repository and is signed in may resolve: in practice the person who
+/// answered a question is as often the one who closes it as the one who asked.
+async fn resolve_thread(
+    State(state): State<AppState>,
+    viewer: Viewer,
+    Path((owner, name, number)): Path<(String, String, i32)>,
+    Json(input): Json<ResolveThread>,
+) -> AppResult<Json<serde_json::Value>> {
+    let (_, mr) = load_merge(&state, &viewer, &owner, &name, number).await?;
+    let u = writer(&viewer)?;
+
+    let blob = Hash::from_hex(&input.blob)
+        .ok_or_else(|| AppError::BadRequest("blob is not a hash".into()))?;
+    if input.side != "old" && input.side != "new" {
+        return Err(AppError::BadRequest("side must be \"old\" or \"new\"".into()));
+    }
+
+    let done = sqlx::query(
+        "UPDATE comments
+            SET resolved_at = CASE WHEN $5 THEN now() ELSE NULL END,
+                resolved_by = CASE WHEN $5 THEN $6 ELSE NULL END,
+                updated_at = now()
+          WHERE merge_request_id = $1
+            AND file_path = $2 AND line = $3 AND side = $4
+            AND blob = $7",
+    )
+    .bind(mr)
+    .bind(&input.file_path)
+    .bind(input.line)
+    .bind(&input.side)
+    .bind(input.resolved)
+    .bind(u.id)
+    .bind(blob.0.to_vec())
+    .execute(&state.db)
+    .await?;
+
+    if done.rows_affected() == 0 {
+        return Err(AppError::not_found("no thread there"));
+    }
+    Ok(Json(serde_json::json!({ "ok": true, "resolved": input.resolved })))
 }
 
 #[derive(Deserialize)]
