@@ -46,4 +46,7 @@ reqwest = { version = "0.13.4", default-features = false, features = ["json", "h
 # Social card rendering. Text is laid out and rasterised in-process because the
 # alternative is a headless browser, which is a heavier dependency than the
 # whole hub.
-resvg = { version = "0.45", default-features = false, features = ["text", "system-fonts"] }
+# No `system-fonts`: the card loads the vendored face and nothing else, so it
+# renders identically on any machine instead of picking up whatever the host
+# happens to have installed.
+resvg = { version = "0.45", default-features = false, features = ["text"] }

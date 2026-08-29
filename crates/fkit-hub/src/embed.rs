@@ -459,7 +459,7 @@ pub fn inject(html: &str, meta: &Meta, base: &str) -> String {
     let u = esc(&meta.url);
 
     let mut tags = String::with_capacity(1024);
-    tags.push_str(&format!("<meta property=\"og:site_name\" content=\"fkit\">\n"));
+    tags.push_str("<meta property=\"og:site_name\" content=\"fkit\">\n");
     tags.push_str(&format!("<meta property=\"og:title\" content=\"{t}\">\n"));
     tags.push_str(&format!("<meta property=\"og:description\" content=\"{d}\">\n"));
     tags.push_str(&format!("<meta property=\"og:url\" content=\"{u}\">\n"));

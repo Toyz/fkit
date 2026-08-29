@@ -51,8 +51,11 @@ pub fn base_url(state: &AppState, headers: &HeaderMap) -> String {
 /// number of distinct pages that get linked in any window is small.
 const CACHE_MAX: usize = 256;
 
-fn cache() -> &'static Mutex<HashMap<String, (std::time::Instant, Vec<u8>)>> {
-    static C: OnceLock<Mutex<HashMap<String, (std::time::Instant, Vec<u8>)>>> = OnceLock::new();
+/// Page path -> when it was rendered, and the PNG.
+type Cards = Mutex<HashMap<String, (std::time::Instant, Vec<u8>)>>;
+
+fn cache() -> &'static Cards {
+    static C: OnceLock<Cards> = OnceLock::new();
     C.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
