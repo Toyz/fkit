@@ -6,7 +6,7 @@ use crate::models::*;
 use crate::perms::{require_admin, require_read, require_write, resolve};
 use crate::perms::Access;
 use crate::state::AppState;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, patch, post};
@@ -15,12 +15,41 @@ use fkit_core::hash::Hash;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// A query over one person's repositories, carrying the rule for which of them
+/// this viewer may be shown.
+///
+/// The rule is written once, here, and pasted between the caller's own two
+/// halves at compile time. It has to be a macro rather than a constant because
+/// sqlx will not accept a statement built at run time -- `SqlSafeStr` is only
+/// implemented for literals, which is a guardrail worth keeping, and `concat!`
+/// will not expand another macro to reach one. So the whole statement comes
+/// out of this expansion as a single literal.
+///
+/// `$2` is the viewer. This composes a statement; it never carries a value
+/// into one, and every value is still bound.
+///
+/// It filters for speed and for honest counts. It is not the authority:
+/// `resolve` still runs per row before any of them is returned.
+macro_rules! owned_sql {
+    ($pre:literal, $post:literal) => {
+        concat!(
+            $pre,
+            "r.visibility = 'public'
+             OR r.owner_id = $2
+             OR EXISTS (SELECT 1 FROM collaborators c
+                        WHERE c.repo_id = r.id AND c.user_id = $2)",
+            $post
+        )
+    };
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/repos", get(list_repos).post(create_repo))
         .route("/users/{username}", get(get_profile))
         .route("/users/{username}/activity", get(get_activity))
         .route("/users/{username}/pushes", get(get_pushes))
+        .route("/users/{username}/repos", get(list_user_repos))
         .route("/repos/{owner}/{name}", get(get_repo))
         .route("/repos/{owner}/{name}", patch(update_repo))
         .route("/repos/{owner}/{name}", delete(delete_repo))
@@ -46,37 +75,64 @@ pub fn routes() -> Router<AppState> {
 
 /// Repositories the viewer can see: their own, ones they collaborate on, and
 /// every public repository.
-async fn list_repos(State(state): State<AppState>, viewer: Viewer) -> AppResult<Json<Vec<RepoView>>> {
+/// Every repository the viewer may see, newest first, a page at a time.
+///
+/// Searching happens here rather than in the browser. The old listing sent two
+/// hundred rows and let the page filter them, which meant a filter that could
+/// not find the two hundred and first repository and quietly said there was
+/// nothing to find.
+async fn list_repos(
+    State(state): State<AppState>,
+    viewer: Viewer,
+    Query(q): Query<ListQuery>,
+) -> AppResult<Json<RepoPage>> {
     let vid = viewer.id();
+    let limit = q.limit();
+    let pattern = q.pattern();
+    let cursor = q.cursor.as_deref().and_then(Cursor::decode);
+
+    // One statement with optional predicates rather than a string built per
+    // request: sqlx will not take a formatted query, and this way there is one
+    // plan and one place where the visibility rule is written.
     let rows: Vec<RepoWithOwner> = sqlx::query_as(
         "SELECT r.*, u.username FROM repos r
          JOIN users u ON u.id = r.owner_id
-         WHERE r.visibility = 'public'
+         WHERE (r.visibility = 'public'
             OR r.owner_id = $1
             OR EXISTS (SELECT 1 FROM collaborators c
-                       WHERE c.repo_id = r.id AND c.user_id = $1)
-         ORDER BY r.updated_at DESC
-         LIMIT 200",
+                       WHERE c.repo_id = r.id AND c.user_id = $1))
+           AND ($2::text IS NULL
+                OR r.name ILIKE $2 ESCAPE '\'
+                OR u.username ILIKE $2 ESCAPE '\')
+           AND ($3::timestamptz IS NULL OR (r.updated_at, r.id) < ($3, $4))
+         ORDER BY r.updated_at DESC, r.id DESC
+         LIMIT $5",
     )
     .bind(vid)
+    .bind(pattern.as_deref())
+    .bind(cursor.map(|c| c.updated_at))
+    .bind(cursor.map(|c| c.id))
+    .bind(limit + 1)
     .fetch_all(&state.db)
     .await?;
 
-    let (uid, admin, can_write) = match &viewer.user {
-        Some(u) => (Some(u.id), u.is_admin, u.can_write),
-        None => (None, false, false),
-    };
+    let (total,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM repos r
+         JOIN users u ON u.id = r.owner_id
+         WHERE (r.visibility = 'public'
+            OR r.owner_id = $1
+            OR EXISTS (SELECT 1 FROM collaborators c
+                       WHERE c.repo_id = r.id AND c.user_id = $1))
+           AND ($2::text IS NULL
+                OR r.name ILIKE $2 ESCAPE '\'
+                OR u.username ILIKE $2 ESCAPE '\')",
+    )
+    .bind(vid)
+    .bind(pattern.as_deref())
+    .fetch_one(&state.db)
+    .await?;
 
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        let access = resolve(&state.db, &row.repo, uid, admin, can_write, state.policy().require_auth).await?;
-        // The SQL pre-filters for speed; this is the authority. A repository the
-        // viewer cannot read must not appear, even by name.
-        if access.can_read() {
-            out.push(super::repo_view(&row.repo, &row.username, access));
-        }
-    }
-    super::attach_heads(&state, &mut out).await;
+    let out = page_of(&state, &viewer, rows, limit, total).await?;
     Ok(Json(out))
 }
 
@@ -482,7 +538,35 @@ struct Profile {
     display_name: Option<String>,
     is_admin: bool,
     created_at: chrono::DateTime<chrono::Utc>,
+    /// The first page, so a profile is one request in the ordinary case.
+    /// Further pages, and any search, come from `/users/{name}/repos`.
     repos: Vec<crate::models::RepoView>,
+    /// The cursor for the page after `repos`, absent when there is none.
+    next: Option<String>,
+    /// How many this viewer may see in total, and how many of those are
+    /// private. Counted rather than taken from `repos.len()`, which was only
+    /// ever the size of the page and read as the size of the account.
+    repo_count: i64,
+    private_count: i64,
+    /// What they work on, ranked over everything the viewer may see rather
+    /// than over whichever repositories happened to fit on the first page.
+    topics: Vec<String>,
+    /// The most recent push to anything with a commit in it.
+    last_push: Option<LastPush>,
+}
+
+/// The tip of whatever this person pushed to most recently.
+///
+/// Server-side because the page cannot work it out any more: it used to scan
+/// the repository list it had been given, which was the first page, so an
+/// account with more repositories than fit would report the newest of those
+/// rather than the newest of all.
+#[derive(Debug, Serialize)]
+struct LastPush {
+    repo: String,
+    at: chrono::DateTime<chrono::Utc>,
+    commit: String,
+    short: String,
 }
 
 async fn get_profile(
@@ -517,41 +601,146 @@ async fn get_profile(
         return Err(AppError::NotFound(format!("no user named {username}")));
     };
 
-    let rows: Vec<RepoWithOwner> = sqlx::query_as(
-        "SELECT r.*, u.username FROM repos r
-         JOIN users u ON u.id = r.owner_id
-         WHERE r.owner_id = $1
-         ORDER BY r.updated_at DESC
-         LIMIT 200",
-    )
+    let page = owned_page(&state, &viewer, owner.id, &ListQuery::default()).await?;
+
+    // Counted over everything the viewer may see, not over the page. These are
+    // the numbers the profile prints, and taking them from the page meant an
+    // account with a thousand repositories reported thirty.
+    let vid = viewer.id();
+    let (repo_count, private_count): (i64, i64) = sqlx::query_as(owned_sql!(
+        "SELECT count(*),
+                count(*) FILTER (WHERE r.visibility = 'private')
+           FROM repos r
+          WHERE r.owner_id = $1 AND (",
+        ")"
+    ))
     .bind(owner.id)
+    .bind(vid)
+    .fetch_one(&state.db)
+    .await?;
+
+    // Ranked across the lot for the same reason.
+    let topics: Vec<(String,)> = sqlx::query_as(owned_sql!(
+        "SELECT t FROM repos r, unnest(r.topics) AS t
+          WHERE r.owner_id = $1 AND (",
+        ")
+          GROUP BY t
+          ORDER BY count(*) DESC, t ASC
+          LIMIT 6"
+    ))
+    .bind(owner.id)
+    .bind(vid)
     .fetch_all(&state.db)
     .await?;
 
-    let (uid, admin, can_write) = match &viewer.user {
-        Some(u) => (Some(u.id), u.is_admin, u.can_write),
-        None => (None, false, false),
-    };
+    // The newest push, over everything rather than over the page, and only
+    // from a repository that has a commit -- ranking by `updated_at` alone
+    // reported the creation of an empty repository as a push and then had no
+    // tip to show for it.
+    let last: Option<(String, chrono::DateTime<chrono::Utc>, Vec<u8>)> =
+        sqlx::query_as(owned_sql!(
+            "SELECT r.name, r.updated_at, f.target
+               FROM repos r
+               JOIN refs f ON f.repo_id = r.id AND f.name = r.default_branch
+              WHERE r.owner_id = $1 AND (",
+            ")
+              ORDER BY r.updated_at DESC
+              LIMIT 1"
+        ))
+    .bind(owner.id)
+    .bind(vid)
+    .fetch_optional(&state.db)
+    .await?;
 
-    // Same rule as the index: a repository the viewer cannot read must not
-    // appear, even as a name.
-    let mut repos = Vec::with_capacity(rows.len());
-    for row in rows {
-        let access =
-            resolve(&state.db, &row.repo, uid, admin, can_write, state.policy().require_auth).await?;
-        if access.can_read() {
-            repos.push(super::repo_view(&row.repo, &row.username, access));
-        }
-    }
-    super::attach_heads(&state, &mut repos).await;
+    let last_push = last.and_then(|(name, at, target)| {
+        let bytes = <[u8; 32]>::try_from(target.as_slice()).ok()?;
+        let hex = Hash(bytes).to_hex();
+        Some(LastPush { repo: name, at, short: hex[..10].to_string(), commit: hex })
+    });
 
     Ok(Json(Profile {
         username: owner.username,
         display_name: owner.display_name,
         is_admin: owner.is_admin,
         created_at: owner.created_at,
-        repos,
+        repos: page.items,
+        next: page.next,
+        repo_count,
+        private_count,
+        topics: topics.into_iter().map(|(t,)| t).collect(),
+        last_push,
     }))
+}
+
+
+/// `GET /users/{username}/repos` -- one page of somebody's repositories.
+async fn list_user_repos(
+    State(state): State<AppState>,
+    viewer: Viewer,
+    Path(username): Path<String>,
+    Query(q): Query<ListQuery>,
+) -> AppResult<Json<RepoPage>> {
+    if state.policy().require_auth {
+        viewer.require()?;
+    }
+    let username = username.trim().to_ascii_lowercase();
+    let owner: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM users WHERE username = $1 AND is_active = TRUE")
+            .bind(&username)
+            .fetch_optional(&state.db)
+            .await?;
+    let Some((owner_id,)) = owner else {
+        return Err(AppError::NotFound(format!("no user named {username}")));
+    };
+    Ok(Json(owned_page(&state, &viewer, owner_id, &q).await?))
+}
+
+/// One page of the repositories `owner_id` has, as this viewer may see them.
+async fn owned_page(
+    state: &AppState,
+    viewer: &Viewer,
+    owner_id: Uuid,
+    q: &ListQuery,
+) -> AppResult<RepoPage> {
+    let vid = viewer.id();
+    let limit = q.limit();
+    let pattern = q.pattern();
+    let cursor = q.cursor.as_deref().and_then(Cursor::decode);
+
+    let rows: Vec<RepoWithOwner> = sqlx::query_as(owned_sql!(
+        "SELECT r.*, u.username FROM repos r
+         JOIN users u ON u.id = r.owner_id
+         WHERE r.owner_id = $1
+           AND (",
+        ")
+           AND ($3::text IS NULL OR r.name ILIKE $3 ESCAPE '\\')
+           AND ($4::timestamptz IS NULL OR (r.updated_at, r.id) < ($4, $5))
+         ORDER BY r.updated_at DESC, r.id DESC
+         LIMIT $6"
+    ))
+    .bind(owner_id)
+    .bind(vid)
+    .bind(pattern.as_deref())
+    .bind(cursor.map(|c| c.updated_at))
+    .bind(cursor.map(|c| c.id))
+    .bind(limit + 1)
+    .fetch_all(&state.db)
+    .await?;
+
+    let (total,): (i64,) = sqlx::query_as(owned_sql!(
+        "SELECT count(*) FROM repos r
+          WHERE r.owner_id = $1
+            AND (",
+        ")
+            AND ($3::text IS NULL OR r.name ILIKE $3 ESCAPE '\\')"
+    ))
+    .bind(owner_id)
+    .bind(vid)
+    .bind(pattern.as_deref())
+    .fetch_one(&state.db)
+    .await?;
+
+    page_of(state, viewer, rows, limit, total).await
 }
 
 async fn create_repo(
@@ -1816,4 +2005,138 @@ async fn get_pushes(
     }
 
     Ok(Json(out))
+}
+
+/* ------------------------------------------------------------- paged listings */
+
+/// How many repositories a listing hands back at once, and the most it will.
+///
+/// The old answer was two hundred, in one shot, with no way to ask for more and
+/// nothing said when there were. Somebody with three thousand repositories got
+/// two hundred of them and a page that quietly claimed that was all of them.
+pub const PAGE: i64 = 30;
+pub const PAGE_MAX: i64 = 100;
+
+/// Where a listing left off: the sort key of the last row it returned.
+///
+/// Keyset rather than an offset. `ORDER BY updated_at DESC` over a table where
+/// a push changes `updated_at` means offsets slide underneath a reader -- push
+/// to something while somebody is on page two and a repository they have
+/// already seen moves onto page three, while another is skipped entirely. A
+/// key does not move.
+#[derive(Debug, Clone, Copy)]
+struct Cursor {
+    updated_at: chrono::DateTime<chrono::Utc>,
+    id: Uuid,
+}
+
+impl Cursor {
+    /// `<rfc3339>|<uuid>`. Opaque to the client by convention, not by
+    /// encryption: it names a sort position, which is not a secret, and a
+    /// forged one can only seek within what the query already allows.
+    fn encode(&self) -> String {
+        format!("{}|{}", self.updated_at.to_rfc3339(), self.id)
+    }
+
+    fn decode(raw: &str) -> Option<Self> {
+        let (when, id) = raw.split_once('|')?;
+        Some(Cursor {
+            updated_at: chrono::DateTime::parse_from_rfc3339(when).ok()?.with_timezone(&chrono::Utc),
+            id: id.parse().ok()?,
+        })
+    }
+}
+
+/// What a listing takes from the query string.
+#[derive(Debug, Deserialize, Default)]
+pub struct ListQuery {
+    /// Substring of the name to match, case-insensitively. Absent or blank
+    /// means everything.
+    q: Option<String>,
+    /// Where to carry on from, from the previous response's `next`.
+    cursor: Option<String>,
+    limit: Option<i64>,
+}
+
+impl ListQuery {
+    fn limit(&self) -> i64 {
+        self.limit.unwrap_or(PAGE).clamp(1, PAGE_MAX)
+    }
+
+    /// The search term, normalised, with LIKE's wildcards defanged.
+    ///
+    /// Without escaping, a name containing `%` matches everything and one
+    /// containing `_` matches any character -- so searching for a repository
+    /// called `wip_2` would quietly return `wip-2` as well. The pattern is
+    /// still bound as a parameter, so this is about correctness rather than
+    /// injection.
+    fn pattern(&self) -> Option<String> {
+        let raw = self.q.as_deref()?.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        let escaped = raw.replace('\\', r"\\").replace('%', r"\%").replace('_', r"\_");
+        Some(format!("%{escaped}%"))
+    }
+}
+
+/// One page of repositories, and where to carry on from.
+#[derive(Debug, Serialize)]
+pub struct RepoPage {
+    items: Vec<RepoView>,
+    /// The cursor for the next page, absent on the last one.
+    next: Option<String>,
+    /// How many match in total -- not how many are on this page.
+    ///
+    /// Counted with the same predicate rather than inferred from the page, so
+    /// a heading can say "30 of 3,000" instead of implying the thirty are all
+    /// there is.
+    total: i64,
+}
+
+/// Turn rows into views: the access check, the head summaries, and the cursor.
+///
+/// The per-repository `resolve` here is what the SQL predicate cannot be
+/// trusted to have done -- it is the authority, and a repository the viewer
+/// cannot read must not appear even by name. It is a query per row, which is
+/// why bounding the page matters beyond the payload size: at two hundred rows
+/// this loop was two hundred round trips for one page load, and at thirty it
+/// is thirty.
+async fn page_of(
+    state: &AppState,
+    viewer: &Viewer,
+    rows: Vec<RepoWithOwner>,
+    limit: i64,
+    total: i64,
+) -> AppResult<RepoPage> {
+    // One row was fetched beyond the page to find out whether there is another
+    // one, which is cheaper and more honest than counting to decide.
+    let more = rows.len() as i64 > limit;
+    let rows: Vec<RepoWithOwner> = rows.into_iter().take(limit as usize).collect();
+
+    let next = if more {
+        rows.last().map(|r| {
+            Cursor { updated_at: r.repo.updated_at, id: r.repo.id }.encode()
+        })
+    } else {
+        None
+    };
+
+    let (uid, admin, can_write) = match &viewer.user {
+        Some(u) => (Some(u.id), u.is_admin, u.can_write),
+        None => (None, false, false),
+    };
+
+    let mut items = Vec::with_capacity(rows.len());
+    for row in rows {
+        let access =
+            resolve(&state.db, &row.repo, uid, admin, can_write, state.policy().require_auth)
+                .await?;
+        if access.can_read() {
+            items.push(super::repo_view(&row.repo, &row.username, access));
+        }
+    }
+    super::attach_heads(state, &mut items).await;
+
+    Ok(RepoPage { items, next, total })
 }

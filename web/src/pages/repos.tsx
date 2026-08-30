@@ -1,10 +1,8 @@
 /** Repository index. */
-import { LoomElement, component, css, styles, reactive, inject } from "@toyz/loom";
-// Shadows the global `fetch` in this module, which is why it is renamed.
-import { fetch as query, type ApiState } from "@toyz/loom/query";
+import { LoomElement, component, css, styles, reactive, inject, mount } from "@toyz/loom";
 import { route } from "@toyz/loom/router";
 import { base } from "../ui";
-import { type Repo } from "../api";
+import { api, type Repo } from "../api";
 import { linkHandler } from "../nav";
 import { repoRow, repoRowSheet } from "../repo-row";
 import { Session } from "../session";
@@ -48,6 +46,8 @@ const sheet = css`
   }
   .hail .fill { flex: 1; }
 
+  .more { display: flex; justify-content: center; margin-top: 14px; }
+
   .empty { padding: 40px 14px; text-align: center; }
   .empty h2 { color: var(--muted); }
   .empty .prose {
@@ -63,6 +63,62 @@ const sheet = css`
 export class PageRepos extends LoomElement {
   @inject("session") accessor session!: Session;
   @reactive accessor filter = "";
+  @reactive accessor items: Repo[] | null = null;
+  @reactive accessor cursor: string | null = null;
+  @reactive accessor total = 0;
+  @reactive accessor busy = false;
+  @reactive accessor failed = "";
+  private debounce: ReturnType<typeof setTimeout> | undefined;
+
+  @mount
+  first() {
+    void this.load();
+  }
+
+  /**
+   * Search on the server, a beat after the typing stops.
+   *
+   * The listing used to fetch two hundred rows once and filter that array in
+   * the browser, which is a search that cannot find the two hundred and first
+   * repository and reports "no matches" about something that exists.
+   */
+  private onFilter(v: string) {
+    this.filter = v;
+    clearTimeout(this.debounce);
+    this.debounce = setTimeout(() => void this.load(), 220);
+  }
+
+  private async load() {
+    this.busy = true;
+    this.failed = "";
+    try {
+      const page = await api.repoPage({ q: this.filter });
+      this.items = page.items;
+      this.cursor = page.next;
+      this.total = page.total;
+    } catch (e) {
+      this.failed = (e as Error).message;
+      this.items = [];
+      this.cursor = null;
+      this.total = 0;
+    } finally {
+      this.busy = false;
+    }
+  }
+
+  private async more() {
+    if (!this.cursor || this.busy) return;
+    this.busy = true;
+    try {
+      const page = await api.repoPage({ q: this.filter, cursor: this.cursor });
+      // Appended: this is the next page of the same list.
+      this.items = [...(this.items ?? []), ...page.items];
+      this.cursor = page.next;
+      this.total = page.total;
+    } finally {
+      this.busy = false;
+    }
+  }
 
   /**
    * The listing, as a request rather than as a nullable field.
@@ -76,37 +132,27 @@ export class PageRepos extends LoomElement {
    * resolves for a 404 or a 500, so a hand-written `.then(r => r.json())` puts
    * an error body in `data` and reports success. This throws instead.
    */
-  @query<Repo[]>({ url: "/api/repos", init: { credentials: "same-origin" } })
-  accessor repos!: ApiState<Repo[]>;
-
   /** This server, spelled the way the CLI wants it. */
   private origin(): string {
     const scheme = location.protocol === "https:" ? "wss" : "ws";
     return `${scheme}://${location.host}`;
   }
 
-  private visible(): Repo[] {
-    const q = this.filter.trim().toLowerCase();
-    const all = this.repos.data ?? [];
-    return q ? all.filter((r) => r.full_name.toLowerCase().includes(q)) : all;
-  }
-
   update() {
-    const list = this.visible();
-    const all = this.repos.data ?? [];
-    const priv = all.filter((r) => r.visibility === "private").length;
-    // Worth a column of faces only if the faces differ.
-    // Say what the list is, and — while filtering — how much of it you are
-    // being shown, since a filtered count alone reads as the whole total.
-    const value = this.repos.loading
+    const list = this.items ?? [];
+    const loading = this.items === null;
+    // What the list is, and how much of it is on screen. The total comes from
+    // the server: this page holds one page, and a page cannot say how many
+    // there are.
+    const value = loading
       ? ""
-      : this.filter
-        ? `${list.length} of ${all.length}`
-        : `${all.length - priv} public${priv ? ` · ${priv} private` : ""}`;
+      : list.length === this.total
+        ? `${this.total} ${this.total === 1 ? "repository" : "repositories"}`
+        : `${list.length} of ${this.total}`;
 
     return (
       <div class="wrap">
-        {this.repos.error ? <fkit-notice message={this.repos.error.message}></fkit-notice> : null}
+        {this.failed ? <fkit-notice message={this.failed}></fkit-notice> : null}
 
         {/* Somebody arriving with no account got a bare list under the word
             "Repositories" and no indication of what any of it is. The only
@@ -142,7 +188,7 @@ export class PageRepos extends LoomElement {
             <input
               placeholder="filter"
               value={this.filter}
-              onInput={(e: Event) => (this.filter = (e.target as HTMLInputElement).value)}
+              onInput={(e: Event) => this.onFilter((e.target as HTMLInputElement).value)}
             />
             {this.session.canCreateRepo ? (
               <a class="btn" href="/new" onClick={linkHandler("/new")}>
@@ -152,7 +198,7 @@ export class PageRepos extends LoomElement {
           </span>
 
           <fkit-list>
-            {this.repos.loading ? (
+            {loading ? (
               [0, 1, 2, 3, 4].map(() => (
                 <div class="rr sk-row">
                   <span class="ic"><span class="sk" style="width:19px;height:19px"></span></span>
@@ -181,6 +227,14 @@ export class PageRepos extends LoomElement {
               list.map((r) => repoRow(r, { withOwner: true }))
             )}
           </fkit-list>
+
+          {list.length && this.cursor ? (
+            <div class="more">
+              <button class="btn" disabled={this.busy} onClick={() => void this.more()}>
+                {this.busy ? "loading" : "show more"}
+              </button>
+            </div>
+          ) : null}
         </fkit-section>
       </div>
     );

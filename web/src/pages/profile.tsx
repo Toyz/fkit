@@ -32,21 +32,6 @@ import { confirmAction } from "../components/fkit-dialog";
 import "../components/fkit-tabs";
 import "../components/fkit-activity";
 
-/**
- * The topics this person's repositories carry, most-used first.
- *
- * Ordering by count rather than alphabetically is what makes the list mean
- * something: the first chip is what they actually spend their time on.
- * Capped, because a sidebar is not a tag cloud.
- */
-function rankTopics(repos: Repo[], cap = 8): string[] {
-  const seen = new Map<string, number>();
-  for (const r of repos) for (const t of r.topics ?? []) seen.set(t, (seen.get(t) ?? 0) + 1);
-  return [...seen.entries()]
-    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-    .slice(0, cap)
-    .map(([t]) => t);
-}
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -246,6 +231,13 @@ const sheet = css`
   /* A commit that sat somewhere before it was sent. Quiet: it is a footnote on
      the row, not a warning about it. */
   .late { font-size: 11px; color: var(--faint); white-space: nowrap; }
+
+  /* The foot of the list: how much of it you have, and how to get the rest. */
+  .more {
+    display: flex; align-items: center; gap: 12px;
+    margin-top: 12px; font-size: 11.5px; color: var(--faint);
+  }
+  .more .of { flex: 1; font-variant-numeric: tabular-nums; }
 `;
 
 @route("/:owner")
@@ -256,6 +248,52 @@ export class PageProfile extends LoomElement {
   @reactive accessor profile: Profile | null = null;
   @reactive accessor error = "";
   @reactive accessor filter = "";
+
+  /**
+   * Search on the server, a beat after the typing stops.
+   *
+   * It used to filter the array the page already had, which was a page. With
+   * more repositories than fit in one, that is a search box that cannot find
+   * most of what you own and says "no matches" about things that exist.
+   */
+  private onFilter(v: string) {
+    this.filter = v;
+    clearTimeout(this.debounce);
+    this.debounce = setTimeout(() => void this.search(), 220);
+  }
+
+  private async search() {
+    const who = this.profile?.username;
+    if (!who) return;
+    this.searching = true;
+    try {
+      const page = await api.userRepos(who, { q: this.filter });
+      this.shown = page.items;
+      this.cursor = page.next;
+      this.matched = page.total;
+    } catch {
+      this.shown = [];
+      this.cursor = null;
+      this.matched = 0;
+    } finally {
+      this.searching = false;
+    }
+  }
+
+  private async more() {
+    const who = this.profile?.username;
+    if (!who || !this.cursor || this.searching) return;
+    this.searching = true;
+    try {
+      const page = await api.userRepos(who, { q: this.filter, cursor: this.cursor });
+      // Appended, not replaced: this is the next page of the same list.
+      this.shown = [...this.shown, ...page.items];
+      this.cursor = page.next;
+      this.matched = page.total;
+    } finally {
+      this.searching = false;
+    }
+  }
   /**
    * A local copy of the signed-in user.
    *
@@ -279,6 +317,17 @@ export class PageProfile extends LoomElement {
   @reactive accessor stashes: MyStash[] | null = null;
   @reactive accessor activity: Activity | null = null;
   @reactive accessor pushes: Push[] | null = null;
+  /**
+   * The repositories on screen, which is a page of them rather than all.
+   *
+   * Held apart from `profile.repos` because it grows: the profile carries the
+   * first page, "show more" appends, and a search replaces the lot.
+   */
+  @reactive accessor shown: Repo[] = [];
+  @reactive accessor cursor: string | null = null;
+  @reactive accessor matched = 0;
+  @reactive accessor searching = false;
+  private debounce: ReturnType<typeof setTimeout> | undefined;
   @reactive accessor busy = false;
   /** A fetch is already out; a second caller should not start another. */
   private loading = false;
@@ -370,6 +419,9 @@ export class PageProfile extends LoomElement {
     this.stashes = null;
     this.activity = null;
     this.pushes = null;
+    this.shown = [];
+    this.cursor = null;
+    this.matched = 0;
     // Its own request: a year of pushes is a different question from a list of
     // repositories, it is the slower of the two, and a profile that will not
     // render until both have landed is a worse profile than one that fills in.
@@ -381,6 +433,9 @@ export class PageProfile extends LoomElement {
       .profile(who)
       .then((p) => {
         this.profile = p;
+        this.shown = p.repos;
+        this.cursor = p.next;
+        this.matched = p.repo_count;
         this.maybeLoadStashes();
       })
       .catch((e) => (this.error = (e as Error).message));
@@ -403,21 +458,22 @@ export class PageProfile extends LoomElement {
 
     const p = this.profile;
     const mine = !!p && this.me === p.username;
-    const q = this.filter.trim().toLowerCase();
-    const shown = p ? (q ? p.repos.filter((r) => r.name.toLowerCase().includes(q)) : p.repos) : [];
-    // The filter is worth its own line only once scanning is actually work.
-    const filterable = (p?.repos.length ?? 0) > 8;
+    const q = this.filter.trim();
+    const shown = this.shown;
+    // The filter is worth its own line only once scanning is actually work --
+    // measured against everything they have, not against the page.
+    const filterable = (p?.repo_count ?? 0) > 8;
 
-    const pub = p?.repos.filter((r) => r.visibility === "public").length ?? 0;
-    const priv = (p?.repos.length ?? 0) - pub;
-    const topics = p ? rankTopics(p.repos) : [];
-    // Only a repository that has a commit can have been pushed to. Ranking
-    // every repository by updated_at made "last push" report the creation of
-    // an empty one, and dropped the tip hash because that repository had no
-    // tip to show.
-    const latest = p?.repos
-      .filter((r) => r.head)
-      .reduce<Repo | null>((best, r) => (!best || r.updated_at > best.updated_at ? r : best), null);
+    /* Counts, topics and the last push all come from the server now. Derived
+       from the array on hand they were derived from one page: an account with
+       more repositories than fit reported the size of the page as its total,
+       ranked its topics over whichever repositories happened to be newest, and
+       named as its last push the newest of those rather than the newest at
+       all. None of that is visible while a page holds everything, which is why
+       it survived this long. */
+    const priv = p?.private_count ?? 0;
+    const topics = p?.topics ?? [];
+    const latest = p?.last_push ?? null;
 
     return (
       <div class="wrap">
@@ -447,7 +503,7 @@ export class PageProfile extends LoomElement {
 
                   <dt>repositories</dt>
                   <dd>
-                    {p.repos.length}
+                    {p.repo_count}
                     {/* What the number means depends on who is reading it. To
                         the owner it is a split; to anybody else it is only
                         ever what they were allowed to see, and saying so is
@@ -459,25 +515,23 @@ export class PageProfile extends LoomElement {
                     )}
                   </dd>
 
-                  {latest ? (
+                  {latest && p ? (
                     <>
                       <dt>last push</dt>
                       <dd>
-                        {relativeTime(latest.updated_at)}
+                        {relativeTime(latest.at)}
                         {/* The tip of that push. A hash is the only thing here
                             that means exactly one state of exactly one tree, so
                             it is the honest answer to what someone is on. */}
-                        {latest.head ? (
-                          <a
-                            class="at"
-                            href={`/${latest.owner}/${latest.name}/commit/${latest.head.commit}`}
-                            onClick={linkHandler(
-                              `/${latest.owner}/${latest.name}/commit/${latest.head.commit}`,
-                            )}
-                          >
-                            {latest.head.short}
-                          </a>
-                        ) : null}
+                        <a
+                          class="at"
+                          href={`/${p.username}/${latest.repo}/commit/${latest.commit}`}
+                          onClick={linkHandler(
+                            `/${p.username}/${latest.repo}/commit/${latest.commit}`,
+                          )}
+                        >
+                          {latest.short}
+                        </a>
                       </dd>
                     </>
                   ) : null}
@@ -534,7 +588,7 @@ export class PageProfile extends LoomElement {
             current={this.tab}
             tabs={[
               { key: "repos", label: "repositories", icon: "repo", href: `/${p.username}`,
-                count: p.repos.length },
+                count: p.repo_count },
               { key: "activity", label: "activity", icon: "history",
                 href: `/${p.username}?tab=activity` },
               ...(mine
@@ -564,7 +618,7 @@ export class PageProfile extends LoomElement {
                     placeholder="filter"
                     aria-label="Filter repositories"
                     value={this.filter}
-                    onInput={(e: Event) => (this.filter = (e.target as HTMLInputElement).value)}
+                    onInput={(e: Event) => this.onFilter((e.target as HTMLInputElement).value)}
                   />
                 ) : null}
                 {mine && this.session.canCreateRepo ? (
@@ -598,10 +652,18 @@ export class PageProfile extends LoomElement {
               ))
             ) : shown.length === 0 ? (
               <div class="empty">
-                <h2>{q ? "no matches" : mine ? "no repositories yet" : "nothing to show"}</h2>
+                <h2>
+                  {this.searching
+                    ? "searching"
+                    : q
+                      ? "no matches"
+                      : mine
+                        ? "no repositories yet"
+                        : "nothing to show"}
+                </h2>
                 <p class="prose">
                   {q
-                    ? "No repository of theirs matches that filter."
+                    ? `Nothing here is called “${q}”.`
                     : mine
                       ? "Create one, then point the CLI at it: fkit remote, fkit push."
                       : `${p.username} has no repositories you are allowed to see. Private ones are not listed, even by name.`}
@@ -616,6 +678,25 @@ export class PageProfile extends LoomElement {
               shown.map((r) => repoRow(r))
             )}
           </fkit-list>
+
+          {/* How much of the list you are looking at, and the way to see more
+              of it. Both are the honest answer to a question the page used to
+              beg: it showed the first two hundred and said nothing at all
+              about the rest. */}
+          {shown.length ? (
+            <div class="more">
+              <span class="of">
+                {shown.length === this.matched
+                  ? `${this.matched} ${this.matched === 1 ? "repository" : "repositories"}`
+                  : `${shown.length} of ${this.matched}`}
+              </span>
+              {this.cursor ? (
+                <button class="btn" disabled={this.searching} onClick={() => void this.more()}>
+                  {this.searching ? "loading" : "show more"}
+                </button>
+              ) : null}
+            </div>
+          ) : null}
         </fkit-section>
         )}
       </div>

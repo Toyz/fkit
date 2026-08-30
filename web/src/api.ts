@@ -550,12 +550,60 @@ export interface RepoStats {
   archive_limit: number;
 }
 
+/** The tip of whatever somebody pushed to most recently. */
+export interface LastPush {
+  repo: string;
+  at: string;
+  commit: string;
+  short: string;
+}
+
 export interface Profile {
   username: string;
   display_name: string | null;
   is_admin: boolean;
   created_at: string;
+  /** The first page. Ask `userRepos` for the rest, or to search. */
   repos: Repo[];
+  /** Cursor for the page after `repos`, null when there is none. */
+  next: string | null;
+  /**
+   * How many this viewer may see, and how many of those are private.
+   *
+   * From the server, not from `repos.length`. The list is a page, and reading
+   * a page count as an account total is how a profile with a thousand
+   * repositories came to say it had thirty.
+   */
+  repo_count: number;
+  private_count: number;
+  /** Ranked over everything visible, not over the page. */
+  topics: string[];
+  last_push: LastPush | null;
+}
+
+/** One page of a repository listing. */
+export interface RepoPage {
+  items: Repo[];
+  /** Pass back as `cursor` for the next page; null on the last. */
+  next: string | null;
+  /** How many match in total, not how many are on this page. */
+  total: number;
+}
+
+/** What a paged listing accepts. */
+export interface ListOpts {
+  q?: string;
+  cursor?: string | null;
+  limit?: number;
+}
+
+function listQuery(o: ListOpts = {}): string {
+  const p = new URLSearchParams();
+  if (o.q?.trim()) p.set("q", o.q.trim());
+  if (o.cursor) p.set("cursor", o.cursor);
+  if (o.limit) p.set("limit", String(o.limit));
+  const s = p.toString();
+  return s ? `?${s}` : "";
 }
 
 /** One day in somebody's push history. */
@@ -676,7 +724,6 @@ export const api = {
     }),
 
   // repos
-  repos: () => request<Repo[]>("/repos"),
   repoStats: (owner: string, name: string) =>
     request<RepoStats>(`/repos/${owner}/${name}/stats`),
   profile: (username: string) => request<Profile>(`/users/${encodeURIComponent(username)}`),
@@ -977,6 +1024,11 @@ export const api = {
     request<NewToken>("/tokens", { method: "POST", body: body(input) }),
   updateToken: (id: string, input: { name?: string; attributes?: boolean }) =>
     request<{ ok: boolean }>(`/tokens/${id}`, { method: "PATCH", body: body(input) }),
+  /** One page of everything the viewer may see, searched on the server. */
+  repoPage: (o: ListOpts = {}) => request<RepoPage>(`/repos${listQuery(o)}`),
+  /** One page of somebody's own repositories, searched on the server. */
+  userRepos: (username: string, o: ListOpts = {}) =>
+    request<RepoPage>(`/users/${encodeURIComponent(username)}/repos${listQuery(o)}`),
   activity: (username: string) =>
     request<Activity>(`/users/${encodeURIComponent(username)}/activity`),
   pushes: (username: string) =>
