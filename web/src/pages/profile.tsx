@@ -13,7 +13,7 @@
  * otherwise swallow `/settings` and `/admin`. Those names are reserved
  * usernames as well, so the two defences agree.
  */
-import { LoomElement, component, css, styles, reactive, mount, on, inject } from "@toyz/loom";
+import { LoomElement, component, css, styles, reactive, mount, on, inject, debounce } from "@toyz/loom";
 import { route } from "@toyz/loom/router";
 import { base } from "../ui";
 import {
@@ -200,6 +200,19 @@ const sheet = css`
   }
 
   .filter { max-width: 180px; font-size: 12px; height: 24px; padding: 0 8px; }
+  /* A search in flight, said on the control that started it.
+     The border rather than a spinner beside it: nothing moves, nothing is
+     added, and the thing pulsing is the thing you are waiting on. It covers
+     the debounce as well as the request, so the box never looks inert while
+     it is about to do something. */
+  .filter.busy { animation: seek 1.1s ease-in-out infinite; }
+  @keyframes seek {
+    0%, 100% { border-color: var(--border-hi); }
+    50%      { border-color: var(--accent); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .filter.busy { animation: none; border-color: var(--accent); }
+  }
 
   .empty { padding: 34px 14px; text-align: center; }
   .empty h2 { color: var(--muted); }
@@ -258,8 +271,24 @@ export class PageProfile extends LoomElement {
    */
   private onFilter(v: string) {
     this.filter = v;
-    clearTimeout(this.debounce);
-    this.debounce = setTimeout(() => void this.search(), 220);
+    // Set the moment a key lands, not when the request goes out. The wait is
+    // the part that needs saying: without it the box sits there looking like
+    // it did nothing for a fifth of a second and then again for as long as the
+    // server takes.
+    this.searching = true;
+    this.runSearch();
+  }
+
+  /**
+   * Loom's decorator rather than a timer of my own.
+   *
+   * It cancels itself when the element goes away, which the hand-rolled
+   * version did not -- type, navigate, and that pending callback still fired,
+   * against a component no longer on the page.
+   */
+  @debounce(220)
+  private runSearch() {
+    void this.search();
   }
 
   private async search() {
@@ -327,7 +356,7 @@ export class PageProfile extends LoomElement {
   @reactive accessor cursor: string | null = null;
   @reactive accessor matched = 0;
   @reactive accessor searching = false;
-  private debounce: ReturnType<typeof setTimeout> | undefined;
+
   @reactive accessor busy = false;
   /** A fetch is already out; a second caller should not start another. */
   private loading = false;
@@ -614,7 +643,7 @@ export class PageProfile extends LoomElement {
               <span slot="action" class="head-acts">
                 {filterable ? (
                   <input
-                    class="filter"
+                    class={this.searching ? "filter busy" : "filter"}
                     placeholder="filter"
                     aria-label="Filter repositories"
                     value={this.filter}

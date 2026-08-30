@@ -1,5 +1,5 @@
 /** Repository index. */
-import { LoomElement, component, css, styles, reactive, inject, mount } from "@toyz/loom";
+import { LoomElement, component, css, styles, reactive, inject, mount, debounce } from "@toyz/loom";
 import { route } from "@toyz/loom/router";
 import { base } from "../ui";
 import { api, type Repo } from "../api";
@@ -48,6 +48,16 @@ const sheet = css`
 
   .more { display: flex; justify-content: center; margin-top: 14px; }
 
+  /* A search in flight, said on the control that started it. */
+  .filter.busy { animation: seek 1.1s ease-in-out infinite; }
+  @keyframes seek {
+    0%, 100% { border-color: var(--border-hi); }
+    50%      { border-color: var(--accent); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .filter.busy { animation: none; border-color: var(--accent); }
+  }
+
   .empty { padding: 40px 14px; text-align: center; }
   .empty h2 { color: var(--muted); }
   .empty .prose {
@@ -68,7 +78,6 @@ export class PageRepos extends LoomElement {
   @reactive accessor total = 0;
   @reactive accessor busy = false;
   @reactive accessor failed = "";
-  private debounce: ReturnType<typeof setTimeout> | undefined;
 
   @mount
   first() {
@@ -84,8 +93,15 @@ export class PageRepos extends LoomElement {
    */
   private onFilter(v: string) {
     this.filter = v;
-    clearTimeout(this.debounce);
-    this.debounce = setTimeout(() => void this.load(), 220);
+    // Set on the keystroke, not on the request, so the wait itself shows.
+    this.busy = true;
+    this.runSearch();
+  }
+
+  /** Loom's decorator: it cancels itself when the element goes away. */
+  @debounce(220)
+  private runSearch() {
+    void this.load();
   }
 
   private async load() {
@@ -186,6 +202,7 @@ export class PageRepos extends LoomElement {
         <fkit-section heading="Repositories" value={value}>
           <span slot="action" class="head-acts">
             <input
+              class={this.busy ? "filter busy" : "filter"}
               placeholder="filter"
               value={this.filter}
               onInput={(e: Event) => this.onFilter((e.target as HTMLInputElement).value)}
