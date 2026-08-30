@@ -26,7 +26,10 @@ COMPOSE="docker compose -f docker-compose.yml -f docker-compose.dev.yml"
 # against a release binary. That reads as "the protocol is slow" rather than
 # "this is a debug build", which is the sort of thing worth being told once.
 #
-#   RELEASE=1 make dev     optimized, slower to rebuild, fast to push to
+#   make dev-release       optimized: slower to rebuild, far faster to push to
+#
+# `RELEASE=1 make dev` does the same, but that spelling is shell-specific --
+# fish wants `env RELEASE=1 make dev` -- so the target is the one to reach for.
 if [ "${RELEASE:-0}" = "1" ]; then
   CARGO_ARGS="run --release -p fkit-hub"
   echo "  build    release (RELEASE=1) — rebuilds are slower, the hub is not"

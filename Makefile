@@ -3,7 +3,9 @@
 #   make up      start everything in Docker (generates .env on first run)
 #   make dev     run the hub on this machine with live reload
 #   make dev-release  the same, optimized: slower to rebuild, far faster to
-#                     push to, which matters once a repository is large
+#                     push to, which matters once a repository is large.
+#                     Prefer this over RELEASE=1, whose spelling differs
+#                     between shells
 #   make logs    follow the hub's logs
 #   make down    stop, keeping data
 #   make test    run the Rust and frontend checks
