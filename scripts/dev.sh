@@ -14,13 +14,34 @@ cd "$(dirname "$0")/.."
 
 COMPOSE="docker compose -f docker-compose.yml -f docker-compose.dev.yml"
 
+# --- debug or release ------------------------------------------------------
+# Debug by default, because the point of this script is that a change to a .rs
+# file is running seconds later, and an optimized rebuild is not.
+#
+# It is worth knowing what that costs, though, because it is not small and it
+# does not look like a build setting when you meet it. An unoptimized hub is
+# several times slower at the work a sync actually does -- hashing every object
+# it receives and decompressing every object it sends -- so a push of a large
+# history against `make dev` can take five times what the same push takes
+# against a release binary. That reads as "the protocol is slow" rather than
+# "this is a debug build", which is the sort of thing worth being told once.
+#
+#   RELEASE=1 make dev     optimized, slower to rebuild, fast to push to
+if [ "${RELEASE:-0}" = "1" ]; then
+  CARGO_ARGS="run --release -p fkit-hub"
+  echo "  build    release (RELEASE=1) — rebuilds are slower, the hub is not"
+else
+  CARGO_ARGS="run -p fkit-hub"
+  echo "  build    debug — fast to rebuild; use RELEASE=1 for a fast hub"
+fi
+
 # --- the watcher -----------------------------------------------------------
 # cargo-watch is the direct analogue of air. watchexec does the same job if it
 # is what you already have, so either is accepted rather than insisted on.
 if command -v cargo-watch >/dev/null 2>&1; then
-  WATCH="cargo watch -c -w crates -x 'run -p fkit-hub'"
+  WATCH="cargo watch -c -w crates -x '$CARGO_ARGS'"
 elif command -v watchexec >/dev/null 2>&1; then
-  WATCH="watchexec -c -r -w crates -e rs -- cargo run -p fkit-hub"
+  WATCH="watchexec -c -r -w crates -e rs -- cargo $CARGO_ARGS"
 else
   cat >&2 <<'MSG'
 No file watcher found. Install one of:

@@ -2,12 +2,14 @@
 #
 #   make up      start everything in Docker (generates .env on first run)
 #   make dev     run the hub on this machine with live reload
+#   make dev-release  the same, optimized: slower to rebuild, far faster to
+#                     push to, which matters once a repository is large
 #   make logs    follow the hub's logs
 #   make down    stop, keeping data
 #   make test    run the Rust and frontend checks
 
 .DEFAULT_GOAL := help
-.PHONY: help setup up dev dev-db dev-down down restart logs ps test build web clean nuke image push
+.PHONY: help setup up dev dev-release dev-db dev-down down restart logs ps test build web clean nuke image push
 
 help: ## Show this help
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -28,6 +30,9 @@ up: setup ## Build and start the hub + Postgres
 # a rebuild and not an image build.
 dev: setup ## Run the hub here with live reload (Postgres stays in Docker)
 	@scripts/dev.sh
+
+dev-release: setup ## Run the hub here with live reload, optimized
+	@RELEASE=1 scripts/dev.sh
 
 dev-db: setup ## Start only Postgres, published on 55432 for a hub run by hand
 	docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --wait postgres
