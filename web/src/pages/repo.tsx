@@ -468,12 +468,25 @@ const commitSheet = css`
   .day .n {
     margin-left: auto; font-variant-numeric: tabular-nums;
   }
+  /* The foot of the history: how much of it is on screen, and the way to
+     see further back. */
+  .histmore {
+    display: flex; align-items: center; gap: 12px;
+    margin-top: 12px; font-size: 11.5px; color: var(--faint);
+  }
+  .histmore .of { flex: 1; font-variant-numeric: tabular-nums; }
   .empty { padding: 30px 14px; text-align: center; color: var(--faint); font-size: 12px; }
 `;
 
 const sheet = css`
   /* Header reads like a path, because that is what it is. */
   .head { border-bottom: 1px solid var(--border); margin-bottom: 14px; }
+  /* A header that ends in tabs already has a rule: the tab row draws its own,
+     and the active tab's underline has to sit on it. Two of them was two
+     hairlines a few pixels apart. Written as a condition on the header rather
+     than a class somebody has to remember, so a header that grows tabs later
+     stops drawing its own without anyone noticing it needed to. */
+  .head:has(fkit-tabs) { border-bottom: 0; margin-bottom: 0; }
 
   /* Tile, name, and what is true of it — the same three-part header the
      settings, profile and issue pages use, so a repository does not announce
@@ -1832,8 +1845,68 @@ export class PageRepo extends LoomElement {
   })
   accessor commitsQuery!: ApiState<Commit[]>;
 
+  /**
+   * Pages after the first, and which listing they belong to.
+   *
+   * The key is carried with them because the query above reloads on its own
+   * when the repository or the ref changes, and pages fetched for the old one
+   * must not be shown under the new. Comparing keys is cheaper than finding
+   * every place a view can change and remembering to clear this.
+   */
+  @reactive accessor tail: Commit[] = [];
+  @reactive accessor tailKey = "";
+  @reactive accessor tailBusy = false;
+  /** The walk reached a root: there is nothing further back to ask for. */
+  @reactive accessor tailDone = false;
+
+  /** Identifies the listing the tail belongs to. */
+  private historyKey(): string {
+    return `${this.loc?.owner}/${this.loc?.name}@${this.refName()}`;
+  }
+
   private get commits(): Commit[] | null {
-    return this.commitsQuery.data ?? null;
+    const first = this.commitsQuery.data;
+    if (!first) return null;
+    if (!this.tail.length || this.tailKey !== this.historyKey()) return first;
+    return [...first, ...this.tail];
+  }
+
+  /**
+   * The next page, resumed from the oldest commit on screen.
+   *
+   * History is a chain, so the commit at the bottom of the list is itself a
+   * valid ref -- asking for the history of *that* costs nothing to find,
+   * whereas `skip` makes the server walk past everything already shown. The
+   * cost of reading page ten should not depend on there having been nine.
+   */
+  private async loadMoreCommits() {
+    const list = this.commits;
+    if (!list?.length || this.tailBusy || this.tailDone || !this.loc) return;
+    const from = list[list.length - 1].hash;
+    this.tailBusy = true;
+    try {
+      const url =
+        `/api/repos/${this.loc.owner}/${this.loc.name}/commits/` +
+        `${encodeURIComponent(from)}?limit=100&skip=1`;
+      const res = await fetch(url, { credentials: "same-origin" });
+      if (!res.ok) throw new Error(String(res.status));
+      const page: Commit[] = await res.json();
+      const key = this.historyKey();
+      if (this.tailKey !== key) {
+        this.tail = [];
+        this.tailKey = key;
+      }
+      this.tail = [...this.tail, ...page];
+      // A short page means the walk ran out of parents, not that something
+      // went wrong. Asking again would return nothing for ever.
+      if (page.length < 100) this.tailDone = true;
+    } catch {
+      // Leave what is already on screen and let them try again: a failed page
+      // is not a reason to throw away nine good ones.
+      this.tailDone = false;
+    } finally {
+      this.tailBusy = false;
+    }
   }
   @query<CommitDetail>({
     url: (el: PageRepo) =>
@@ -3105,6 +3178,31 @@ export class PageRepo extends LoomElement {
       );
     };
 
+    /* How much of the history is on screen, and the way further back.
+       Built here rather than inside a branch: past two hundred commits this
+       method returns a virtualized list from a different return, and putting
+       the control on only one of them made it vanish at exactly the length
+       where somebody needs it. */
+    const total = this.treeQuery.data?.commits ?? this.stats?.commits;
+    const foot = list.length ? (
+      <div class="histmore">
+        <span class="of">
+          {total !== undefined && total > list.length
+            ? `${list.length.toLocaleString()} of ${total.toLocaleString()} commits`
+            : `${list.length.toLocaleString()} ${list.length === 1 ? "commit" : "commits"}`}
+        </span>
+        {!this.tailDone && (total === undefined || list.length < total) ? (
+          <button
+            class="btn"
+            disabled={this.tailBusy}
+            onClick={() => void this.loadMoreCommits()}
+          >
+            {this.tailBusy ? "loading" : "show more"}
+          </button>
+        ) : null}
+      </div>
+    ) : null;
+
     // Virtualizing cannot carry the day headers with it, so a long history
     // stays flat rather than pretending to be grouped and scrolling wrong.
     if (list.length > 200) {
@@ -3115,7 +3213,12 @@ export class PageRepo extends LoomElement {
       ) as unknown as HTMLElement & { pinToBottom: boolean };
       v.pinToBottom = false;
       adoptInto(v, commitSheet);
-      return <div class="panel commits">{v}</div>;
+      return (
+        <>
+          <div class="panel commits">{v}</div>
+          {foot}
+        </>
+      );
     }
 
     if (list.length === 0) {
@@ -3141,7 +3244,12 @@ export class PageRepo extends LoomElement {
       for (const c of g.items) out.push(row(c));
     }
 
-    return <div class="panel commits">{out}</div>;
+    return (
+      <>
+        <div class="panel commits">{out}</div>
+        {foot}
+      </>
+    );
   }
 
   /// One commit: what it says, what it touched, and what it points at.
