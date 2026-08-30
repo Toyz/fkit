@@ -787,11 +787,7 @@ export class PageProfile extends LoomElement {
           {list === null ? (
             <fkit-empty><span class="sk" style="width:260px"></span></fkit-empty>
           ) : list.length === 0 ? (
-            <fkit-empty>
-              Nothing yet. Commits are linked to an account by the push that
-              delivered them, so anything pushed before that existed — or with a
-              token that declines to attribute — is not counted.
-            </fkit-empty>
+            <fkit-empty>No commits attributed to this account yet.</fkit-empty>
           ) : (
             byDay(list).flatMap((g) => [
               <div class="grp" loom-key={`h:${g.day}`}>
@@ -842,11 +838,7 @@ export class PageProfile extends LoomElement {
           {list === null ? (
             <fkit-empty><span class="sk" style="width:220px"></span></fkit-empty>
           ) : list.length === 0 ? (
-            <fkit-empty>
-              Nothing parked. Work you set aside and sent here follows you
-              between machines, and only you can see it — administrators
-              included. Send one with fkit stash push.
-            </fkit-empty>
+            <fkit-empty>Nothing parked. Send one with fkit stash push.</fkit-empty>
           ) : (
             byRepo(list).flatMap((g) => [
               // A header, then what is parked under it — the shape the commit

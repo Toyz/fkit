@@ -4620,7 +4620,7 @@ fkit push</pre>
                 {this.labelFilter
                   ? `No ${this.issueFilter === "all" ? "" : this.issueFilter} issues labelled ${this.labelFilter}.`
                   : this.issueFilter === "open"
-                    ? "No open issues. Anything wrong, or anything missing, goes here."
+                    ? "No open issues."
                     : `No ${this.issueFilter} issues.`}
               </fkit-empty>
             ) : (
@@ -6341,8 +6341,7 @@ fkit push</pre>
               <fkit-empty><span class="sk" style="width:200px"></span></fkit-empty>
             ) : labels.length === 0 ? (
               <fkit-empty>
-                No labels yet. They are how a tracker stays navigable once it has
-                more issues than fit on a screen.
+                No labels yet.
               </fkit-empty>
             ) : (
               labels.map((l) => (
