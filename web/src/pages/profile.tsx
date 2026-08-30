@@ -16,10 +16,12 @@
 import { LoomElement, component, css, styles, reactive, mount, on, inject } from "@toyz/loom";
 import { route } from "@toyz/loom/router";
 import { base } from "../ui";
-import { api, relativeTime, type Profile, type Repo } from "../api";
+import { api, relativeTime, type MyStash, type Profile, type Repo } from "../api";
 import { linkHandler } from "../nav";
 import { repoRow, repoRowSheet } from "../repo-row";
 import { Session } from "../session";
+import { confirmAction } from "../components/fkit-dialog";
+import "../components/fkit-tabs";
 
 /**
  * The topics this person's repositories carry, most-used first.
@@ -35,6 +37,25 @@ function rankTopics(repos: Repo[], cap = 8): string[] {
     .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
     .slice(0, cap)
     .map(([t]) => t);
+}
+
+/** Stashes bucketed by the repository they belong to, order preserved.
+ *
+ *  A run rather than a map: the list arrives newest first, so walking it and
+ *  starting a bucket when the repository changes keeps the most recent work at
+ *  the top — which is the order somebody looking for what they were doing
+ *  yesterday actually wants. Grouping properly would sort by project name and
+ *  bury it.
+ */
+function byRepo(list: MyStash[]): { slug: string; items: MyStash[] }[] {
+  const out: { slug: string; items: MyStash[] }[] = [];
+  for (const st of list) {
+    const slug = `${st.owner}/${st.repo}`;
+    const last = out[out.length - 1];
+    if (last && last.slug === slug) last.items.push(st);
+    else out.push({ slug, items: [st] });
+  }
+  return out;
 }
 
 const sheet = css`
@@ -100,6 +121,23 @@ const sheet = css`
   }
   .empty .btn { margin-top: 14px; }
 
+
+  /* A group header inside the stash list. Slotted into fkit-list, so it is
+     the page's to style — the same bar the commit history puts between days,
+     because it is doing the same job. */
+  .grp {
+    display: flex; align-items: center; gap: 8px;
+    padding: 7px 14px;
+    background: var(--raised);
+    border-bottom: 1px solid var(--border);
+    font-size: 11.5px;
+  }
+  .grp + .grp, fkit-row + .grp { border-top: 1px solid var(--border); }
+  .grp a { color: var(--text); text-decoration: none; }
+  .grp a:hover { color: var(--accent); text-decoration: underline; }
+  .grp .n {
+    margin-left: auto; color: var(--faint); font-variant-numeric: tabular-nums;
+  }
 `;
 
 @route("/:owner")
@@ -119,6 +157,41 @@ export class PageProfile extends LoomElement {
    * no way to create a repository.
    */
   @reactive accessor me: string | null = null;
+
+  /**
+   * Which view is showing. Read from the query string rather than a path
+   * segment, because `/{owner}/stashes` is already how a repository called
+   * "stashes" is spelled.
+   *
+   * Parked work is behind a click on purpose: it should not render just
+   * because you opened your own profile, which is a thing people do while
+   * somebody else is looking at the screen.
+   */
+  @reactive accessor tab: "repos" | "stashes" = "repos";
+  @reactive accessor stashes: MyStash[] | null = null;
+  @reactive accessor busy = false;
+
+  @mount
+  readTab() {
+    const sync = () => {
+      const want = new URLSearchParams(location.search).get("tab");
+      this.tab = want === "stashes" ? "stashes" : "repos";
+      if (this.tab === "stashes" && this.stashes === null) void this.loadStashes();
+    };
+    sync();
+    addEventListener("popstate", sync);
+    return () => removeEventListener("popstate", sync);
+  }
+
+  private async loadStashes() {
+    try {
+      this.stashes = await api.myStashes();
+    } catch {
+      // Not fatal: the rest of the profile is still worth showing, and an
+      // empty list reads the same as a failed one here.
+      this.stashes = [];
+    }
+  }
 
   @mount
   watchUser() {
@@ -237,8 +310,25 @@ export class PageProfile extends LoomElement {
           )}
         </div>
 
+        {mine ? (
+          <fkit-tabs
+            current={this.tab}
+            tabs={[
+              { key: "repos", label: "repositories", icon: "repo", href: `/${p?.username ?? ""}` },
+              {
+                key: "stashes",
+                label: "stashes",
+                icon: "archive",
+                href: `/${p?.username ?? ""}?tab=stashes`,
+                count: this.stashes?.length,
+              },
+            ]}
+          ></fkit-tabs>
+        ) : null}
+
+        {mine && this.tab === "stashes" ? this.renderStashes() : (
         <fkit-section
-          heading="Repositories"
+          heading={mine ? "" : "Repositories"}
           value={
             p === null
               ? ""
@@ -296,7 +386,100 @@ export class PageProfile extends LoomElement {
             )}
           </fkit-list>
         </fkit-section>
+        )}
       </div>
+    );
+  }
+
+  /**
+   * Parked work, across every repository.
+   *
+   * Across, because "where did I leave that" is not a question you can ask a
+   * repository — the answer is that you cannot remember which one. Each row
+   * links into the ordinary commit page, which renders a stash correctly with
+   * no special handling: a stash commit's first parent is the tree it was
+   * taken from, and a commit page diffs a commit against its first parent.
+   */
+  private renderStashes() {
+    const list = this.stashes;
+    return (
+      <fkit-section
+        value={list === null ? "" : `${list.length} parked`}
+        blurb="Work you set aside and sent to a server so it follows you between machines. Only you can see these, including administrators. They expire on their own."
+      >
+        <fkit-list>
+          {list === null ? (
+            <fkit-empty><span class="sk" style="width:220px"></span></fkit-empty>
+          ) : list.length === 0 ? (
+            <fkit-empty>
+              Nothing parked. `fkit stash push` sends one here from a working copy.
+            </fkit-empty>
+          ) : (
+            byRepo(list).flatMap((g) => [
+              // A header, then what is parked under it — the shape the commit
+              // history already uses for days. A stash only means anything
+              // against the repository it was taken from, so that is the thing
+              // worth naming once rather than repeating down every row.
+              <div class="grp" loom-key={`h:${g.slug}`}>
+                <fkit-avatar name={g.slug} glyph="repo" size={14}></fkit-avatar>
+                <a href={`/${g.slug}`} onClick={linkHandler(`/${g.slug}`)}>
+                  {g.slug}
+                </a>
+                <span class="n">{g.items.length}</span>
+              </div>,
+              ...g.items.map((st) => {
+              const href = `/${st.owner}/${st.repo}/commit/${st.commit_hash}`;
+              return (
+                <fkit-row
+                  loom-key={st.id}
+                  href={href}
+                  name={st.message}
+                  meta={`${relativeTime(st.created_at)} · expires ${relativeTime(
+                    st.expires_at,
+                  )}`}
+                >
+                  {/* Keyed by the commit, not the repository: the repository is
+                      already named in the header above, and this way two
+                      stashes on one project are still told apart at a glance. */}
+                  <fkit-avatar
+                    slot="icon"
+                    name={st.commit_hash}
+                    glyph="archive"
+                    size={22}
+                  ></fkit-avatar>
+                  <span class="sha">{st.commit_hash.slice(0, 10)}</span>
+                  <button
+                    class="revoke"
+                    disabled={this.busy}
+                    onClick={async () => {
+                      const ok = await confirmAction({
+                        title: `Drop this stash?`,
+                        effects: [
+                          { text: `Removed from ${st.owner}/${st.repo} on this server` },
+                          { text: "Any copy on one of your machines is untouched", tone: "safe" },
+                        ],
+                        confirm: "drop stash",
+                        danger: true,
+                      });
+                      if (!ok) return;
+                      this.busy = true;
+                      try {
+                        await api.dropStash(st.owner, st.repo, st.id);
+                        await this.loadStashes();
+                      } finally {
+                        this.busy = false;
+                      }
+                    }}
+                  >
+                    drop
+                  </button>
+                </fkit-row>
+              );
+            }),
+            ])
+          )}
+        </fkit-list>
+      </fkit-section>
     );
   }
 }

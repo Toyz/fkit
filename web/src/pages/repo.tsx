@@ -565,16 +565,6 @@ const sheet = css`
     .rmeta { grid-column: 1 / -1; }
   }
 
-  .tabs { display: flex; gap: 2px; }
-  .tabs a {
-    display: flex; align-items: center; gap: 6px;
-    padding: 5px 10px; color: var(--muted); font-size: 12px;
-    border-bottom: 2px solid transparent; margin-bottom: -1px;
-  }
-  .tabs a loom-icon { opacity: .7; }
-  .tabs a.on loom-icon { opacity: 1; color: var(--accent); }
-  .tabs a:hover { color: var(--text); text-decoration: none; }
-  .tabs a.on { color: var(--text); border-bottom-color: var(--accent); }
 
   .toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
   select.branch { width: auto; font-size: 12px; padding: 3px 6px; }
@@ -899,15 +889,6 @@ const sheet = css`
     margin: 12px 0 0; line-height: 1.5; max-width: 78ch;
   }
 
-  /* A count riding a tab. Quiet by default; it picks up the accent on the
-     tab you are actually on, the same way the label does. */
-  .tabs .tabn {
-    display: inline-flex; align-items: center; justify-content: center;
-    min-width: 16px; height: 16px; padding: 0 5px; margin-left: 2px;
-    border-radius: var(--radius-pill); background: var(--raised); color: var(--muted);
-    font-size: 10.5px; font-variant-numeric: tabular-nums;
-  }
-  .tabs a.on .tabn { background: var(--accent-weak); color: var(--accent); }
 
   /* The header an issue and a merge request share. */
   .subject { margin-bottom: 16px; }
@@ -6678,17 +6659,16 @@ fkit push</pre>
           </div>
 
           {r.description ? <div class="desc">{r.description}</div> : null}
-          <div class="tabs">
-            {tabs.map(([key, label, ic, href, count]) => (
-              <a class={tab === key ? "on" : ""} href={href} onClick={linkHandler(href)}>
-                <loom-icon name={ic} size={12}></loom-icon>
-                {label}
-                {/* Zero is not worth a badge — an empty issue tracker should
-                    look empty rather than decorated with a nought. */}
-                {count ? <span class="tabn">{count}</span> : null}
-              </a>
-            ))}
-          </div>
+          <fkit-tabs
+            current={tab}
+            tabs={tabs.map(([key, label, icon, href, count]) => ({
+              key,
+              label,
+              icon,
+              href,
+              count,
+            }))}
+          ></fkit-tabs>
         </div>
 
         {/* Reading someone's private work because you administer the server

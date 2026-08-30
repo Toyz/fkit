@@ -275,6 +275,19 @@ export interface BranchRule {
   created_at: string;
 }
 
+/** Work parked on the server, across every repository. Only ever your own. */
+export interface MyStash {
+  id: string;
+  owner: string;
+  repo: string;
+  commit_hash: string;
+  base_hash: string;
+  message: string;
+  bytes: number;
+  created_at: string;
+  expires_at: string;
+}
+
 export interface Collaborator {
   user_id: string;
   username: string;
@@ -923,6 +936,10 @@ export const api = {
     request<NewToken>("/tokens", { method: "POST", body: body(input) }),
   updateToken: (id: string, input: { name?: string; attributes?: boolean }) =>
     request<{ ok: boolean }>(`/tokens/${id}`, { method: "PATCH", body: body(input) }),
+  myStashes: () => request<MyStash[]>("/auth/stashes"),
+  dropStash: (owner: string, name: string, id: string) =>
+    request<{ ok: boolean }>(`/repos/${owner}/${name}/stashes/${id}`, { method: "DELETE" }),
+
   branchRules: (owner: string, name: string) =>
     request<BranchRule[]>(`/repos/${owner}/${name}/rules`),
   addBranchRule: (

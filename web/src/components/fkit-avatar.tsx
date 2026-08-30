@@ -11,6 +11,7 @@
  * renders differently from the real thing is worse than no preview.
  */
 import { LoomElement, component, css, styles, prop } from "@toyz/loom";
+import { hueFor } from "../tint";
 
 const sheet = css`
   :host { display: inline-block; }
@@ -70,25 +71,10 @@ export class FkitAvatar extends LoomElement {
     return words[0][0] + words[1][0];
   }
 
-  /**
-   * A hue for this name, stable across sessions and servers.
-   *
-   * FNV-1a, because the only requirements are that it spreads short strings
-   * and that it gives the same answer everywhere — the same reasons this
-   * program identifies everything else by a digest of its content.
-   */
-  private hue(): number {
-    let h = 0x811c9dc5;
-    for (let i = 0; i < this.name.length; i++) {
-      h ^= this.name.charCodeAt(i);
-      h = Math.imul(h, 0x01000193) >>> 0;
-    }
-    return h % 360;
-  }
 
   update() {
     return (
-      <span class="a" style={`--sz:${this.size}px;--h:${this.hue()}`}>
+      <span class="a" style={`--sz:${this.size}px;--h:${hueFor(this.name)}`}>
         {this.glyph ? (
           <loom-icon name={this.glyph} size={Math.round(this.size * 0.46)}></loom-icon>
         ) : (

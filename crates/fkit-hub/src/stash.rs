@@ -74,6 +74,43 @@ pub async fn list(db: &sqlx::PgPool, user: Uuid, repo: Uuid) -> sqlx::Result<Vec
     .await
 }
 
+/// One parked change set, with the repository it belongs to.
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct MineRow {
+    pub id: Uuid,
+    pub owner: String,
+    pub repo: String,
+    #[serde(serialize_with = "hex")]
+    pub commit_hash: Vec<u8>,
+    #[serde(serialize_with = "hex")]
+    pub base_hash: Vec<u8>,
+    pub message: String,
+    pub bytes: i64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Everything this account has parked anywhere.
+///
+/// Across repositories on purpose: a stash belongs to one repository, but the
+/// question "where did I leave that" is not one you can ask a repository,
+/// because the answer is that you cannot remember which.
+pub async fn mine(db: &sqlx::PgPool, user: Uuid) -> sqlx::Result<Vec<MineRow>> {
+    sqlx::query_as(
+        "SELECT s.id, u.username AS owner, r.name AS repo,
+                s.commit_hash, s.base_hash, s.message, s.bytes,
+                s.created_at, s.expires_at
+           FROM stashes s
+           JOIN repos r ON r.id = s.repo_id
+           JOIN users u ON u.id = r.owner_id
+          WHERE s.user_id = $1 AND s.expires_at > now()
+          ORDER BY s.created_at DESC",
+    )
+    .bind(user)
+    .fetch_all(db)
+    .await
+}
+
 /// Park one, refusing it if this account is already over its limit.
 #[allow(clippy::too_many_arguments)]
 pub async fn create(

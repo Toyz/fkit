@@ -28,6 +28,7 @@ pub fn routes() -> Router<AppState> {
         .route("/auth/password", post(change_password))
         .route("/auth/sessions", get(list_sessions).delete(revoke_other_sessions))
         .route("/auth/sessions/{id}", delete(revoke_session))
+        .route("/auth/stashes", get(my_stashes))
         .route("/tokens", get(list_tokens).post(create_token))
         .route("/tokens/{id}", patch(update_token).delete(revoke_token))
 }
@@ -849,6 +850,18 @@ async fn create_token(
             secret: minted.secret,
         }),
     ))
+}
+
+/// Everything this account has parked, across every repository.
+///
+/// Only ever your own — there is no path here that takes a username, because
+/// there is no version of this question somebody else gets to ask.
+async fn my_stashes(
+    State(state): State<AppState>,
+    viewer: Viewer,
+) -> AppResult<Json<Vec<crate::stash::MineRow>>> {
+    let u = viewer.require()?;
+    Ok(Json(crate::stash::mine(&state.db, u.id).await?))
 }
 
 /// Change what an existing token does, without reissuing it.

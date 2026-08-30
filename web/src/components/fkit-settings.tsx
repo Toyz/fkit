@@ -15,6 +15,7 @@
  * wrote them styles them. Each component styles its own chrome only.
  */
 import { LoomElement, component, css, styles, prop } from "@toyz/loom";
+import { linkHandler } from "../nav";
 
 /** Shadow roots do not inherit the document reset. */
 const reset = css`
@@ -256,6 +257,19 @@ const itemSheet = css`
   :host(:last-of-type) { border-bottom: 0; }
 
   .ic { color: var(--faint); display: flex; flex: none; }
+
+  /* The row-wide link, and the one piece of stacking that matters here.
+     It has to lie *over* the row's own text: under it, a click on the words —
+     the obvious gesture, and most of the row's area — lands on a span and does
+     nothing, which is a link that looks clickable everywhere except where you
+     would click it. The text is inert, so covering it costs nothing.
+
+     What the page slotted in is not inert. Those ride above the cover, so a
+     button in a row is still a button and a link in a slotted body still goes
+     where it says. The icon is the exception: it is decoration, so it stays
+     under and the row stays clickable there too. */
+  .cover { position: absolute; inset: 0; z-index: 1; }
+  ::slotted(:not([slot="icon"])) { position: relative; z-index: 2; }
   :host([current]) .ic { color: var(--accent); }
   /* A row whose icon carries a state rather than a kind. Colour and shape
      together: someone who cannot tell the greens from the greys still has the
@@ -284,15 +298,39 @@ export class FkitRow extends LoomElement {
   @prop accessor current = false;
   /** "" | open | done | off — what the icon's colour should say. */
   @prop accessor tone = "";
+  /**
+   * Where the row goes. Set it and the whole row is the link, which is what a
+   * reader expects of a row standing for one thing — clicking the words is the
+   * obvious gesture, and a ten-character hash is a target nobody can find.
+   */
+  @prop accessor href = "";
 
   update() {
     return (
       <>
+        {/* Laid over the row rather than wrapped around it: a real link, so
+            middle-click and copy-address work, but underneath everything else
+            so a button in the row is still a button. */}
+        {this.href ? (
+          <a
+            class="cover"
+            href={this.href}
+            onClick={linkHandler(this.href)}
+            tabIndex={-1}
+            aria-hidden="true"
+          ></a>
+        ) : null}
+        {/* An icon says what kind of thing the row is. A row that stands for
+            something with an identity of its own — a repository, an account,
+            a stash — slots an `fkit-avatar` here instead, so it is told apart
+            by the same derived colour it wears everywhere else on the site. */}
         {this.icon ? (
           <span class="ic">
             <loom-icon name={this.icon} size={14}></loom-icon>
           </span>
-        ) : null}
+        ) : (
+          <slot name="icon"></slot>
+        )}
         {/* A row is usually a name over a line of metadata. When what it
             holds does not fit that — an issue title that is also a link, say —
             the whole middle is slotted instead of the two props being bent
