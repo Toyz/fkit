@@ -592,9 +592,6 @@ export interface Push {
 export interface Activity {
   since: string;
   until: string;
-  /** False when the window was shortened because the account is younger than
-   *  a year, so the heading can say what it actually covers. */
-  full_year: boolean;
   total: number;
   /** The busiest single day, so shading scales to this person's own year. */
   busiest: number;

@@ -485,14 +485,7 @@ export class PageProfile extends LoomElement {
                   {this.activity && this.activity.total > 0 ? (
                     <>
                       <dt>pushed</dt>
-                      {/* Same window the grid beside it draws, said the same
-                          way. A young account gets a short one, and calling
-                          eleven weeks "this year" here while the heading says
-                          "since joining" is two labels for one number. */}
-                      <dd>
-                        {this.activity.total} commits{" "}
-                        {this.activity.full_year ? "this year" : "since joining"}
-                      </dd>
+                      <dd>{this.activity.total} commits this year</dd>
                     </>
                   ) : null}
                 </dl>
@@ -642,10 +635,14 @@ export class PageProfile extends LoomElement {
   private renderPushes() {
     const list = this.pushes;
     return (
-      <fkit-section
-        value={list === null ? "" : list.length ? `last ${list.length}` : ""}
-        blurb="Commits this account delivered, newest first. Work in repositories you cannot see is counted in the graph above but not listed here — there is no way to show what a commit was without showing it."
-      >
+      /* No heading and no preamble. A list of commits in date order does not
+         need to be told it is a list of commits in date order, and the policy
+         note that used to sit here -- what is counted, what is withheld -- was
+         a paragraph of documentation charged to everybody who opened the tab
+         to see what somebody had been doing. It belongs where it is asked for:
+         in the empty state, which is the one time this page has nothing better
+         to say. */
+      <fkit-section>
         <fkit-list>
           {list === null ? (
             <fkit-empty><span class="sk" style="width:260px"></span></fkit-empty>
@@ -700,16 +697,15 @@ export class PageProfile extends LoomElement {
   private renderStashes() {
     const list = this.stashes;
     return (
-      <fkit-section
-        value={list === null ? "" : `${list.length} parked`}
-        blurb="Work you set aside and sent to a server so it follows you between machines. Only you can see these, including administrators. They expire on their own."
-      >
+      <fkit-section>
         <fkit-list>
           {list === null ? (
             <fkit-empty><span class="sk" style="width:220px"></span></fkit-empty>
           ) : list.length === 0 ? (
             <fkit-empty>
-              Nothing parked. `fkit stash push` sends one here from a working copy.
+              Nothing parked. Work you set aside and sent here follows you
+              between machines, and only you can see it — administrators
+              included. Send one with fkit stash push.
             </fkit-empty>
           ) : (
             byRepo(list).flatMap((g) => [
