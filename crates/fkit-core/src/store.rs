@@ -148,7 +148,31 @@ impl Store {
             moved += 1;
             bytes += framed.len() as u64;
         }
+
+        // Packing is the point at which a store settles into the segments it
+        // will keep for a while, so it is the natural moment to put their
+        // indexes in hash order and stop holding them in memory.
+        {
+            let mut slot = self.pack.lock().unwrap();
+            if let Some(pack) = slot.as_mut() {
+                pack.seal_all()?;
+            }
+        }
         Ok((moved, bytes))
+    }
+
+    /// Put every segment index in hash order, so lookups happen on disk.
+    ///
+    /// Idempotent, and safe to call on a store that is already sealed — which
+    /// is why packing can simply always end with it rather than trying to work
+    /// out whether anything changed.
+    pub fn seal_indexes(&self) -> Result<()> {
+        self.enable_pack()?;
+        let mut slot = self.pack.lock().unwrap();
+        if let Some(pack) = slot.as_mut() {
+            pack.seal_all()?;
+        }
+        Ok(())
     }
 
     /// Merge small segments into fewer, larger ones.
@@ -231,7 +255,10 @@ impl Store {
         let pack = slot
             .as_mut()
             .context("this store has no packed segments to compact")?;
-        pack.compact(segments, keep)
+        let stats = pack.compact(segments, keep)?;
+        // The segments compaction just wrote are final by construction.
+        pack.seal_all()?;
+        Ok(stats)
     }
 
     pub fn root(&self) -> &Path {

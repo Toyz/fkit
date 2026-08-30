@@ -38,21 +38,18 @@
 //! the object it described is simply not found, and gets written again. There is
 //! no state that a crash can leave *wrong*, only state it can leave *absent*.
 
-use crate::hash::{Hash, HASH_LEN};
+use crate::hash::Hash;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Rotate to a new segment past this size.
 pub const SEGMENT_LIMIT: u64 = 512 * 1024 * 1024;
 
-/// Index file header. Versioned because the entry layout is on-disk format.
-const IDX_MAGIC: &[u8; 8] = b"fkitidx1";
-
-/// hash(32) + offset(8) + stored(4) + raw(4) + flags(1)
-const IDX_ENTRY: usize = HASH_LEN + 8 + 4 + 4 + 1;
+pub use crate::index::{Located, IDX_ENTRY, IDX_MAGIC};
+use crate::index::{Index, Sealed};
 
 /// `flags` bit 0: the stored bytes are zstd-compressed.
 const FLAG_ZSTD: u8 = 1;
@@ -70,22 +67,6 @@ const COMPRESS_RATIO: f64 = 0.95;
 #[cfg(feature = "compression")]
 const ZSTD_LEVEL: i32 = 1;
 
-#[derive(Debug, Clone, Copy)]
-pub struct Located {
-    pub segment: u32,
-    pub offset: u64,
-    /// Bytes occupied in the segment.
-    pub stored: u32,
-    /// Bytes after decompression — the real object size.
-    pub raw: u32,
-    pub flags: u8,
-}
-
-impl Located {
-    pub fn compressed(&self) -> bool {
-        self.flags & FLAG_ZSTD != 0
-    }
-}
 
 /// Cheap screen for data that cannot compress.
 ///
@@ -149,8 +130,9 @@ fn expand(_bytes: &[u8], _raw_len: usize) -> Result<Vec<u8>> {
 
 pub struct Pack {
     dir: PathBuf,
-    /// Where every packed object lives. Built once, at open.
-    index: HashMap<Hash, Located>,
+    /// Where every packed object lives. Closed segments are searched on disk;
+    /// only the one being appended to is held in memory.
+    index: Index,
     /// Segment ids in this store, so a reader can open them by number.
     names: HashMap<u32, PathBuf>,
     /// This process's writable segment.
@@ -166,7 +148,8 @@ impl Pack {
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("creating pack dir {}", dir.display()))?;
 
-        let mut index = HashMap::new();
+        let mut index = Index::default();
+        let mut hot: HashMap<Hash, Located> = HashMap::new();
         let mut names = HashMap::new();
         let mut max_id = 0u32;
 
@@ -181,7 +164,17 @@ impl Pack {
             };
             max_id = max_id.max(id);
             names.insert(id, path.with_extension("seg"));
-            load_index(&path, id, &mut index)?;
+
+            // A sealed index is searched where it lies. Anything else is a
+            // segment that was still being written, so it is read into memory
+            // the way it always was — and sealed the next time one is closed.
+            match Sealed::open(&path, id)? {
+                Some(sealed) => index.push_sealed(sealed),
+                None => crate::index::load_append_order(&path, id, &mut hot)?,
+            }
+        }
+        for (h, loc) in hot {
+            index.insert(h, loc);
         }
 
         Ok(Pack {
@@ -195,7 +188,7 @@ impl Pack {
     }
 
     pub fn contains(&self, h: Hash) -> bool {
-        self.index.contains_key(&h)
+        self.index.contains(h)
     }
 
     pub fn len(&self) -> usize {
@@ -207,11 +200,11 @@ impl Pack {
     }
 
     pub fn ids(&self) -> Vec<Hash> {
-        self.index.keys().copied().collect()
+        self.index.ids().unwrap_or_default()
     }
 
     pub fn get(&self, h: Hash) -> Result<Option<Vec<u8>>> {
-        let Some(loc) = self.index.get(&h) else {
+        let Some(loc) = self.index.get(h) else {
             return Ok(None);
         };
         let path = self
@@ -245,7 +238,7 @@ impl Pack {
 
     /// Append `framed` under `id`. Returns false if it was already packed.
     pub fn put(&mut self, id: Hash, framed: &[u8]) -> Result<bool> {
-        if self.index.contains_key(&id) {
+        if self.index.contains(id) {
             return Ok(false);
         }
         let squeezed = squeeze(framed);
@@ -287,6 +280,51 @@ impl Pack {
         Ok(true)
     }
 
+    /// Put one segment's index in hash order and search it on disk from now on.
+    ///
+    /// Not an optimisation that can be skipped on failure: leaving the records
+    /// in memory is correct, just expensive, so a seal that cannot be written
+    /// is reported and the hot copy kept.
+    fn seal_segment(&mut self, id: u32) -> Result<()> {
+        let Some(seg) = self.names.get(&id).cloned() else { return Ok(()) };
+        let idx = crate::index::idx_path(&seg);
+        if !idx.exists() {
+            return Ok(());
+        }
+        crate::index::seal(&idx, id)?;
+        if let Some(sealed) = Sealed::open(&idx, id)? {
+            // Everything this segment held is now answered from disk.
+            self.index.forget_segment(id);
+            self.index.push_sealed(sealed);
+        }
+        Ok(())
+    }
+
+    /// Seal every segment, including the one being written.
+    ///
+    /// Called from packing, which is the point at which a store says it is
+    /// finished for now. The open segment is closed first: sealing an index
+    /// that is still being appended to would put it in hash order and then let
+    /// the next write append out of order behind it. A later write simply
+    /// opens a new segment, which is what happens after a rollover anyway.
+    pub fn seal_all(&mut self) -> Result<()> {
+        if let Some((id, seg, idx, _)) = self.current.take() {
+            seg.sync_all()?;
+            idx.sync_all()?;
+            drop((seg, idx));
+            self.seal_segment(id)?;
+        }
+
+        let already: std::collections::HashSet<u32> =
+            self.index.sealed_segments().into_iter().collect();
+        let ids: Vec<u32> =
+            self.names.keys().copied().filter(|id| !already.contains(id)).collect();
+        for id in ids {
+            self.seal_segment(id)?;
+        }
+        Ok(())
+    }
+
     /// Flush and fsync this writer's segment.
     pub fn sync(&mut self) -> Result<()> {
         if let Some((_, seg, idx, _)) = self.current.as_mut() {
@@ -302,6 +340,14 @@ impl Pack {
         {
             return Ok(());
         }
+        // The segment being replaced is finished, so its index can be put in
+        // hash order and handed to the on-disk search. Until this happens the
+        // records must stay in write order, because a crash mid-append has to
+        // leave an index that describes only bytes that are really there.
+        if let Some((old, _, _, _)) = self.current.take() {
+            self.seal_segment(old)?;
+        }
+
         let id = self.next_id;
         self.next_id += 1;
 
@@ -323,16 +369,16 @@ impl Pack {
 
     /// Bytes actually occupied on disk.
     pub fn bytes(&self) -> u64 {
-        self.index.values().map(|l| l.stored as u64).sum()
+        self.index.stored_bytes()
     }
 
     /// Bytes the same objects would occupy uncompressed.
     pub fn raw_bytes(&self) -> u64 {
-        self.index.values().map(|l| l.raw as u64).sum()
+        self.index.raw_bytes()
     }
 
     pub fn compressed_count(&self) -> usize {
-        self.index.values().filter(|l| l.compressed()).count()
+        self.index.compressed_count()
     }
 }
 
@@ -347,9 +393,11 @@ impl Pack {
     /// Which objects live in a given segment.
     pub fn ids_in(&self, segment: u32) -> Vec<Hash> {
         self.index
-            .iter()
+            .entries()
+            .unwrap_or_default()
+            .into_iter()
             .filter(|(_, l)| l.segment == segment)
-            .map(|(h, _)| *h)
+            .map(|(h, _)| h)
             .collect()
     }
 
@@ -367,7 +415,7 @@ impl Pack {
         let mut carry: Vec<(Hash, Vec<u8>)> = Vec::new();
         for seg in segments {
             for id in self.ids_in(*seg) {
-                let loc = self.index[&id];
+                let Some(loc) = self.index.get(id) else { continue };
                 stats.examined += 1;
                 if keep.contains(&id) {
                     let bytes = self
@@ -382,11 +430,15 @@ impl Pack {
         }
 
         // Forget the old locations so `put` does not treat these as present and
-        // skip writing them into the new segment.
+        // skip writing them into the new segment. Both halves have to go: the
+        // hot records, and the sealed index still answering for the segment.
+        // Leaving the sealed half in place made `put` skip every survivor and
+        // then the old file was deleted underneath them.
         for seg in segments {
             for id in self.ids_in(*seg) {
                 self.index.remove(&id);
             }
+            self.index.forget_sealed(*seg);
         }
 
         // Force a fresh segment so survivors never land back in a file we are
@@ -416,39 +468,6 @@ pub struct CompactStats {
     pub reclaimed: u64,
 }
 
-fn load_index(path: &Path, segment: u32, out: &mut HashMap<Hash, Located>) -> Result<()> {
-    let data = std::fs::read(path)?;
-    if data.len() < IDX_MAGIC.len() || &data[..IDX_MAGIC.len()] != IDX_MAGIC {
-        anyhow::bail!(
-            "{} is not an fkit pack index (or predates the current format) — \
-             delete the pack directory and re-run `fkit pack`",
-            path.display()
-        );
-    }
-    let body = &data[IDX_MAGIC.len()..];
-    let (entries, tail) = body.as_chunks::<IDX_ENTRY>();
-    if !tail.is_empty() {
-        // A partial trailing entry is a torn write from a crash. Ignoring it is
-        // safe: the object is simply absent and will be written again.
-        tracing_note(path, tail.len());
-    }
-    for e in entries {
-        let hash = Hash(e[..HASH_LEN].try_into().unwrap());
-        let offset = u64::from_le_bytes(e[HASH_LEN..HASH_LEN + 8].try_into().unwrap());
-        let stored = u32::from_le_bytes(e[HASH_LEN + 8..HASH_LEN + 12].try_into().unwrap());
-        let raw = u32::from_le_bytes(e[HASH_LEN + 12..HASH_LEN + 16].try_into().unwrap());
-        let flags = e[HASH_LEN + 16];
-        out.insert(hash, Located { segment, offset, stored, raw, flags });
-    }
-    Ok(())
-}
-
-fn tracing_note(path: &Path, bytes: usize) {
-    eprintln!(
-        "fkit: ignoring {bytes} trailing byte(s) of a partially written index ({})",
-        path.display()
-    );
-}
 
 #[cfg(test)]
 mod tests {

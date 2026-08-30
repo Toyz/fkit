@@ -201,6 +201,28 @@ memory is always the near tier, because a round trip to Redis costs more than
 reading the object off local disk. `NoCache` is the default in the library, so
 nothing pays for a cache it did not ask for.
 
+### Pack indexes
+
+A segment's index is a flat array of fixed-size records, and it has two lives.
+While the segment is being appended to, records land in write order — a crash
+must never leave an index promising bytes the segment does not hold — and that
+index is held in memory.
+
+`fkit pack` closes the segment and rewrites its index in hash order. A sorted
+immutable array is something you can binary search where it lies, so a sealed
+index is never loaded: about two dozen positioned reads answer a lookup in a
+ten-million-object store, all of them into pages the operating system is
+already caching. Totals live in the sealed header, so asking how large a store
+is stays a constant-time question.
+
+That matters at size. A hash map of every record costs around a hundred bytes
+an object once the table's own overhead is counted, so ten million objects is
+roughly a gigabyte of memory and several seconds of startup spent describing
+objects nobody asked for.
+
+Old indexes are still read: an unsealed one is loaded the way it always was and
+sealed the next time the store is packed.
+
 ## Garbage collection
 
 ```sh
@@ -582,9 +604,6 @@ set only, so `--force` cannot eat a file fkit has never seen.
 
 ## Not done yet
 
-- **On-disk pack index.** The index is loaded into memory at open (~48 bytes per
-  object). Fine to a few million objects; past that it wants a sorted on-disk
-  index with binary search.
 - **Recursive merge base.** Criss-cross histories can have several equally-good
   bases. fkit picks one and reports the ambiguity rather than merging them into a
   virtual base the way git does.

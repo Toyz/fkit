@@ -16,6 +16,7 @@ pub mod diff;
 pub mod fsck;
 pub mod gc;
 pub mod hash;
+pub mod index;
 pub mod ingest;
 pub mod merge;
 pub mod object;

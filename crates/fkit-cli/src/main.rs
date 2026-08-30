@@ -1880,6 +1880,12 @@ fn cmd_pack() -> Result<()> {
         println!("  consolidated {folded} small segment(s)");
     }
 
+    // Packing means the store has settled, so this is where its indexes stop
+    // being append-order lists held in memory and become sorted files searched
+    // where they lie. Unconditional because it is idempotent, and because
+    // "nothing to pack" is exactly the state a long-lived store sits in.
+    repo.store.seal_indexes()?;
+
     let (on_disk, raw) = repo.store.packed_bytes();
     println!("  {} object(s) packed", repo.store.packed_count());
     if raw > 0 {
