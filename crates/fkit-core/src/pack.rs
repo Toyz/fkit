@@ -42,7 +42,7 @@ use crate::hash::Hash;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::PathBuf;
 
 /// Rotate to a new segment past this size.
@@ -210,10 +210,64 @@ pub struct Pack {
     index: Index,
     /// Segment ids in this store, so a reader can open them by number.
     names: HashMap<u32, PathBuf>,
+    /// Open handles for the segments read from, one per segment.
+    ///
+    /// Every object read used to open its segment, seek, and read -- three
+    /// syscalls and a path lookup per object, on a store where a single
+    /// verification pass reads eight hundred thousand of them, and where a
+    /// patch reads its base as well. The handles are kept and read from by
+    /// offset instead, which is also what makes one handle safe to share: a
+    /// positional read does not move a cursor anyone else is using.
+    handles: std::cell::RefCell<HashMap<u32, File>>,
+    /// Patch bases, kept once they have been put back together.
+    ///
+    /// A base anchors a run of revisions, so the same one is asked for once per
+    /// patch that names it -- and answering meant reading it, decompressing it
+    /// and verifying its hash again every time. Measured on git's history that
+    /// was three quarters of what it cost to read a patched object at all.
+    ///
+    /// Content-addressed, so an entry cannot go stale; it is dropped when the
+    /// object it holds could stop existing.
+    bases: std::cell::RefCell<BaseCache>,
     /// This process's writable segment.
     current: Option<(u32, File, File, u64)>,
     writer_id: String,
     next_id: u32,
+}
+
+/// How much materialised base content to keep. Bases are a few kilobytes each,
+/// and there are far fewer of them than there are patches naming them.
+const BASE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Bases that have been put back together, and what they occupy.
+#[derive(Default)]
+struct BaseCache {
+    held: HashMap<Hash, std::sync::Arc<Vec<u8>>>,
+    bytes: usize,
+}
+
+/// Read exactly `buf.len()` bytes from `offset`, leaving the cursor alone.
+#[cfg(unix)]
+fn read_exact_at(f: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(f, buf, offset)
+}
+
+#[cfg(windows)]
+fn read_exact_at(f: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut done = 0;
+    while done < buf.len() {
+        match f.seek_read(&mut buf[done..], offset + done as u64)? {
+            0 => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "segment ended early",
+                ))
+            }
+            n => done += n,
+        }
+    }
+    Ok(())
 }
 
 impl Pack {
@@ -256,10 +310,54 @@ impl Pack {
             dir,
             index,
             names,
+            handles: std::cell::RefCell::new(HashMap::new()),
+            bases: std::cell::RefCell::new(BaseCache::default()),
             current: None,
             writer_id: format!("w{}", std::process::id()),
             next_id: max_id + 1,
         })
+    }
+
+    /// Bytes from a segment, through a handle that stays open.
+    fn read_at(&self, seg: u32, offset: u64, len: usize) -> Result<Vec<u8>> {
+        let mut open = self.handles.borrow_mut();
+        let f = match open.entry(seg) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let path = self
+                    .names
+                    .get(&seg)
+                    .with_context(|| format!("segment {seg} is missing"))?;
+                e.insert(File::open(path)?)
+            }
+        };
+        let mut buf = vec![0u8; len];
+        read_exact_at(f, &mut buf, offset)?;
+        Ok(buf)
+    }
+
+    /// A patch's base, put back together at most once while it stays wanted.
+    fn base_bytes(&self, base: Hash) -> Result<std::sync::Arc<Vec<u8>>> {
+        // Taken and dropped before `get` runs: holding it across the read
+        // would still be borrowed when `get` came back for the next base.
+        let hit = self.bases.borrow().held.get(&base).cloned();
+        if let Some(bytes) = hit {
+            return Ok(bytes);
+        }
+
+        let bytes = std::sync::Arc::new(
+            self.get(base)?
+                .with_context(|| format!("the base {} of a patch is gone", base.short()))?,
+        );
+
+        let mut cache = self.bases.borrow_mut();
+        if cache.bytes + bytes.len() > BASE_CACHE_BYTES {
+            cache.held.clear();
+            cache.bytes = 0;
+        }
+        cache.bytes += bytes.len();
+        cache.held.insert(base, std::sync::Arc::clone(&bytes));
+        Ok(bytes)
     }
 
     pub fn contains(&self, h: Hash) -> bool {
@@ -282,15 +380,7 @@ impl Pack {
         let Some(loc) = self.index.get(h) else {
             return Ok(None);
         };
-        let path = self
-            .names
-            .get(&loc.segment)
-            .with_context(|| format!("segment {} is missing", loc.segment))?;
-
-        let mut f = File::open(path)?;
-        f.seek(SeekFrom::Start(loc.offset))?;
-        let mut buf = vec![0u8; loc.stored as usize];
-        f.read_exact(&mut buf)?;
+        let mut buf = self.read_at(loc.segment, loc.offset, loc.stored as usize)?;
 
         if loc.is_delta() {
             // Depth is one, so this recursion cannot go further: `pick_base`
@@ -300,9 +390,7 @@ impl Pack {
                     .and_then(|b| <[u8; HASH_LEN]>::try_from(b).ok())
                     .context("a delta payload is missing the name of its base")?,
             );
-            let base_bytes = self
-                .get(base)?
-                .with_context(|| format!("the base {} of a patch is gone", base.short()))?;
+            let base_bytes = self.base_bytes(base)?;
             buf = expand_delta(&buf, &base_bytes, loc.raw as usize)?;
         } else if loc.compressed() {
             buf = expand(&buf, loc.raw as usize)?;
@@ -325,12 +413,7 @@ impl Pack {
 
     /// The payload of an object exactly as it sits in its segment.
     fn stored_bytes(&self, loc: &Located) -> Option<Vec<u8>> {
-        let path = self.names.get(&loc.segment)?;
-        let mut f = File::open(path).ok()?;
-        f.seek(SeekFrom::Start(loc.offset)).ok()?;
-        let mut buf = vec![0u8; loc.stored as usize];
-        f.read_exact(&mut buf).ok()?;
-        Some(buf)
+        self.read_at(loc.segment, loc.offset, loc.stored as usize).ok()
     }
 
     /// Append an object's stored form verbatim, keeping how it was encoded.
@@ -448,12 +531,8 @@ impl Pack {
 
     /// The base a stored patch names, read from the front of its payload.
     fn base_named_by(&self, loc: &Located) -> Option<Hash> {
-        let path = self.names.get(&loc.segment)?;
-        let mut f = File::open(path).ok()?;
-        f.seek(SeekFrom::Start(loc.offset)).ok()?;
-        let mut name = [0u8; HASH_LEN];
-        f.read_exact(&mut name).ok()?;
-        Some(Hash(name))
+        let head = self.read_at(loc.segment, loc.offset, HASH_LEN).ok()?;
+        Some(Hash(head.try_into().ok()?))
     }
 
     /// Append `framed` under `id`, storing it as a patch against `base` when
@@ -601,6 +680,9 @@ impl Pack {
         let offset = seg.metadata()?.len();
 
         self.names.insert(id, seg_path);
+        // A fresh id cannot collide with a live handle, but an id reused after
+        // a compaction could, and a stale one here reads the wrong file.
+        self.handles.borrow_mut().remove(&id);
         self.current = Some((id, seg, idx, offset));
         Ok(())
     }
@@ -702,6 +784,16 @@ impl Pack {
 
         for seg in segments {
             if let Some(path) = self.names.remove(seg) {
+                // Drop the read handle with the segment. On Unix an unlinked
+                // file stays readable through an open descriptor, so a handle
+                // left behind would go on answering with the contents of a
+                // segment that no longer exists.
+                self.handles.borrow_mut().remove(seg);
+                // Objects are about to stop existing, and only then can a
+                // content-addressed cache be holding something wrong.
+                let mut bases = self.bases.borrow_mut();
+                bases.held.clear();
+                bases.bytes = 0;
                 let _ = std::fs::remove_file(path.with_extension("idx"));
                 let _ = std::fs::remove_file(&path);
             }
@@ -1063,5 +1155,79 @@ mod delta_tests {
             again.get(h2).is_err() || again.get(h2).unwrap().as_deref() != Some(v2.as_slice()),
             "a corrupted patch was accepted and returned as if it were the object"
         );
+    }
+}
+
+#[cfg(test)]
+mod probe {
+    use super::*;
+    use std::time::Instant;
+
+    /// Where a read actually spends its time, on a real store.
+    /// `FKIT_PROBE=/path/to/objects/pack cargo test -p fkit-core probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn read_costs() {
+        let Ok(dir) = std::env::var("FKIT_PROBE") else { return };
+        let pack = Pack::open(&dir).unwrap();
+
+        let segs: Vec<u32> = pack.names.keys().copied().collect();
+        let mut literals = Vec::new();
+        let mut deltas = Vec::new();
+        for seg in segs {
+            for id in pack.ids_in(seg) {
+                match pack.index.get(id) {
+                    Some(l) if l.is_delta() => deltas.push(id),
+                    Some(_) => literals.push(id),
+                    None => {}
+                }
+            }
+        }
+        println!("  literals {}   deltas {}", literals.len(), deltas.len());
+
+        let n = 20_000.min(literals.len()).min(deltas.len());
+        for (name, ids) in [("literal", &literals), ("delta", &deltas)] {
+            let t = Instant::now();
+            let mut bytes = 0u64;
+            for id in ids.iter().take(n) {
+                bytes += pack.get(*id).unwrap().unwrap().len() as u64;
+            }
+            let per = t.elapsed().as_secs_f64() / n as f64;
+            println!("  {name:<8} {n} reads in {:.2}s  = {:.1} us each  ({:.0} B avg)",
+                     t.elapsed().as_secs_f64(), per * 1e6, bytes as f64 / n as f64);
+        }
+
+        // Index lookups: the thing every arriving object does, twice.
+        {
+            let present: Vec<Hash> = literals.iter().take(50_000).copied().collect();
+            let absent: Vec<Hash> = (0..50_000u32)
+                .map(|i| Hash(*blake3::hash(&i.to_le_bytes()).as_bytes()))
+                .collect();
+            for (name, ids) in [("hit ", &present), ("miss", &absent)] {
+                let t = Instant::now();
+                let mut found = 0;
+                for id in ids.iter() {
+                    if pack.index.get(*id).is_some() {
+                        found += 1;
+                    }
+                }
+                println!(
+                    "  index {name} {} lookups in {:.2}s = {:.1} us each ({found} found)",
+                    ids.len(),
+                    t.elapsed().as_secs_f64(),
+                    t.elapsed().as_secs_f64() / ids.len() as f64 * 1e6
+                );
+            }
+            println!("  sealed segments: {}", pack.index.sealed_count());
+        }
+
+        // How much of a delta read is fetching and verifying its base again.
+        let t = Instant::now();
+        for id in deltas.iter().take(n) {
+            let loc = pack.index.get(*id).unwrap();
+            let base = pack.base_named_by(&loc).unwrap();
+            let _ = pack.get(base).unwrap();
+        }
+        println!("  of which resolving the base: {:.2}s", t.elapsed().as_secs_f64());
     }
 }

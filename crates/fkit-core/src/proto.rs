@@ -357,6 +357,34 @@ pub fn fetch_closure<T: Transport + ?Sized>(
 /// nothing at all until it finishes, which is indistinguishable from being
 /// stuck -- and the one time it really was stuck, that is exactly how it
 /// looked.
+/// Where a transfer's time goes, when `FKIT_TIMING` is set. Diagnostic only.
+pub mod timing {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub static RECV: AtomicU64 = AtomicU64::new(0);
+    pub static HAS: AtomicU64 = AtomicU64::new(0);
+    pub static PUT: AtomicU64 = AtomicU64::new(0);
+    pub static LINKS: AtomicU64 = AtomicU64::new(0);
+    pub static WALK: AtomicU64 = AtomicU64::new(0);
+    pub static PRUNES: AtomicU64 = AtomicU64::new(0);
+
+    pub fn on() -> bool {
+        std::env::var_os("FKIT_TIMING").is_some()
+    }
+
+    pub fn add(c: &AtomicU64, t: std::time::Instant) {
+        c.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    pub fn report() -> String {
+        let ms = |c: &AtomicU64| c.load(Ordering::Relaxed) as f64 / 1e6;
+        format!(
+            "recv {:.0}ms  has {:.0}ms  put {:.0}ms  links {:.0}ms  gapwalk {:.0}ms  prunes {}",
+            ms(&RECV), ms(&HAS), ms(&PUT), ms(&LINKS), ms(&WALK),
+            PRUNES.load(Ordering::Relaxed)
+        )
+    }
+}
+
 pub fn fetch_closure_watched<T: Transport + ?Sized>(
     store: &Store,
     ws: &mut T,
@@ -367,8 +395,21 @@ pub fn fetch_closure_watched<T: Transport + ?Sized>(
     let mut queue: VecDeque<Hash> = VecDeque::new();
     let mut requested: HashSet<Hash> = HashSet::new();
 
+    // Whether the walk ever stopped at something that was already here.
+    //
+    // Gaps are only possible underneath such a thing: everything fetched on
+    // this connection had its links followed, so its children were either
+    // fetched too or were already present and pruned at in turn. A transfer
+    // that never pruned has therefore covered its whole closure, and the scan
+    // for holes at the end has nothing it could find -- on a fresh clone it
+    // was a second full pass over every object, for nothing.
+    let mut pruned = false;
+
     for &r in roots {
-        if !store.has(r) && requested.insert(r) {
+        if store.has(r) {
+            pruned = true;
+            timing::PRUNES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else if requested.insert(r) {
             queue.push_back(r);
         }
     }
@@ -411,7 +452,10 @@ pub fn fetch_closure_watched<T: Transport + ?Sized>(
             // `put_patch` recompute the hash and refuse anything that does not
             // come out as the name it was offered under, so a forged object
             // cannot be stored and a forged patch cannot be applied.
-            let arrived: Vec<(Hash, Vec<u8>)> = match recv(ws)? {
+            let _t = std::time::Instant::now();
+            let incoming = recv(ws)?;
+            timing::add(&timing::RECV, _t);
+            let arrived: Vec<(Hash, Vec<u8>)> = match incoming {
                 Msg::Objects { objects } => {
                     if objects.is_empty() {
                         break;
@@ -423,7 +467,9 @@ pub fn fetch_closure_watched<T: Transport + ?Sized>(
                             requested.insert(claimed);
                             continue;
                         }
+                        let _t = std::time::Instant::now();
                         let (id, _) = store.put_raw(claimed, &framed)?;
+                        timing::add(&timing::PUT, _t);
                         stats.objects += 1;
                         stats.bytes += framed.len() as u64;
                         out.push((id, framed));
@@ -442,11 +488,13 @@ pub fn fetch_closure_watched<T: Transport + ?Sized>(
                         // the peer already did the work of finding the base,
                         // and undoing it here is how a 1.4 GiB history became
                         // 2.8 GiB on the far side.
+                        let _t = std::time::Instant::now();
                         let framed = store
                             .put_patch(claimed, raw, &payload)
                             .with_context(|| {
                                 format!("applying the patch the peer sent for {}", claimed.short())
                             })?;
+                        timing::add(&timing::PUT, _t);
                         stats.objects += 1;
                         stats.bytes += payload.len() as u64;
                         out.push((claimed, framed));
@@ -458,22 +506,40 @@ pub fn fetch_closure_watched<T: Transport + ?Sized>(
                 }
             };
 
+            // Everything in this message counts as ours before any of its
+            // links are read. Marking them one at a time meant a link from the
+            // first object to the fifth found the fifth already stored but not
+            // yet accounted for, and read as a gap that had been pruned at.
+            for (id, _) in &arrived {
+                delivered.insert(*id);
+                requested.insert(*id);
+            }
+
             for (id, framed) in arrived {
-                delivered.insert(id);
-                requested.insert(id);
                 // The edges are read out of the bytes in hand. Asking the
                 // store for them instead meant writing the object, flushing
                 // it, and then reopening its segment to read, decompress and
                 // re-verify what was already in memory -- once per object,
                 // which over a large history is most of the time a push takes.
-                for link in Store::decode_framed(&framed)
+                let _t = std::time::Instant::now();
+                let links = Store::decode_framed(&framed)
                     .with_context(|| format!("object {} will not decode", id.short()))?
-                    .links()
-                {
-                    if !store.has(link) && requested.insert(link) {
+                    .links();
+                timing::add(&timing::LINKS, _t);
+                let _t = std::time::Instant::now();
+                for link in links {
+                    if store.has(link) {
+                        // Already here, and not because this connection put it
+                        // here: that is where a gap could be hiding.
+                        if !requested.contains(&link) {
+                            pruned = true;
+                            timing::PRUNES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    } else if requested.insert(link) {
                         queue.push_back(link);
                     }
                 }
+                timing::add(&timing::HAS, _t);
             }
             progress(&stats);
         }
@@ -488,11 +554,17 @@ pub fn fetch_closure_watched<T: Transport + ?Sized>(
 
         // The queue is empty; that is not the same as being complete.
         // Look for children of things we hold that never arrived.
+        if !pruned {
+            break 'walk;
+        }
+
+        let _t = std::time::Instant::now();
         let mut seen = HashSet::new();
         let mut holes = Vec::new();
         for &r in roots {
             holes.extend(missing_in_closure(store, r, &mut seen)?);
         }
+        timing::add(&timing::WALK, _t);
         if holes.is_empty() {
             break 'walk;
         }

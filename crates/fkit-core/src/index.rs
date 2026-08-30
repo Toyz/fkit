@@ -119,8 +119,23 @@ fn read_at(f: &File, buf: &mut [u8], off: u64) -> std::io::Result<()> {
 }
 
 /// A finished index, searched where it lies.
+/// How large a sealed index may be before it is left on disk.
+///
+/// 49 bytes an object, so this covers a store of about five million of them.
+/// Past that the searches go back to the file and the operating system's page
+/// cache is what keeps them quick.
+const RESIDENT_LIMIT: u64 = 256 * 1024 * 1024;
+
 pub struct Sealed {
     file: File,
+    /// The index itself, when it is small enough to keep.
+    ///
+    /// A lookup is a binary search, so it touched the disk about sixteen times
+    /// per sealed segment and once more for every segment it had to rule out.
+    /// On a clone of git's history that was fifty per cent of the whole
+    /// transfer -- not reading objects, just asking whether they were already
+    /// here.
+    resident: Option<Vec<u8>>,
     pub segment: u32,
     count: u64,
     stored: u64,
@@ -150,8 +165,17 @@ impl Sealed {
         if SEALED_HEADER as u64 + count * IDX_ENTRY as u64 > len {
             return Ok(None);
         }
+        let body = SEALED_HEADER as u64 + count * IDX_ENTRY as u64;
+        let resident = if body <= RESIDENT_LIMIT {
+            let mut buf = vec![0u8; body as usize];
+            read_at(&file, &mut buf, 0).ok().map(|()| buf)
+        } else {
+            None
+        };
+
         Ok(Some(Sealed {
             file,
+            resident,
             segment,
             count,
             stored: n(16),
@@ -161,8 +185,12 @@ impl Sealed {
     }
 
     fn record(&self, i: u64) -> Result<(Hash, Located)> {
+        let at = SEALED_HEADER + i as usize * IDX_ENTRY;
+        if let Some(body) = &self.resident {
+            return Ok(decode(&body[at..at + IDX_ENTRY], self.segment));
+        }
         let mut e = [0u8; IDX_ENTRY];
-        read_at(&self.file, &mut e, SEALED_HEADER as u64 + i * IDX_ENTRY as u64)?;
+        read_at(&self.file, &mut e, at as u64)?;
         Ok(decode(&e, self.segment))
     }
 
@@ -251,6 +279,11 @@ pub struct Index {
 }
 
 impl Index {
+    /// How many sealed indexes a lookup may have to search. Test scaffolding.
+    pub fn sealed_count(&self) -> usize {
+        self.sealed.len()
+    }
+
     pub fn push_sealed(&mut self, s: Sealed) {
         self.sealed.push(s);
     }

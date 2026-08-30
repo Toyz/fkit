@@ -1956,6 +1956,9 @@ fn cmd_clone(url: &str, dir: Option<&str>, no_checkout: bool) -> Result<()> {
         "received {} object(s), {} in {} round trip(s)",
         total.objects, human(total.bytes), total.round_trips
     );
+    if fkit_core::proto::timing::on() {
+        eprintln!("  timing: {}", fkit_core::proto::timing::report());
+    }
     if no_checkout {
         println!("{primary} is at {} (no files written)", tip.short());
     } else {
