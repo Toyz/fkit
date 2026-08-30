@@ -182,20 +182,19 @@ jobs:
   # to a public host hands that token to the network.
   mirror:
     needs: build
-    # Manual for now, deliberately.
+    # Only for main. A tag push publishes an image too, but the mirror follows
+    # the branch, and replaying it again on every release would do nothing but
+    # find there is nothing to do.
     #
-    # The sync protocol changed on both ends: a reply is several messages
-    # closed by an empty one, and objects held as a patch travel as patches.
-    # The hub at fkit.work is still serving the previous protocol, so a runner
-    # built from this commit would open a conversation it cannot finish. Worse,
-    # a half-finished push leaves objects whose children never arrived, and the
-    # next attempt prunes at exactly those and reports success having fixed
-    # nothing.
-    #
-    # So: deploy the hub first, then run this by hand, then put the trigger
-    # back. It was `github.ref == 'refs/heads/main'`, and it goes back to that
-    # once the two ends speak the same protocol again.
-    if: github.event_name == 'workflow_dispatch' && inputs.mirror
+    # A manual run can still skip it, which is what the `mirror` input is for:
+    # when the protocol on this branch has moved ahead of what the deployed hub
+    # answers, mirroring would open a conversation it cannot finish, and a
+    # half-finished push is worse than a failed one -- it leaves objects whose
+    # children never arrived, and the next attempt prunes at exactly those and
+    # reports success having fixed nothing.
+    if: >-
+      github.ref == 'refs/heads/main'
+      && (github.event_name != 'workflow_dispatch' || inputs.mirror)
     runs-on: ubuntu-latest
     permissions:
       contents: read
