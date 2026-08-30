@@ -22,6 +22,7 @@ import {
   humanSize,
   relativeTime,
   type AdminStats,
+  type SystemView,
   type SiteRole,
   type CacheStats,
   type AdminUser,
@@ -208,6 +209,9 @@ export class PageAdmin extends LoomElement {
   @reactive accessor section: Section = "overview";
   @reactive accessor settings: InstanceSettings | null = null;
   @reactive accessor stats: AdminStats | null = null;
+  @reactive accessor system: SystemView | null = null;
+  /** Repeating sample, so the CPU share has two points to work from. */
+  private ticking: ReturnType<typeof setInterval> | null = null;
   @reactive accessor cache: CacheStats | null = null;
   @reactive accessor users: AdminUser[] | null = null;
   @reactive accessor userFilter = "";
@@ -246,6 +250,7 @@ export class PageAdmin extends LoomElement {
     try {
       if (this.section === "overview" || this.stats === null) {
         this.stats = await api.adminStats();
+        this.watchSystem();
         this.cache = await api.cacheStats().catch(() => null);
       }
       if (this.settings === null) this.settings = await api.adminSettings();
@@ -322,6 +327,98 @@ export class PageAdmin extends LoomElement {
    * "Held" rather than "used", because this memory is deliberate — the reason
    * this panel exists is that it otherwise reads as a leak.
    */
+  /**
+   * Sample the process while this page is open.
+   *
+   * Twice, at least: the CPU figure is a share of the interval between two
+   * asks, so a single reading has nothing to compare against and says so
+   * rather than reporting zero.
+   */
+  private watchSystem() {
+    if (this.ticking) return;
+    const take = () => {
+      void api
+        .systemStats()
+        .then((v) => {
+          this.system = v;
+        })
+        .catch(() => {});
+    };
+    take();
+    this.ticking = setInterval(take, 4000);
+  }
+
+  @mount
+  stopSampling() {
+    return () => {
+      if (this.ticking) clearInterval(this.ticking);
+      this.ticking = null;
+    };
+  }
+
+  private renderSystem() {
+    const y = this.system;
+    const secs = (n: number) => {
+      const d = Math.floor(n / 86400);
+      const h = Math.floor((n % 86400) / 3600);
+      const m = Math.floor((n % 3600) / 60);
+      return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`;
+    };
+    const used =
+      y && y.memory_total_bytes && y.memory_available_bytes
+        ? y.memory_total_bytes - y.memory_available_bytes
+        : null;
+
+    return (
+      <fkit-section heading="This process">
+        <fkit-list>
+          {y === null ? (
+            <fkit-empty><span class="sk" style="width:200px"></span></fkit-empty>
+          ) : (
+            <div class="stat-grid">
+              <div class="stat-cell">
+                <b>{y.transfers_open}</b>
+                <span>transfers in flight</span>
+              </div>
+              <div class="stat-cell">
+                <b>{y.cpu_percent === null ? "—" : `${y.cpu_percent.toFixed(0)}%`}</b>
+                <span>of one core</span>
+              </div>
+              <div class="stat-cell">
+                <b>{y.load ? y.load[0].toFixed(2) : "—"}</b>
+                <span>load, 1 min</span>
+              </div>
+              <div class="stat-cell">
+                <b>{y.rss_bytes === null ? "—" : humanSize(y.rss_bytes)}</b>
+                <span>memory here</span>
+              </div>
+              <div class="stat-cell">
+                <b>{used === null ? "—" : humanSize(used)}</b>
+                <span>of {humanSize(y.memory_total_bytes ?? 0)} on the machine</span>
+              </div>
+              <div class="stat-cell">
+                <b>{secs(y.uptime)}</b>
+                <span>up</span>
+              </div>
+              <div class="stat-cell">
+                <b>{y.pushes.count.toLocaleString()}</b>
+                <span>pushes served</span>
+              </div>
+              <div class="stat-cell">
+                <b>{y.pulls.count.toLocaleString()}</b>
+                <span>pulls served</span>
+              </div>
+              <div class="stat-cell">
+                <b>{humanSize(y.pushes.bytes + y.pulls.bytes)}</b>
+                <span>moved</span>
+              </div>
+            </div>
+          )}
+        </fkit-list>
+      </fkit-section>
+    );
+  }
+
   private renderCache() {
     const c = this.cache;
     return (
@@ -418,6 +515,8 @@ export class PageAdmin extends LoomElement {
             )}
           </fkit-list>
         </fkit-section>
+
+        {this.renderSystem()}
 
         {this.renderCache()}
 

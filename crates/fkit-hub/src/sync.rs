@@ -430,6 +430,7 @@ impl RepoHost for PgHost {
     }
 
     fn on_push(&self, branch: &str, tip: Hash, stats: &TransferStats) {
+        self.state.live.pushed(stats.objects, stats.bytes);
         tracing::info!(
             "push {}/{branch} -> {} by {} ({} objects, {} bytes)",
             self.label, tip.short(), self.actor, stats.objects, stats.bytes
@@ -445,6 +446,7 @@ impl RepoHost for PgHost {
     }
 
     fn on_pull(&self, branch: &str, stats: &TransferStats) {
+        self.state.live.pulled(stats.objects, stats.bytes);
         tracing::info!(
             "pull {}/{branch} by {} ({} objects, {} bytes)",
             self.label, self.actor, stats.objects, stats.bytes
@@ -481,7 +483,11 @@ async fn serve(socket: WebSocket, state: AppState, owner: String, name: String) 
     });
 
     let rt = Handle::current();
+    let live = std::sync::Arc::clone(&state.live);
     let outcome = tokio::task::spawn_blocking(move || {
+        // Held for the length of the session, so the gauge comes back down
+        // however this ends -- including badly.
+        let _open = live.session();
         let mut t = ChannelTransport { tx: out_tx, rx: in_rx };
         run(&mut t, state, rt, &owner, &name)
     })

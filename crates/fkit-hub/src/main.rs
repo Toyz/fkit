@@ -15,6 +15,7 @@ mod content;
 mod embed;
 mod email;
 mod error;
+mod live;
 mod models;
 mod perms;
 mod ratelimit;
@@ -114,6 +115,7 @@ async fn main() -> Result<()> {
         cache_backend,
         self_repo: cfg.self_repo.clone(),
         build: Default::default(),
+        live: std::sync::Arc::new(live::Live::default()),
     };
 
     let api = Router::new()

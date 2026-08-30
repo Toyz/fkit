@@ -48,6 +48,9 @@ pub struct AppState {
     /// build is the build -- and because finding it means reading commit
     /// objects, which is not work to repeat for every page footer.
     pub build: Arc<tokio::sync::OnceCell<Option<String>>>,
+    /// What this process is doing right now, for the admin panel. In-process
+    /// and reset when the process is; see [`crate::live`].
+    pub live: Arc<crate::live::Live>,
 }
 
 impl AppState {

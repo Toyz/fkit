@@ -696,6 +696,28 @@ export interface AdminStats {
   disk_bytes: number;
 }
 
+/** Objects moved by transfers of one kind since the process started. */
+export interface Moved {
+  count: number;
+  objects: number;
+  bytes: number;
+}
+
+/** What the server process is doing, and what it costs the machine. */
+export interface SystemView {
+  uptime: number;
+  /** Share of one core since this was last asked. Null on the first ask. */
+  cpu_percent: number | null;
+  load: [number, number, number] | null;
+  rss_bytes: number | null;
+  memory_total_bytes: number | null;
+  memory_available_bytes: number | null;
+  transfers_open: number;
+  transfers_accepted: number;
+  pushes: Moved;
+  pulls: Moved;
+}
+
 export interface Meta {
   site_name?: string;
   /** The release this server is running. */
@@ -1006,6 +1028,7 @@ export const api = {
     request<InstanceSettings>("/admin/settings", { method: "PATCH", body: body(input) }),
   adminStats: () => request<AdminStats>("/admin/stats"),
   cacheStats: () => request<CacheStats>("/admin/cache"),
+  systemStats: () => request<SystemView>("/admin/system"),
   clearCache: () => request<CacheStats>("/admin/cache", { method: "DELETE" }),
   adminEmail: () => request<EmailStatus>("/admin/email"),
   updateAdminEmail: (input: {

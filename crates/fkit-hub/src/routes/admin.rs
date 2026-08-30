@@ -25,6 +25,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/admin/settings", get(get_settings).patch(patch_settings))
         .route("/admin/stats", get(stats))
+        .route("/admin/system", get(system))
         .route("/admin/cache", get(cache).delete(drop_cache))
         .route("/admin/users", get(list_users))
         .route("/admin/users/{id}", patch(patch_user))
@@ -158,6 +159,49 @@ async fn stats(State(state): State<AppState>, viewer: Viewer) -> AppResult<Json<
         merge_requests: one("SELECT count(*) FROM merge_requests").await,
         open_merge_requests: one("SELECT count(*) FROM merge_requests WHERE state = 'open'").await,
         disk_bytes: dir_size(&state.data_dir.join("repos")),
+    }))
+}
+
+/// What this process is doing and what it is costing the machine.
+///
+/// A hub that feels slow is either busy or broken, and from outside those look
+/// identical. Everything here is read at the moment it is asked for; nothing is
+/// stored, and nothing survives a restart.
+#[derive(Serialize)]
+struct SystemView {
+    /// Seconds this process has been up.
+    uptime: u64,
+    /// Share of one core used since this was last asked. `null` on the first
+    /// ask -- a rate needs two samples, and zero would read as idle.
+    cpu_percent: Option<f64>,
+    /// Load averages over one, five and fifteen minutes.
+    load: Option<[f64; 3]>,
+    /// Resident memory of this process.
+    rss_bytes: Option<u64>,
+    memory_total_bytes: Option<u64>,
+    memory_available_bytes: Option<u64>,
+    /// Sync connections open right now.
+    transfers_open: i64,
+    /// Sync connections accepted since start.
+    transfers_accepted: u64,
+    pushes: crate::live::Moved,
+    pulls: crate::live::Moved,
+}
+
+async fn system(State(state): State<AppState>, viewer: Viewer) -> AppResult<Json<SystemView>> {
+    require_admin(&viewer).await?;
+    let (total, available) = crate::live::system_memory();
+    Ok(Json(SystemView {
+        uptime: state.live.uptime_secs(),
+        cpu_percent: state.live.cpu_percent(),
+        load: crate::live::load_average(),
+        rss_bytes: crate::live::process_rss(),
+        memory_total_bytes: total,
+        memory_available_bytes: available,
+        transfers_open: state.live.open_sessions(),
+        transfers_accepted: state.live.accepted(),
+        pushes: state.live.pushes(),
+        pulls: state.live.pulls(),
     }))
 }
 
