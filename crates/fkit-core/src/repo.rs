@@ -404,17 +404,25 @@ impl Repo {
     /// occupied its position before. That is only ever a hint: a first commit
     /// has none, and a wrong guess is noticed and discarded by the pack.
     pub fn snapshot_writing(&self) -> Result<crate::ingest::Ingested> {
+        self.snapshot_writing_watched(None)
+    }
+
+    pub fn snapshot_writing_watched(
+        &self,
+        watch: Option<crate::ingest::Observer<'_>>,
+    ) -> Result<crate::ingest::Ingested> {
         let prior = self.head_tree().unwrap_or(None);
         let prior = match prior {
             Some(root) => crate::ingest::Prior::at(&self.store, root),
             None => crate::ingest::Prior::none(),
         };
-        crate::ingest::ingest_dir_after(
+        crate::ingest::ingest_dir_watched(
             &Sink::writing(&self.store),
             &self.root,
             &self.ignore(),
             &self.mounts()?,
             &prior,
+            watch,
         )
     }
 
@@ -456,7 +464,21 @@ impl Repo {
     /// Both fields are part of the commit's hash, so an import is reproducible:
     /// replaying the same source twice produces the same fkit commits.
     pub fn commit_as(&self, message: &str, who: &CommitAs) -> Result<CommitResult> {
-        let snap = self.snapshot_writing()?;
+        self.commit_watched(message, who, None)
+    }
+
+    /// [`commit_as`](Self::commit_as), reporting progress while it hashes.
+    ///
+    /// Hashing a large working tree is the slow part of a commit, and it is
+    /// silent — so a caller with a terminal can say what is happening rather
+    /// than looking hung.
+    pub fn commit_watched(
+        &self,
+        message: &str,
+        who: &CommitAs,
+        watch: Option<crate::ingest::Observer<'_>>,
+    ) -> Result<CommitResult> {
+        let snap = self.snapshot_writing_watched(watch)?;
         let parent = self.head_commit()?;
         let merging = self.merge_head()?;
 

@@ -354,3 +354,47 @@ fn an_unset_override_falls_back_to_the_configured_author() {
     assert_eq!(c.author, repo.author());
     assert!(c.timestamp > 0, "an unset date means now, not zero");
 }
+
+/// The ingest reports progress that a caller can actually display.
+///
+/// Hashing a large tree is minutes of silence otherwise, and the only thing
+/// worse than no progress is progress that lies — so this checks the counts
+/// only move forwards and that the last one is the whole job.
+#[test]
+fn ingest_reports_progress_that_ends_at_the_total() {
+    use fkit_core::ingest::Progress;
+
+    let tmp = Tmp::new("progress");
+    let repo = Repo::init(&tmp.0).unwrap();
+    repo.config_set("author.name", "t").unwrap();
+    repo.config_set("author.email", "t@e").unwrap();
+
+    for i in 0..60 {
+        write(&tmp.0, &format!("d{}/f{i}.txt", i % 7), &"x".repeat(500 + i * 13));
+    }
+
+    let mut seen: Vec<(usize, usize, u64)> = Vec::new();
+    let mut scanned = false;
+    let mut built = false;
+    repo.commit_watched("everything", &Default::default(), Some(&mut |p| match p {
+        Progress::Scanning { .. } => scanned = true,
+        Progress::Hashing { done, total, bytes, .. } => seen.push((done, total, bytes)),
+        Progress::Building => built = true,
+    }))
+    .unwrap();
+
+    assert!(scanned, "the walk should announce itself before hashing starts");
+    assert!(built, "tree building should be reported too");
+    assert!(!seen.is_empty(), "hashing reported nothing at all");
+
+    // Never goes backwards: a counter that jitters is worse than none.
+    for pair in seen.windows(2) {
+        assert!(pair[1].0 >= pair[0].0, "file count went backwards: {pair:?}");
+        assert!(pair[1].2 >= pair[0].2, "byte count went backwards: {pair:?}");
+    }
+
+    let (done, total, bytes) = *seen.last().unwrap();
+    assert_eq!(done, total, "the final report must be the whole job");
+    assert_eq!(total, 60, "every file should be counted once");
+    assert!(bytes > 0, "bytes hashed should be reported");
+}

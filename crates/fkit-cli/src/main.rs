@@ -358,7 +358,9 @@ fn cmd_commit(
     if who.author.is_none() {
         require_author(&repo)?;
     }
-    let res = repo.commit_as(&message, &who)?;
+    let mut progress = Progress::new();
+    let res = repo.commit_watched(&message, &who, Some(&mut |p| progress.show(p)))?;
+    progress.done();
     let branch = match repo.head()? {
         Head::Branch(b) => b,
         Head::Detached(_) => "(detached)".into(),
@@ -376,17 +378,161 @@ fn cmd_commit(
         }
     }
 
-    println!("[{branch} {}] {message}", res.commit.short());
-    println!("  tree {}", res.tree.short());
+    println!("[{branch} {}] {}", res.commit.short(), message.lines().next().unwrap_or(""));
+
+    // What actually changed, which is the question someone has just after
+    // committing — the object counts below answer a different one.
+    let parent_tree = match repo.store.get(res.commit)? {
+        Object::Commit(c) => match c.parents.first() {
+            Some(p) => match repo.store.get(*p)? {
+                Object::Commit(pc) => Some(pc.tree),
+                _ => None,
+            },
+            None => None,
+        },
+        _ => None,
+    };
+    let changes = diff_trees(&repo.view(), parent_tree, Some(res.tree))?;
+    report_changes(&changes);
+
     let s = res.stats;
     println!(
-        "  {} new object(s), {} written; {} object(s) already stored ({} deduplicated)",
+        "  {} · {} new object(s), {} written{}",
+        res.tree.short(),
         s.objects_written,
         human(s.bytes_written),
-        s.objects_deduped,
-        human(s.bytes_deduped),
+        if s.objects_deduped > 0 {
+            format!(
+                ", {} already stored ({} deduplicated)",
+                s.objects_deduped,
+                human(s.bytes_deduped)
+            )
+        } else {
+            String::new()
+        },
     );
     Ok(())
+}
+
+/// A one-line progress display for work that would otherwise be silent.
+///
+/// Written to stderr and only when stderr is a terminal: piped into a file or
+/// a CI log, carriage returns produce a single unreadable line, and the useful
+/// output on stdout stays clean either way.
+struct Progress {
+    tty: bool,
+    width: usize,
+    last: std::time::Instant,
+}
+
+impl Progress {
+    fn new() -> Progress {
+        // Auto-detect, but let it be forced either way: a CI log may well want
+        // the progress, and someone piping into a pager may not.
+        let tty = match std::env::var("FKIT_PROGRESS").ok().as_deref() {
+            Some("0") | Some("no") | Some("off") => false,
+            Some("1") | Some("yes") | Some("on") => true,
+            _ => std::io::IsTerminal::is_terminal(&std::io::stderr()),
+        };
+        Progress {
+            tty,
+            width: 0,
+            // Far enough in the past that the first update always draws.
+            last: std::time::Instant::now() - std::time::Duration::from_secs(1),
+        }
+    }
+
+    fn show(&mut self, p: fkit_core::ingest::Progress<'_>) {
+        if !self.tty {
+            return;
+        }
+        // Redrawing faster than the eye resolves just burns syscalls.
+        if self.last.elapsed() < std::time::Duration::from_millis(100) {
+            return;
+        }
+        self.last = std::time::Instant::now();
+
+        let line = match p {
+            fkit_core::ingest::Progress::Scanning { .. } => "  scanning…".to_string(),
+            fkit_core::ingest::Progress::Hashing { done, total, bytes, .. } => {
+                let pct = if total == 0 { 100 } else { done * 100 / total };
+                format!("  hashing {done}/{total} files ({pct}%), {}", human(bytes))
+            }
+            fkit_core::ingest::Progress::Building => "  building trees…".to_string(),
+        };
+        self.draw(&line);
+    }
+
+    fn draw(&mut self, line: &str) {
+        use std::io::Write;
+        let mut err = std::io::stderr();
+        // Pad to erase whatever was longer before, rather than clearing the
+        // line first — one write, no flicker.
+        let pad = self.width.saturating_sub(line.chars().count());
+        let _ = write!(err, "\r{line}{:pad$}", "", pad = pad);
+        let _ = err.flush();
+        self.width = line.chars().count();
+    }
+
+    /// Erase the line so the real output starts on a clean one.
+    fn done(&mut self) {
+        use std::io::Write;
+        if !self.tty || self.width == 0 {
+            return;
+        }
+        let mut err = std::io::stderr();
+        let _ = write!(err, "\r{:width$}\r", "", width = self.width);
+        let _ = err.flush();
+        self.width = 0;
+    }
+}
+
+/// Summarise a commit's changes, then name them.
+///
+/// Capped, because the first commit of a large repository has a hundred
+/// thousand entries and nobody reads that — but the count is always exact, so
+/// the summary never hides how much happened.
+fn report_changes(changes: &[Change]) {
+    const LIST_LIMIT: usize = 12;
+
+    if changes.is_empty() {
+        // Reachable via a merge commit, which can have an unchanged tree.
+        println!("  no file changes");
+        return;
+    }
+
+    let (mut added, mut removed, mut modified, mut typed) = (0, 0, 0, 0);
+    for c in changes {
+        match c {
+            Change::Added { .. } => added += 1,
+            Change::Removed { .. } => removed += 1,
+            Change::Modified { .. } => modified += 1,
+            Change::TypeChanged { .. } => typed += 1,
+        }
+    }
+
+    let mut parts = Vec::new();
+    if added > 0 { parts.push(format!("{added} added")) }
+    if modified > 0 { parts.push(format!("{modified} modified")) }
+    if removed > 0 { parts.push(format!("{removed} removed")) }
+    if typed > 0 { parts.push(format!("{typed} type changed")) }
+    let n = changes.len();
+    println!("  {n} file{} changed: {}", if n == 1 { "" } else { "s" }, parts.join(", "));
+
+    for c in changes.iter().take(LIST_LIMIT) {
+        let detail = match c {
+            Change::Added { size, .. } => format!(" ({})", human(*size)),
+            Change::Removed { size, .. } => format!(" (was {})", human(*size)),
+            Change::Modified { old_size, new_size, .. } => {
+                format!(" ({} -> {})", human(*old_size), human(*new_size))
+            }
+            Change::TypeChanged { .. } => String::new(),
+        };
+        println!("   {} {}{detail}", c.sigil(), c.path());
+    }
+    if n > LIST_LIMIT {
+        println!("   … and {} more", n - LIST_LIMIT);
+    }
 }
 
 fn cmd_log(count: Option<usize>) -> Result<()> {

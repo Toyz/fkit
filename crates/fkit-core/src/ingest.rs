@@ -500,6 +500,26 @@ pub fn ingest_dir(
     ingest_dir_after(sink, dir, ignore, mounts, &Prior::none())
 }
 
+/// What an ingest is doing, for a caller that wants to say so.
+///
+/// Hashing a large tree takes minutes, and a command that prints nothing for
+/// minutes is indistinguishable from one that has hung. The counts are read
+/// from the same atomic the workers already use to claim work, so reporting
+/// costs nothing when nobody is listening.
+#[derive(Debug, Clone, Copy)]
+pub enum Progress<'a> {
+    /// Walking the directory tree, before any hashing starts.
+    Scanning { files: usize },
+    /// Hashing file contents. `done` of `total`, with the bytes so far.
+    Hashing { done: usize, total: usize, bytes: u64, path: &'a str },
+    /// Building the directory objects — serial, and usually brief.
+    Building,
+}
+
+/// A callback invoked as an ingest proceeds. Called from the coordinating
+/// thread only, so an implementation does not have to be thread-safe.
+pub type Observer<'o> = &'o mut dyn FnMut(Progress<'_>);
+
 /// Ingest a directory, knowing the tree it is a revision of.
 ///
 /// Everything the previous tree offers is a hint about which chunk each new
@@ -512,6 +532,21 @@ pub fn ingest_dir_after(
     mounts: &Mounts,
     prior: &Prior,
 ) -> Result<Ingested> {
+    ingest_dir_watched(sink, dir, ignore, mounts, prior, None)
+}
+
+/// [`ingest_dir_after`], reporting progress as it goes.
+pub fn ingest_dir_watched(
+    sink: &Sink,
+    dir: &Path,
+    ignore: &Ignore,
+    mounts: &Mounts,
+    prior: &Prior,
+    mut watch: Option<Observer<'_>>,
+) -> Result<Ingested> {
+    if let Some(w) = watch.as_deref_mut() {
+        w(Progress::Scanning { files: 0 });
+    }
     let sk = enumerate(dir, ignore, mounts)?;
 
     let threads = std::thread::available_parallelism()
@@ -520,7 +555,10 @@ pub fn ingest_dir_after(
         .min(sk.jobs.len().max(1));
 
     let next = std::sync::atomic::AtomicUsize::new(0);
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let bytes = std::sync::atomic::AtomicU64::new(0);
     let jobs = &sk.jobs;
+    let total = jobs.len();
 
     // Scoped threads: no 'static bound, so `sink` and `jobs` are borrowed
     // directly and there is nothing to clone or Arc.
@@ -529,17 +567,45 @@ pub fn ingest_dir_after(
             let handles: Vec<_> = (0..threads)
                 .map(|_| {
                     let next = &next;
+                    let done = &done;
+                    let bytes = &bytes;
                     scope.spawn(move || {
                         let mut mine = Vec::new();
                         loop {
                             let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let Some(job) = jobs.get(i) else { break };
-                            mine.push(run_job(sink, job, prior)?);
+                            let out = run_job(sink, job, prior)?;
+                            done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            bytes.fetch_add(out.1.size, std::sync::atomic::Ordering::Relaxed);
+                            mine.push(out);
                         }
                         Ok(mine)
                     })
                 })
                 .collect();
+
+            // The coordinating thread reports while the workers run. Polling
+            // beats a channel here: the counters are already there, and a
+            // progress line nobody reads should not slow the work down.
+            if let Some(w) = watch.as_deref_mut() {
+                use std::sync::atomic::Ordering::Relaxed;
+                while done.load(Relaxed) < total {
+                    w(Progress::Hashing {
+                        done: done.load(Relaxed),
+                        total,
+                        bytes: bytes.load(Relaxed),
+                        path: "",
+                    });
+                    std::thread::sleep(std::time::Duration::from_millis(80));
+                }
+                w(Progress::Hashing {
+                    done: total,
+                    total,
+                    bytes: bytes.load(Relaxed),
+                    path: "",
+                });
+            }
+
             handles.into_iter().map(|h| h.join().expect("ingest worker panicked")).collect()
         });
 
@@ -571,6 +637,9 @@ pub fn ingest_dir_after(
 
     // Tree building is serial and deterministic: identical contents must give an
     // identical hash no matter how the work was scheduled.
+    if let Some(w) = watch {
+        w(Progress::Building);
+    }
     let (hash, size) = build_nested(sink, &files, &sk.dirs, "", prior)?;
     Ok(Ingested { hash, size, stats })
 }
