@@ -375,6 +375,32 @@ pub fn is_ancestor(store: &Store, ancestor: Hash, descendant: Hash) -> Result<bo
 /// push before moving a ref, so a ref can never point into a partial DAG.
 pub fn verify_closure(store: &Store, root: Hash) -> Result<usize> {
     let mut seen = HashSet::new();
+    verify_closure_into(store, root, &mut seen)
+}
+
+/// As [`verify_closure`], but remembering what has already been proven.
+///
+/// A push moves one ref at a time and verifies each before letting it move, so
+/// a repository with a thousand tags verified the same history a thousand
+/// times -- every walk from scratch, reading and materializing every object
+/// along the way. Pushing git's own tags that way took about twenty seconds
+/// each and pinned a core for the better part of an hour.
+///
+/// Carrying the set across those calls makes the cost of the whole push the
+/// size of the history rather than the size of the history times the number of
+/// refs. It is sound because presence is monotone within a session: a store
+/// only gains objects while a push is running, so an object proven present
+/// stays present, and stopping at one that has already been proven skips a
+/// subtree that has already been checked.
+///
+/// The caller owns the set, so it is only ever shared where that is true --
+/// within one connection, never across them.
+pub fn verify_closure_into(
+    store: &Store,
+    root: Hash,
+    seen: &mut HashSet<Hash>,
+) -> Result<usize> {
+    let before = seen.len();
     let mut stack = vec![root];
     while let Some(h) = stack.pop() {
         if !seen.insert(h) {
@@ -385,7 +411,7 @@ pub fn verify_closure(store: &Store, root: Hash) -> Result<usize> {
         }
         stack.extend(store.get(h)?.links());
     }
-    Ok(seen.len())
+    Ok(seen.len() - before)
 }
 
 #[cfg(test)]

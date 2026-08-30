@@ -11,7 +11,9 @@
 //! which keeps `fkit-core` free of any async runtime dependency.
 
 use crate::hash::Hash;
-use crate::proto::{fetch_closure, serve_wants, verify_closure, Msg, TransferStats, Transport};
+use crate::proto::{
+    fetch_closure, serve_wants, verify_closure_into, Msg, TransferStats, Transport,
+};
 use crate::store::Store;
 use anyhow::{bail, Result};
 
@@ -154,6 +156,13 @@ pub fn serve_session<T: Transport + ?Sized, H: RepoHost + ?Sized>(
 ) -> Result<SessionStats> {
     let mut totals = SessionStats::default();
 
+    // What this connection has already proven present. A push moves one ref at
+    // a time and verifies each before letting it move, so without this a
+    // repository with a thousand tags verifies the same history a thousand
+    // times. Scoped to the session, because that is exactly as long as the
+    // "already checked" claim holds.
+    let mut verified: std::collections::HashSet<Hash> = std::collections::HashSet::new();
+
     loop {
         // A disconnect after the work is done is the normal ending, not an error.
         let msg = match crate::proto::recv(t) {
@@ -225,7 +234,7 @@ pub fn serve_session<T: Transport + ?Sized, H: RepoHost + ?Sized>(
                 // Receive the closure first: the ref cannot be allowed to point
                 // at objects we do not hold, so verification precedes the move.
                 let stats = fetch_closure(host.store(), t, &[tip])?;
-                verify_closure(host.store(), tip)?;
+                verify_closure_into(host.store(), tip, &mut verified)?;
                 totals.pushed.merge(&stats);
 
                 match host.advance_ref(&branch, tip, force)? {
