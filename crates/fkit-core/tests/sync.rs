@@ -262,3 +262,120 @@ fn a_receiver_with_holes_is_repaired_rather_than_refused() {
     );
     verify_closure(&receiver, commit).expect("the closure is whole again");
 }
+
+/// A gap far back in the history is filled, however far back it is.
+///
+/// Gap-filling used to be a loop of its own, capped at a few rounds, that
+/// fetched what was missing and stopped there without following the links of
+/// anything it fetched. It therefore advanced by one layer of the graph per
+/// round -- and a chain of parent commits is as deep as the history is long,
+/// so a receiver missing an ancestor ran out of rounds long before it reached
+/// the bottom. Worse, it failed the same way on every retry, because each
+/// attempt pruned at the same present objects and rediscovered the same gap.
+/// The only way out was deleting the repository.
+///
+/// Discovering a chain still costs a round trip per link, which is a separate
+/// matter; what this fixes is giving up.
+#[test]
+fn a_gap_deep_in_the_history_is_filled_however_deep_it_is() {
+    let (a, b) = (Tmp::new("deepsend"), Tmp::new("deeprecv"));
+    let sender = Store::open(&a.0).unwrap();
+    let receiver = Store::open(&b.0).unwrap();
+
+    // Deeper than any fixed number of repair rounds would cover.
+    const DEPTH: usize = 40;
+    let mut tip = None;
+    for i in 0..DEPTH {
+        tip = Some(seed(&sender, format!("revision {i}").as_bytes(), &format!("c{i}"), tip));
+    }
+    let tip = tip.unwrap();
+
+    // The receiver holds the newest commit and nothing beneath or behind it:
+    // the shape an interrupted transfer leaves, where what is present is what
+    // the walk prunes at.
+    receiver.put_raw(tip, &sender.get_raw(tip).unwrap()).unwrap();
+
+    let stats = transfer(&sender, &receiver, tip);
+    verify_closure(&receiver, tip).expect("the history should be whole again");
+    assert!(stats.objects > DEPTH as u64, "every commit behind the tip should have arrived");
+
+    // And a second transfer over a now-complete store asks for nothing.
+    let again = transfer(&sender, &receiver, tip);
+    assert_eq!(again.objects, 0, "a repaired store should not be repaired twice");
+}
+
+/// An object the sender holds as a patch arrives as a patch.
+///
+/// Objects were expanded before transmission, so a store that had gone to the
+/// trouble of diffing an object against its neighbour handed over the whole of
+/// it anyway -- and the receiver, told nothing about the relationship, wrote it
+/// out whole as well. A 1,448 MiB history went over the wire as 3,846 MiB and
+/// landed as 2,784 MiB.
+#[test]
+fn an_object_held_as_a_patch_crosses_the_wire_as_one() {
+    let (a, b) = (Tmp::new("patchsend"), Tmp::new("patchrecv"));
+    let sender = Store::open(&a.0).unwrap();
+    let receiver = Store::open(&b.0).unwrap();
+
+    let tree = {
+        let sink = Sink::writing(&sender);
+        let readme = ingest_bytes(&sink, b"# hello\n").unwrap();
+        fkit_core::ingest::build_tree(
+            &sink,
+            vec![TreeEntry {
+                name: "README.md".into(),
+                kind: EntryKind::File { exec: false },
+                hash: readme.hash,
+                size: readme.size,
+            }],
+        )
+        .unwrap()
+        .0
+    };
+
+    // High-entropy text, so the literal does not simply compress away and the
+    // patch is the thing that wins.
+    let noise: String = (0..8192u32)
+        .map(|i| {
+            let x = i.wrapping_mul(2654435761) >> 11;
+            char::from_digit(x % 16, 16).unwrap()
+        })
+        .collect();
+    let commit = |message: String| Commit {
+        tree,
+        parents: vec![],
+        author: "tester".into(),
+        timestamp: 1_700_000_000,
+        message,
+    };
+
+    let (base, _) = sender.put(&Object::Commit(commit(noise.clone()))).unwrap();
+    let near = Object::Commit(commit(format!("edited{}", &noise[6..])));
+    let (id, _) = sender.put_based(&near, Some(base)).unwrap();
+
+    assert!(
+        sender.stored_patch(id).is_some(),
+        "the test needs the sender to actually hold this as a patch"
+    );
+
+    let stats = transfer(&sender, &receiver, id);
+
+    assert!(
+        receiver.stored_patch(id).is_some(),
+        "the patch was expanded somewhere between the two stores"
+    );
+    assert!(
+        receiver.has(base),
+        "the literal a patch is diffed against must travel with it"
+    );
+    verify_closure(&receiver, id).expect("the object must still read back whole");
+
+    // And the saving is real: the patch plus its base beat sending the pair of
+    // them outright.
+    let outright = sender.get_raw(id).unwrap().len() + sender.get_raw(base).unwrap().len();
+    assert!(
+        (stats.bytes as usize) < outright,
+        "sent {} bytes where two literals would have been {outright}",
+        stats.bytes
+    );
+}

@@ -309,6 +309,29 @@ impl Store {
     /// security model: a malicious peer cannot make us store bytes under a name
     /// that does not hash to those bytes, so a verified root hash pins every
     /// byte beneath it.
+    /// The patch this object is stored as, if it is stored as one.
+    ///
+    /// Used to send an object over the wire in the form it is already held in,
+    /// rather than expanding it only for the far end to store it whole again.
+    pub fn stored_patch(&self, h: Hash) -> Option<(Hash, u32, Vec<u8>)> {
+        let slot = self.pack.lock().unwrap();
+        slot.as_ref()?.stored_patch(h)
+    }
+
+    /// Store a patch from elsewhere as a patch, once it is shown to expand to
+    /// the object it claims to be. The base it names must already be here.
+    ///
+    /// Returns the expanded bytes, which the caller needs in order to read the
+    /// object's links.
+    pub fn put_patch(&self, claimed: Hash, raw_len: u32, payload: &[u8]) -> Result<Vec<u8>> {
+        self.enable_pack()?;
+        let mut slot = self.pack.lock().unwrap();
+        let pack = slot
+            .as_mut()
+            .context("a patch can only be stored in a pack, and there is none")?;
+        pack.put_patch(claimed, raw_len, payload)
+    }
+
     pub fn put_raw(&self, claimed: Hash, framed: &[u8]) -> Result<(Hash, WriteStats)> {
         self.put_raw_based(claimed, framed, None)
     }

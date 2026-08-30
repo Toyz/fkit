@@ -843,7 +843,7 @@ fn cmd_stash_remote_push(which: Option<usize>) -> Result<()> {
     serve_wants(&repo.store, &mut ws)?;
     match recv(&mut ws)? {
         Msg::Ok { message } => println!("  {message}"),
-        other => bail!("unexpected reply: {other:?}"),
+        other => bail!("unexpected reply: {}", other.name()),
     }
     ws.close();
     Ok(())
@@ -857,7 +857,7 @@ fn cmd_stash_remote_list() -> Result<()> {
     let entries = match recv(&mut ws)? {
         Msg::StashList { entries } => entries,
         Msg::Error { message } => bail!("{message}"),
-        other => bail!("unexpected reply: {other:?}"),
+        other => bail!("unexpected reply: {}", other.name()),
     };
     ws.close();
 
@@ -885,7 +885,7 @@ fn cmd_stash_fetch(commit: Option<&str>) -> Result<()> {
     let entries = match recv(&mut ws)? {
         Msg::StashList { entries } => entries,
         Msg::Error { message } => bail!("{message}"),
-        other => bail!("unexpected reply: {other:?}"),
+        other => bail!("unexpected reply: {}", other.name()),
     };
 
     let wanted: Vec<(Hash, String)> = match commit {
@@ -936,7 +936,7 @@ fn cmd_stash_forget(spec: &str) -> Result<()> {
     let entries = match recv(&mut ws)? {
         Msg::StashList { entries } => entries,
         Msg::Error { message } => bail!("{message}"),
-        other => bail!("unexpected reply: {other:?}"),
+        other => bail!("unexpected reply: {}", other.name()),
     };
     let (h, _) = entries
         .iter()
@@ -947,7 +947,7 @@ fn cmd_stash_forget(spec: &str) -> Result<()> {
     match recv(&mut ws)? {
         Msg::Ok { message } => println!("  {message}"),
         Msg::Error { message } => bail!("{message}"),
-        other => bail!("unexpected reply: {other:?}"),
+        other => bail!("unexpected reply: {}", other.name()),
     }
     ws.close();
     println!("  the copy on this machine is untouched");
@@ -1296,7 +1296,7 @@ fn connect(url: &str, repo: Option<&Repo>) -> Result<(WebSocket, Vec<(String, Ha
     })?;
     match recv(&mut ws)? {
         Msg::Welcome { refs } => Ok((ws, refs)),
-        other => bail!("unexpected greeting from server: {other:?}"),
+        other => bail!("unexpected greeting from server: {}", other.name()),
     }
 }
 
@@ -1385,7 +1385,7 @@ fn cmd_push(branch: Option<&str>, force: bool, no_tags: bool, only: &[String]) -
             );
             println!("  {message}");
         }
-        other => bail!("unexpected reply: {other:?}"),
+        other => bail!("unexpected reply: {}", other.name()),
     }
 
     if with_tags {
@@ -1471,7 +1471,7 @@ fn send_tags(
                 }
                 Some(_) => current += 1,
             },
-            Ok(other) => bail!("unexpected reply pushing tag {name}: {other:?}"),
+            Ok(other) => bail!("unexpected reply pushing tag {name}: {}", other.name()),
             Err(e) => skipped.push(format!("{name}: {}", first_line(&e))),
         }
     }
@@ -1602,7 +1602,7 @@ fn pull_branch(
     let tip = match recv(ws)? {
         Msg::RefIs { tip: Some(t), .. } => t,
         Msg::RefIs { tip: None, .. } => bail!("remote has no branch '{branch}'"),
-        other => bail!("unexpected reply: {other:?}"),
+        other => bail!("unexpected reply: {}", other.name()),
     };
 
     let stats = fetch_closure(&repo.store, ws, &[tip])?;
@@ -1890,7 +1890,7 @@ fn fetch_ref(_repo: &Repo, ws: &mut WebSocket, branch: &str) -> Result<Hash> {
     match recv(ws)? {
         Msg::RefIs { tip: Some(t), .. } => Ok(t),
         Msg::RefIs { tip: None, .. } => bail!("remote has no branch '{branch}'"),
-        other => bail!("unexpected reply: {other:?}"),
+        other => bail!("unexpected reply: {}", other.name()),
     }
 }
 

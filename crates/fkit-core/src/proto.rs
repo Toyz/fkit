@@ -74,6 +74,19 @@ impl Transport for WebSocket {
 /// most of the wall clock.
 pub const BATCH: usize = 4096;
 
+/// How many bytes of objects one reply message may carry.
+///
+/// `BATCH` bounds a reply in objects; this bounds it in bytes, which is the
+/// thing a receiver actually has a limit on. Without it a batch of large
+/// objects built a message past what the other end would accept, and a
+/// websocket peer that refuses a frame does not say so -- it closes, and both
+/// sides report only that the other one went away.
+///
+/// Chosen to sit under the smallest limit anything in this system imposes
+/// (axum's 16 MiB default frame) with room to spare, while still being large
+/// enough that the round trips `BATCH` was raised to save stay saved.
+pub const REPLY_BUDGET: usize = 8 * 1024 * 1024;
+
 /// How many times a transfer may go back for objects an earlier one lost.
 ///
 /// A handful. Each round fills the gaps the previous one revealed, and a
@@ -118,6 +131,15 @@ pub enum Msg {
     Want { hashes: Vec<Hash> },
     /// The answer: framed object bytes, each verifiable against its hash.
     Objects { objects: Vec<(Hash, Vec<u8>)> },
+    /// The same answer, for objects the sender already holds as a patch.
+    ///
+    /// Each payload names its own base and expands to the object; the base is
+    /// sent as a literal first, in the same reply, so the far end can always
+    /// apply it. Sending the expansion instead meant a store that had gone to
+    /// the trouble of patching an object handed over the whole of it anyway,
+    /// and the receiving store, told nothing about the relationship, wrote it
+    /// out whole as well.
+    Patches { items: Vec<(Hash, u32, Vec<u8>)> },
     /// "I have everything I need."
     Done,
 
@@ -190,6 +212,15 @@ impl Msg {
                 w.u32(objects.len() as u32);
                 for (h, b) in objects { w.hash(*h); w.bytes(b) }
             }
+            Msg::Patches { items } => {
+                w.u8(0x23);
+                w.u32(items.len() as u32);
+                for (h, raw, b) in items {
+                    w.hash(*h);
+                    w.u32(*raw);
+                    w.bytes(b)
+                }
+            }
             Msg::Done => w.u8(0x22),
             Msg::Ok { message } => { w.u8(0x30); w.str(message) }
             Msg::Error { message } => { w.u8(0x31); w.str(message) }
@@ -238,6 +269,12 @@ impl Msg {
                 for _ in 0..n { objects.push((r.hash()?, r.bytes()?)) }
                 Msg::Objects { objects }
             }
+            0x23 => {
+                let n = r.u32()? as usize;
+                let mut items = Vec::with_capacity(n.min(BATCH * 4));
+                for _ in 0..n { items.push((r.hash()?, r.u32()?, r.bytes()?)) }
+                Msg::Patches { items }
+            }
             0x22 => Msg::Done,
             0x30 => Msg::Ok { message: r.str()? },
             0x31 => Msg::Error { message: r.str()? },
@@ -266,6 +303,7 @@ impl Msg {
             Msg::RefIs { .. } => "RefIs",
             Msg::Want { .. } => "Want",
             Msg::Objects { .. } => "Objects",
+            Msg::Patches { .. } => "Patches",
             Msg::Done => "Done",
             Msg::Ok { .. } => "Ok",
             Msg::Error { .. } => "Error",
@@ -335,93 +373,133 @@ pub fn fetch_closure_watched<T: Transport + ?Sized>(
         }
     }
 
-    while !queue.is_empty() {
-        if requested.len() > MAX_OBJECTS_PER_SYNC {
-            bail!("sync exceeded {MAX_OBJECTS_PER_SYNC} objects — refusing to continue");
-        }
-
-        let batch: Vec<Hash> = (0..BATCH).filter_map(|_| queue.pop_front()).collect();
-        send(ws, &Msg::Want { hashes: batch.clone() })?;
-        stats.round_trips += 1;
-
-        let Msg::Objects { objects } = recv(ws)? else {
-            bail!("expected an Objects message");
-        };
-
-        let wanted: HashSet<Hash> = batch.iter().copied().collect();
-        let mut delivered = HashSet::new();
-
-        for (claimed, framed) in objects {
-            // Objects beyond what was asked for are welcome: the peer runs
-            // ahead into the closure so this side does not have to discover it
-            // a layer at a time. Taking them on trust costs nothing, because
-            // `put_raw` below names every object by the hash of its own bytes
-            // -- an object nobody wanted is at worst wasted bytes, never a way
-            // to store something under a name that does not describe it.
-            if store.has(claimed) {
-                delivered.insert(claimed);
-                requested.insert(claimed);
-                continue;
-            }
-            // The edges are read out of the bytes we were handed, before they
-            // are written. Asking the store for them instead meant writing the
-            // object, flushing it, and then reopening its segment to read,
-            // decompress and re-verify what was already in memory -- once per
-            // object, which over a large history is most of the time a push
-            // takes.
-            let links = Store::decode_framed(&framed)
-                .with_context(|| format!("peer sent object {} that will not decode", claimed.short()))?
-                .links();
-
-            // put_raw recomputes the hash; a lying peer is rejected here, so
-            // decoding first costs nothing in trust: a forged object cannot be
-            // stored, and its links can only ever add work, never bypass a
-            // check.
-            let (id, _) = store.put_raw(claimed, &framed)?;
-            delivered.insert(id);
-            requested.insert(id);
-            stats.objects += 1;
-            stats.bytes += framed.len() as u64;
-
-            // Follow the newly-revealed edges.
-            for link in links {
-                if !store.has(link) && requested.insert(link) {
-                    queue.push_back(link);
-                }
-            }
-        }
-
-        progress(&stats);
-
-        if let Some(missing) = wanted.iter().find(|h| !delivered.contains(h)) {
-            bail!(
-                "peer could not supply object {} — its repository is incomplete",
-                missing.short()
-            );
-        }
-    }
-
-    // Before saying we are finished, make sure we actually are.
+    // The walk and the gap-filling are one loop, not two.
     //
-    // The walk above prunes at anything already here, which is what makes an
+    // The walk prunes at anything already here, which is what makes an
     // incremental transfer cheap -- and also what makes it skip the gaps a
     // previously interrupted transfer left, since the objects above a gap are
-    // present and get pruned at. So once the queue empties, look for holes and
-    // go back for them.
+    // present and get pruned at. So when the queue empties, look for holes and
+    // put them back into the same queue: whatever comes back then has its own
+    // links followed, the way everything else does.
     //
-    // This has to happen before `Done`, not after: `Done` is what releases the
-    // other side from answering, and a `Want` sent afterwards arrives at a peer
-    // that has stopped listening for one.
+    // Fetching gaps in a loop of their own instead advanced by one layer of
+    // the graph per round, because nothing followed the links of what it
+    // fetched. A chain of parent commits is as deep as the history is long,
+    // so a store missing one in the middle needed a round per commit and gave
+    // up long before it got there.
     let mut rounds = 0;
-    loop {
+    'walk: loop {
+        while !queue.is_empty() {
+            if requested.len() > MAX_OBJECTS_PER_SYNC {
+                bail!("sync exceeded {MAX_OBJECTS_PER_SYNC} objects — refusing to continue");
+            }
+
+            let batch: Vec<Hash> = (0..BATCH).filter_map(|_| queue.pop_front()).collect();
+            send(ws, &Msg::Want { hashes: batch.clone() })?;
+            stats.round_trips += 1;
+
+            let wanted: HashSet<Hash> = batch.iter().copied().collect();
+            let mut delivered = HashSet::new();
+
+            // One `Want` is answered by as many messages as the peer needs to
+        // stay under its size budget, ending with an empty one. Objects it
+        // holds as a patch arrive as patches, after the literals they are
+        // diffed against.
+        loop {
+            // Whatever arrived, stored and expanded, ready to have its links
+            // read. Nothing is trusted on the way in: both `put_raw` and
+            // `put_patch` recompute the hash and refuse anything that does not
+            // come out as the name it was offered under, so a forged object
+            // cannot be stored and a forged patch cannot be applied.
+            let arrived: Vec<(Hash, Vec<u8>)> = match recv(ws)? {
+                Msg::Objects { objects } => {
+                    if objects.is_empty() {
+                        break;
+                    }
+                    let mut out = Vec::with_capacity(objects.len());
+                    for (claimed, framed) in objects {
+                        if store.has(claimed) {
+                            delivered.insert(claimed);
+                            requested.insert(claimed);
+                            continue;
+                        }
+                        let (id, _) = store.put_raw(claimed, &framed)?;
+                        stats.objects += 1;
+                        stats.bytes += framed.len() as u64;
+                        out.push((id, framed));
+                    }
+                    out
+                }
+                Msg::Patches { items } => {
+                    let mut out = Vec::with_capacity(items.len());
+                    for (claimed, raw, payload) in items {
+                        if store.has(claimed) {
+                            delivered.insert(claimed);
+                            requested.insert(claimed);
+                            continue;
+                        }
+                        // Kept as a patch rather than expanded and rewritten:
+                        // the peer already did the work of finding the base,
+                        // and undoing it here is how a 1.4 GiB history became
+                        // 2.8 GiB on the far side.
+                        let framed = store
+                            .put_patch(claimed, raw, &payload)
+                            .with_context(|| {
+                                format!("applying the patch the peer sent for {}", claimed.short())
+                            })?;
+                        stats.objects += 1;
+                        stats.bytes += payload.len() as u64;
+                        out.push((claimed, framed));
+                    }
+                    out
+                }
+                other => {
+                    bail!("expected an Objects or Patches message, got {}", other.name())
+                }
+            };
+
+            for (id, framed) in arrived {
+                delivered.insert(id);
+                requested.insert(id);
+                // The edges are read out of the bytes in hand. Asking the
+                // store for them instead meant writing the object, flushing
+                // it, and then reopening its segment to read, decompress and
+                // re-verify what was already in memory -- once per object,
+                // which over a large history is most of the time a push takes.
+                for link in Store::decode_framed(&framed)
+                    .with_context(|| format!("object {} will not decode", id.short()))?
+                    .links()
+                {
+                    if !store.has(link) && requested.insert(link) {
+                        queue.push_back(link);
+                    }
+                }
+            }
+            progress(&stats);
+        }
+
+        if let Some(missing) = wanted.iter().find(|h| !delivered.contains(h)) {
+                bail!(
+                    "peer could not supply object {} — its repository is incomplete",
+                    missing.short()
+                );
+            }
+        }
+
+        // The queue is empty; that is not the same as being complete.
+        // Look for children of things we hold that never arrived.
         let mut seen = HashSet::new();
         let mut holes = Vec::new();
         for &r in roots {
             holes.extend(missing_in_closure(store, r, &mut seen)?);
         }
         if holes.is_empty() {
-            break;
+            break 'walk;
         }
+
+        // Guard against a peer that answers without ever making progress,
+        // rather than against depth: the walk below follows links, so depth
+        // costs passes through the queue, not rounds.
         rounds += 1;
         if rounds > MAX_REPAIR_ROUNDS {
             bail!(
@@ -432,30 +510,15 @@ pub fn fetch_closure_watched<T: Transport + ?Sized>(
             );
         }
 
-        let before = stats.objects;
-        for chunk in holes.chunks(BATCH) {
-            send(ws, &Msg::Want { hashes: chunk.to_vec() })?;
-            stats.round_trips += 1;
-            let Msg::Objects { objects } = recv(ws)? else {
-                bail!("expected an Objects message while filling gaps");
-            };
-            for (claimed, framed) in objects {
-                if store.has(claimed) {
-                    continue;
-                }
-                store.put_raw(claimed, &framed)?;
-                stats.objects += 1;
-                stats.bytes += framed.len() as u64;
+        for h in holes {
+            // Through the same guard as everything else: a hole that goes in
+            // unguarded can be queued a second time when some other object
+            // turns out to link to it, and the peer is then asked for one
+            // hash twice in a single exchange.
+            if requested.insert(h) {
+                queue.push_back(h);
             }
         }
-        if stats.objects == before {
-            bail!(
-                "the peer cannot supply {}, which this repository needs \
-                 and does not have",
-                holes[0].short()
-            );
-        }
-        progress(&stats);
     }
 
     send(ws, &Msg::Done)?;
@@ -478,25 +541,110 @@ pub fn serve_wants_watched<T: Transport + ?Sized>(
     progress: &mut dyn FnMut(&TransferStats),
 ) -> Result<TransferStats> {
     let mut stats = TransferStats::default();
-    let mut sent: HashSet<Hash> = HashSet::new();
+    // Bases already sent on this connection. Only ever consulted to decide
+    // whether a patch's base still needs sending -- never to decide whether an
+    // object that was asked for gets answered, which is always yes.
+    let mut sent_bases: HashSet<Hash> = HashSet::new();
     loop {
         match recv(ws)? {
             Msg::Want { hashes } => {
                 stats.round_trips += 1;
 
-                let mut objects = Vec::with_capacity(hashes.len());
+                // Objects the store already holds as a patch go over as that
+                // patch, with the literal they are diffed against sent beside
+                // them. Expanding them here only for the far end to store them
+                // whole again threw away the compression twice: once on the
+                // wire, once on the receiver's disk.
+                //
+                // Literals are sent before patches, so a base is always in
+                // place by the time the patch that names it arrives. Depth is
+                // one by construction -- a patch's base is never itself a
+                // patch -- so this ordering is all the dependency there is.
+                let mut literals: Vec<(Hash, Vec<u8>)> = Vec::new();
+                let mut patches: Vec<(Hash, u32, Vec<u8>)> = Vec::new();
+                let mut carried: HashSet<Hash> = HashSet::new();
+
+                // Every hash asked for is answered, including one asked for
+                // twice. Skipping a repeat to save the bytes meant the reply
+                // quietly came back short, and a peer that is missing
+                // something it was promised has no way to tell that from a
+                // peer that lied -- so it gave up, on a connection that was
+                // working, over an object that was right here.
                 for h in hashes {
-                    if !sent.insert(h) {
-                        continue;
+                    match store.stored_patch(h) {
+                        Some((base, raw, payload)) => {
+                            if sent_bases.insert(base) && carried.insert(base) {
+                                let framed = store.get_raw(base).with_context(|| {
+                                    format!("the base {} of a patch is gone", base.short())
+                                })?;
+                                stats.objects += 1;
+                                stats.bytes += framed.len() as u64;
+                                literals.push((base, framed));
+                            }
+                            stats.objects += 1;
+                            stats.bytes += payload.len() as u64;
+                            patches.push((h, raw, payload));
+                        }
+                        None => {
+                            let framed = store.get_raw(h).with_context(|| {
+                                format!("peer wants {} which we do not have", h.short())
+                            })?;
+                            stats.objects += 1;
+                            stats.bytes += framed.len() as u64;
+                            if carried.insert(h) {
+                                literals.push((h, framed));
+                            }
+                        }
                     }
-                    let framed = store
-                        .get_raw(h)
-                        .with_context(|| format!("peer wants {} which we do not have", h.short()))?;
-                    stats.objects += 1;
-                    stats.bytes += framed.len() as u64;
-                    objects.push((h, framed));
                 }
-                send(ws, &Msg::Objects { objects })?;
+
+                // A batch is a count of objects, and a count of objects is not
+                // a size in bytes: one file node for a large directory can
+                // outweigh a thousand chunks. Packing a whole batch into one
+                // message therefore made the message unbounded, and a receiver
+                // with a frame limit hangs up on it -- silently, at the TCP
+                // level, so both ends saw only "the other one disappeared".
+                //
+                // So a reply is filled to a size and then sent, as many times
+                // as it takes, and closed with an empty message. Something
+                // larger than the budget still goes out on its own: the point
+                // is to bound the common case, not to refuse the big one.
+                let mut pending = 0usize;
+                let mut batch: Vec<(Hash, Vec<u8>)> = Vec::new();
+                for (h, framed) in literals {
+                    let entry = framed.len() + 32 + 4;
+                    if pending + entry > REPLY_BUDGET && !batch.is_empty() {
+                        send(ws, &Msg::Objects { objects: std::mem::take(&mut batch) })?;
+                        pending = 0;
+                        progress(&stats);
+                    }
+                    pending += entry;
+                    batch.push((h, framed));
+                }
+                if !batch.is_empty() {
+                    send(ws, &Msg::Objects { objects: batch })?;
+                }
+
+                let mut pending = 0usize;
+                let mut batch: Vec<(Hash, u32, Vec<u8>)> = Vec::new();
+                for (h, raw, payload) in patches {
+                    let entry = payload.len() + 32 + 4 + 4;
+                    if pending + entry > REPLY_BUDGET && !batch.is_empty() {
+                        send(ws, &Msg::Patches { items: std::mem::take(&mut batch) })?;
+                        pending = 0;
+                        progress(&stats);
+                    }
+                    pending += entry;
+                    batch.push((h, raw, payload));
+                }
+                if !batch.is_empty() {
+                    send(ws, &Msg::Patches { items: batch })?;
+                }
+
+                // The terminator. Waiting on "have I got everything I asked
+                // for" instead would wait forever whenever the peer skipped
+                // something it had already sent.
+                send(ws, &Msg::Objects { objects: Vec::new() })?;
                 progress(&stats);
             }
             Msg::Done => return Ok(stats),
@@ -613,6 +761,7 @@ mod tests {
             Msg::RefIs { branch: "dev".into(), tip: Some(Hash([3; 32])) },
             Msg::Want { hashes: vec![Hash([4; 32]), Hash([5; 32])] },
             Msg::Objects { objects: vec![(Hash([6; 32]), vec![1, 2, 3])] },
+            Msg::Patches { items: vec![(Hash([11; 32]), 4096, vec![4, 5, 6])] },
             Msg::Done,
             Msg::Ok { message: "pushed".into() },
             Msg::Error { message: "nope".into() },
@@ -621,5 +770,111 @@ mod tests {
             let back = Msg::decode(&m.encode()).unwrap();
             assert_eq!(back, m, "round trip failed for {m:?}");
         }
+    }
+
+    /// A transport that answers from a script and keeps what was written to it,
+    /// so one side of the exchange can be examined without a second thread.
+    struct Scripted {
+        inbox: VecDeque<Vec<u8>>,
+        wrote: Vec<Vec<u8>>,
+    }
+
+    impl Transport for Scripted {
+        fn send_bytes(&mut self, payload: &[u8]) -> Result<()> {
+            self.wrote.push(payload.to_vec());
+            Ok(())
+        }
+        fn recv_bytes(&mut self) -> Result<Option<Vec<u8>>> {
+            Ok(self.inbox.pop_front())
+        }
+    }
+
+    /// A reply is bounded by bytes, not by how many objects were asked for.
+    ///
+    /// `BATCH` counts objects, and objects are not a fixed size, so a reply
+    /// that packed a whole batch into one message was unbounded. Nothing
+    /// reported that: a websocket peer refusing an over-sized frame just
+    /// closes, and both ends saw only that the other had gone away. A push of
+    /// a large history therefore died instantly, on a healthy connection, with
+    /// "connection reset by peer" and nothing else to go on.
+    #[test]
+    fn a_reply_is_bounded_by_bytes_not_by_object_count() {
+        let dir = std::env::temp_dir().join(format!(
+            "fkit-reply-budget-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = crate::store::Store::open(&dir).unwrap();
+
+        // Comfortably more than one reply's worth, and incompressible enough
+        // that it stays that way once stored.
+        let mut payload = vec![0u8; REPLY_BUDGET * 3];
+        let mut x: u32 = 0x1234_5678;
+        for b in payload.iter_mut() {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *b = (x >> 24) as u8;
+        }
+        let sink = crate::store::Sink::writing(&store);
+        let file = crate::ingest::ingest_bytes(&sink, &payload).unwrap();
+
+        // Everything under that file, which is what one `Want` would carry.
+        let mut hashes = Vec::new();
+        let mut stack = vec![file.hash];
+        let mut seen = HashSet::new();
+        while let Some(h) = stack.pop() {
+            if !seen.insert(h) {
+                continue;
+            }
+            hashes.push(h);
+            stack.extend(store.get(h).unwrap().links());
+        }
+        assert!(hashes.len() <= BATCH, "one batch should cover this file");
+
+        let mut t = Scripted {
+            inbox: VecDeque::from(vec![
+                Msg::Want { hashes: hashes.clone() }.encode(),
+                Msg::Done.encode(),
+            ]),
+            wrote: Vec::new(),
+        };
+        serve_wants(&store, &mut t).unwrap();
+
+        let replies: Vec<Msg> = t.wrote.iter().map(|b| Msg::decode(b).unwrap()).collect();
+        let biggest = t.wrote.iter().map(|b| b.len()).max().unwrap();
+        let largest_object = hashes
+            .iter()
+            .map(|h| store.get_raw(*h).unwrap().len())
+            .max()
+            .unwrap();
+
+        // One object always goes out even if it alone is over budget, so the
+        // ceiling is the budget plus the largest single object -- not the
+        // sum of a batch, which is what it used to be.
+        assert!(
+            biggest <= REPLY_BUDGET + largest_object + 1024,
+            "a reply message reached {biggest} bytes, past the {REPLY_BUDGET} byte budget"
+        );
+        assert!(
+            replies.len() > 2,
+            "this payload should have needed splitting, got {} message(s)",
+            replies.len()
+        );
+        assert!(
+            matches!(replies.last(), Some(Msg::Objects { objects }) if objects.is_empty()),
+            "a reply must end with an empty message, or the reader cannot tell where it stops"
+        );
+
+        // And the split loses nothing.
+        let mut got = HashSet::new();
+        for r in &replies {
+            let Msg::Objects { objects } = r else { panic!("not an Objects message") };
+            for (h, _) in objects {
+                got.insert(*h);
+            }
+        }
+        assert_eq!(got, hashes.into_iter().collect::<HashSet<_>>());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

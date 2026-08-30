@@ -297,7 +297,7 @@ pub fn serve_session<T: Transport + ?Sized, H: RepoHost + ?Sized>(
             Msg::Done => return Ok(totals),
 
             other => {
-                send_error(t, format!("unexpected message {other:?}"))?;
+                send_error(t, format!("unexpected message {}", other.name()))?;
                 return Ok(totals);
             }
         }

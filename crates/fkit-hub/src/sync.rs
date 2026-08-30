@@ -41,7 +41,13 @@ pub async fn handler(
     State(state): State<AppState>,
     Path((owner, name)): Path<(String, String)>,
 ) -> Response {
-    ws.on_upgrade(move |socket| serve(socket, state, owner, name))
+    // axum defaults to a 16 MiB frame, and a frame over the limit is not an
+    // error the peer gets told about -- the connection just closes. Match what
+    // this protocol is willing to send so a legitimate message is never
+    // dropped without a word.
+    ws.max_frame_size(fkit_core::ws::MAX_FRAME as usize)
+        .max_message_size(fkit_core::ws::MAX_FRAME as usize)
+        .on_upgrade(move |socket| serve(socket, state, owner, name))
 }
 
 struct ChannelTransport {

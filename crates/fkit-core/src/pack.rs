@@ -368,6 +368,54 @@ impl Pack {
         Ok(true)
     }
 
+    /// The patch `id` is stored as, if it is stored as one.
+    ///
+    /// The payload is returned exactly as it sits in the segment, which means
+    /// it already names its own base -- so it can be handed to another store
+    /// verbatim, and that store can find the base without being told.
+    pub fn stored_patch(&self, id: Hash) -> Option<(Hash, u32, Vec<u8>)> {
+        let loc = self.index.get(id)?;
+        if !loc.is_delta() {
+            return None;
+        }
+        let payload = self.stored_bytes(&loc)?;
+        let base = Hash(payload.get(..HASH_LEN)?.try_into().ok()?);
+        Some((base, loc.raw, payload))
+    }
+
+    /// Take a patch produced by another store, keeping it as a patch.
+    ///
+    /// The base it names has to be here already; the caller is responsible for
+    /// that ordering. Returns the bytes it expands to, because the caller
+    /// needs them anyway and expanding twice would be a waste.
+    ///
+    /// Nothing is taken on trust: the patch is applied and the result must
+    /// hash to `id` before any of it is written. A patch that expands to
+    /// something else is refused exactly as forged literal bytes would be.
+    pub fn put_patch(&mut self, id: Hash, raw_len: u32, payload: &[u8]) -> Result<Vec<u8>> {
+        let base = Hash(
+            payload
+                .get(..HASH_LEN)
+                .and_then(|b| <[u8; HASH_LEN]>::try_from(b).ok())
+                .context("a patch is missing the name of its base")?,
+        );
+        let base_bytes = self
+            .get(base)?
+            .with_context(|| format!("the base {} of a patch is not here", base.short()))?;
+        let framed = expand_delta(payload, &base_bytes, raw_len as usize)?;
+
+        let actual = Hash(*blake3::hash(&framed).as_bytes());
+        if actual != id {
+            anyhow::bail!(
+                "a patch offered as {} expands to {}",
+                id.short(),
+                actual.short()
+            );
+        }
+        self.put_stored(id, payload, FLAG_DELTA, raw_len)?;
+        Ok(framed)
+    }
+
     /// Append `framed` under `id`. Returns false if it was already packed.
     pub fn put(&mut self, id: Hash, framed: &[u8]) -> Result<bool> {
         self.put_based(id, framed, None)
