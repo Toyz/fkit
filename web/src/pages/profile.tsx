@@ -16,7 +16,15 @@
 import { LoomElement, component, css, styles, reactive, mount, on, inject } from "@toyz/loom";
 import { route } from "@toyz/loom/router";
 import { base } from "../ui";
-import { api, relativeTime, type Activity, type MyStash, type Profile, type Repo } from "../api";
+import {
+  api,
+  relativeTime,
+  type Activity,
+  type MyStash,
+  type Profile,
+  type Push,
+  type Repo,
+} from "../api";
 import { linkHandler } from "../nav";
 import { repoRow, repoRowSheet } from "../repo-row";
 import { Session } from "../session";
@@ -38,6 +46,44 @@ function rankTopics(repos: Repo[], cap = 8): string[] {
     .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
     .slice(0, cap)
     .map(([t]) => t);
+}
+
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/** A day, in UTC, written for a person.
+ *
+ *  UTC because the grid above counts days in UTC, and two views of the same
+ *  commit disagreeing about which day it was is the kind of thing that makes
+ *  a page look like it is guessing. Local time reads more naturally and is not
+ *  worth having the feed say Thursday while the square above it says Friday.
+ */
+function utcDay(iso: string): string {
+  const d = new Date(iso);
+  return `${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
+}
+
+/** Commits bucketed by the day they say they were written. */
+function byDay(list: Push[]): { day: string; items: Push[] }[] {
+  const out: { day: string; items: Push[] }[] = [];
+  for (const c of list) {
+    const day = utcDay(c.committed_at);
+    const last = out[out.length - 1];
+    if (last && last.day === day) last.items.push(c);
+    else out.push({ day, items: [c] });
+  }
+  return out;
+}
+
+/** Did these two happen on the same day, counted the way the grid counts? */
+function sameDay(a: string, b: string): boolean {
+  return utcDay(a) === utcDay(b);
+}
+
+/** `Travis <t@e.com>` reads as a name in a list; the address does not. */
+function authorName(author: string): string {
+  const lt = author.indexOf("<");
+  return (lt === -1 ? author : author.slice(0, lt)).trim() || author;
 }
 
 /** Stashes bucketed by the repository they belong to, order preserved.
@@ -196,6 +242,10 @@ const sheet = css`
     margin-left: auto; color: var(--faint); font-variant-numeric: tabular-nums;
   }
 
+
+  /* A commit that sat somewhere before it was sent. Quiet: it is a footnote on
+     the row, not a warning about it. */
+  .late { font-size: 11px; color: var(--faint); white-space: nowrap; }
 `;
 
 @route("/:owner")
@@ -225,9 +275,10 @@ export class PageProfile extends LoomElement {
    * because you opened your own profile, which is a thing people do while
    * somebody else is looking at the screen.
    */
-  @reactive accessor tab: "repos" | "stashes" = "repos";
+  @reactive accessor tab: "repos" | "activity" | "stashes" = "repos";
   @reactive accessor stashes: MyStash[] | null = null;
   @reactive accessor activity: Activity | null = null;
+  @reactive accessor pushes: Push[] | null = null;
   @reactive accessor busy = false;
   /** A fetch is already out; a second caller should not start another. */
   private loading = false;
@@ -236,8 +287,11 @@ export class PageProfile extends LoomElement {
   readTab() {
     const sync = () => {
       const want = new URLSearchParams(location.search).get("tab");
-      this.tab = want === "stashes" ? "stashes" : "repos";
+      this.tab = want === "stashes" ? "stashes" : want === "activity" ? "activity" : "repos";
       this.maybeLoadStashes();
+      // Behind its own click. Reading twenty commit objects is not work worth
+      // doing for the many more people who came to look at the repositories.
+      if (this.tab === "activity" && this.pushes === null) void this.loadPushes();
     };
     sync();
     addEventListener("popstate", sync);
@@ -261,6 +315,15 @@ export class PageProfile extends LoomElement {
     if (!this.me || this.me !== this.profile?.username) return;
     this.loading = true;
     void this.loadStashes();
+  }
+
+  private async loadPushes() {
+    const who = this.profile?.username ?? location.pathname.split("/").filter(Boolean)[0] ?? "";
+    try {
+      this.pushes = await api.pushes(who);
+    } catch {
+      this.pushes = [];
+    }
   }
 
   private async loadStashes() {
@@ -298,6 +361,7 @@ export class PageProfile extends LoomElement {
     this.filter = "";
     this.stashes = null;
     this.activity = null;
+    this.pushes = null;
     // Its own request: a year of pushes is a different question from a list of
     // repositories, it is the slower of the two, and a profile that will not
     // render until both have landed is a worse profile than one that fills in.
@@ -446,23 +510,35 @@ export class PageProfile extends LoomElement {
           ) : null}
         </div>
 
-        {mine ? (
+        {/* Shown to everybody now, not only to the account itself: activity is
+            a public view of a public person, filtered by what the viewer may
+            see like everything else. Only stashes are yours alone. */}
+        {p ? (
           <fkit-tabs
             current={this.tab}
             tabs={[
-              { key: "repos", label: "repositories", icon: "repo", href: `/${p?.username ?? ""}` },
-              {
-                key: "stashes",
-                label: "stashes",
-                icon: "archive",
-                href: `/${p?.username ?? ""}?tab=stashes`,
-                count: this.stashes?.length,
-              },
+              { key: "repos", label: "repositories", icon: "repo", href: `/${p.username}`,
+                count: p.repos.length },
+              { key: "activity", label: "activity", icon: "history",
+                href: `/${p.username}?tab=activity` },
+              ...(mine
+                ? [
+                    {
+                      key: "stashes",
+                      label: "stashes",
+                      icon: "archive" as const,
+                      href: `/${p.username}?tab=stashes`,
+                      count: this.stashes?.length,
+                    },
+                  ]
+                : []),
             ]}
           ></fkit-tabs>
         ) : null}
 
-        {mine && this.tab === "stashes" ? this.renderStashes() : (
+        {mine && this.tab === "stashes" ? this.renderStashes() : this.tab === "activity" ? (
+          this.renderPushes()
+        ) : (
         <fkit-section
           heading={mine ? "" : "Repositories"}
           value={
@@ -536,6 +612,65 @@ export class PageProfile extends LoomElement {
    * no special handling: a stash commit's first parent is the tree it was
    * taken from, and a commit page diffs a commit against its first parent.
    */
+  /** What this person has actually been doing, newest first. */
+  private renderPushes() {
+    const list = this.pushes;
+    return (
+      <fkit-section
+        value={list === null ? "" : list.length ? `last ${list.length}` : ""}
+        blurb="Commits this account delivered, newest first. Work in repositories you cannot see is counted in the graph above but not listed here — there is no way to show what a commit was without showing it."
+      >
+        <fkit-list>
+          {list === null ? (
+            <fkit-empty><span class="sk" style="width:260px"></span></fkit-empty>
+          ) : list.length === 0 ? (
+            <fkit-empty>
+              Nothing yet. Commits are linked to an account by the push that
+              delivered them, so anything pushed before that existed — or with a
+              token that declines to attribute — is not counted.
+            </fkit-empty>
+          ) : (
+            byDay(list).flatMap((g) => [
+              <div class="grp" loom-key={`h:${g.day}`}>
+                <loom-icon name="commit" size={12}></loom-icon>
+                {g.day}
+                <span class="n">{g.items.length}</span>
+              </div>,
+              ...g.items.map((c) => {
+                const href = `/${c.repo}/commit/${c.commit}`;
+                return (
+                  <fkit-row
+                    loom-key={c.commit}
+                    href={href}
+                    name={c.summary}
+                    meta={`${c.repo} · ${authorName(c.author)}`}
+                  >
+                    <fkit-avatar
+                      slot="icon"
+                      name={c.repo}
+                      glyph="commit"
+                      size={22}
+                    ></fkit-avatar>
+                    {/* When it arrived, but only when that is not the same day
+                        it was written. A commit pushed the moment it was made
+                        needs no note; one that sat on a laptop for a week is
+                        the case this column exists for. */}
+                    {sameDay(c.committed_at, c.pushed_at) ? null : (
+                      <span class="late" title={`pushed ${relativeTime(c.pushed_at)}`}>
+                        pushed {relativeTime(c.pushed_at)}
+                      </span>
+                    )}
+                    <span class="sha">{c.short}</span>
+                  </fkit-row>
+                );
+              }),
+            ])
+          )}
+        </fkit-list>
+      </fkit-section>
+    );
+  }
+
   private renderStashes() {
     const list = this.stashes;
     return (

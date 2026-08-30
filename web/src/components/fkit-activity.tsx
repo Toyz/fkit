@@ -37,8 +37,9 @@ const LEVELS = 4;
  * is honestly the same neutral. */
 const NAMED = 5;
 
-/* The neutral for everything outside the top few, and for the depth scale in
-   the legend. Blue-grey rather than a hue any repository could land on. */
+/* The neutral for everything outside the top few, for work in repositories
+   the viewer may not be told about, and for the depth scale in the legend.
+   Blue-grey rather than a hue any repository could land on. */
 const OTHER_HUE = 214;
 
 const sheet = css`
@@ -187,12 +188,17 @@ export class FkitActivity extends LoomElement {
         LEVELS,
         Math.max(1, Math.ceil((hit.count / Math.max(a.busiest, 1)) * LEVELS)),
       );
-      const hue = named.has(hit.repo) ? hueFor(hit.repo) : OTHER_HUE;
+      /* An empty name is work in something this viewer may not be told about.
+         It counts -- a fortnight on an unreleased project should not read as a
+         fortnight of nothing -- but it is drawn in the neutral and says only
+         that it happened. */
+      const hue = hit.repo && named.has(hit.repo) ? hueFor(hit.repo) : OTHER_HUE;
+      const what = hit.repo ? `mostly ${hit.repo}` : "in a private repository";
       squares.push(
         <i
           class={`d l${level}`}
           style={`--h:${hue}`}
-          title={`${plural(hit.count, "commit")} on ${human(day)} — mostly ${hit.repo}`}
+          title={`${plural(hit.count, "commit")} on ${human(day)} — ${what}`}
         ></i>,
       );
     }
@@ -248,10 +254,19 @@ export class FkitActivity extends LoomElement {
   }
 }
 
-/** The projects worth naming under the grid, busiest first. */
+/** The projects worth naming under the grid, busiest first.
+ *
+ *  Days with no name are days in a repository the viewer may not read. They
+ *  are skipped here rather than listed as a nameless entry: the legend exists
+ *  to say what a colour means, and "something you cannot see" is not a colour
+ *  anybody needs looking up.
+ */
 function topRepos(a: Activity): [string, number][] {
   const tally = new Map<string, number>();
-  for (const d of a.days) tally.set(d.repo, (tally.get(d.repo) ?? 0) + d.count);
+  for (const d of a.days) {
+    if (!d.repo) continue;
+    tally.set(d.repo, (tally.get(d.repo) ?? 0) + d.count);
+  }
   return [...tally.entries()].sort((x, y) => y[1] - x[1]).slice(0, NAMED);
 }
 

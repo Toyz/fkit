@@ -563,8 +563,29 @@ export interface ActivityDay {
   /** `YYYY-MM-DD`, in UTC -- the day the server counted it in. */
   date: string;
   count: number;
-  /** `owner/name` of whatever took most of that day. */
+  /**
+   * `owner/name` of whatever took most of that day.
+   *
+   * Empty when that repository is one you may not be told about. The day still
+   * counts -- hiding it would make the graph lie about the person -- but there
+   * is no name to give and the square is drawn in the neutral.
+   */
   repo: string;
+}
+
+/** One commit somebody delivered, for the feed on a profile. */
+export interface Push {
+  /** `owner/name` -- the label and the start of the link. */
+  repo: string;
+  commit: string;
+  short: string;
+  summary: string;
+  /** What the commit claims about its author, which is not the same as who
+   *  pushed it. Only the push is established. */
+  author: string;
+  /** When it says it was written, and when it reached this server. */
+  committed_at: string;
+  pushed_at: string;
 }
 
 /** A year of pushes, for the grid on a profile. */
@@ -958,6 +979,8 @@ export const api = {
     request<{ ok: boolean }>(`/tokens/${id}`, { method: "PATCH", body: body(input) }),
   activity: (username: string) =>
     request<Activity>(`/users/${encodeURIComponent(username)}/activity`),
+  pushes: (username: string) =>
+    request<Push[]>(`/users/${encodeURIComponent(username)}/pushes`),
   myStashes: () => request<MyStash[]>("/auth/stashes"),
   dropStash: (owner: string, name: string, id: string) =>
     request<{ ok: boolean }>(`/repos/${owner}/${name}/stashes/${id}`, { method: "DELETE" }),

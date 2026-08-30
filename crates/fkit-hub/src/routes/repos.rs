@@ -20,6 +20,7 @@ pub fn routes() -> Router<AppState> {
         .route("/repos", get(list_repos).post(create_repo))
         .route("/users/{username}", get(get_profile))
         .route("/users/{username}/activity", get(get_activity))
+        .route("/users/{username}/pushes", get(get_pushes))
         .route("/repos/{owner}/{name}", get(get_repo))
         .route("/repos/{owner}/{name}", patch(update_repo))
         .route("/repos/{owner}/{name}", delete(delete_repo))
@@ -1478,9 +1479,12 @@ struct DayView {
     /// The repository that took most of that day's commits, as `owner/name`.
     ///
     /// One name rather than a breakdown: the grid tints a square by it, and a
-    /// square is four pixels wide. Ties go to whichever the database returned
-    /// first, which is arbitrary and does not matter -- on a day split evenly
-    /// between two projects, either answer is true.
+    /// square is eleven pixels wide. Ties go to whichever the database
+    /// returned first, which is arbitrary and does not matter -- on a day
+    /// split evenly between two projects, either answer is true.
+    ///
+    /// Empty when that repository is one the viewer may not be told about. The
+    /// day still counts; it just has no name to give.
     repo: String,
 }
 
@@ -1525,14 +1529,29 @@ struct Activity {
 /// answer. Backdating within that bound remains possible, exactly as it is in
 /// git, and no amount of arithmetic here would change that.
 ///
-/// # What it must not leak
+/// # Private work counts, and is never named
 ///
-/// Everything, if the visibility filter is skipped. A grid built from every
-/// commit an account pushed would publish the shape of its private work --
-/// which days somebody was busy, and how busy, on repositories the viewer is
-/// not allowed to know exist. That is why the counts are assembled per
-/// repository and then filtered, rather than summed in SQL: a total is not
-/// something you can redact after the fact.
+/// Dropping a private repository's commits entirely would make the graph lie
+/// about the person -- a fortnight spent on something unreleased would read as
+/// a fortnight of nothing -- so they are counted. What is withheld is the
+/// name: any repository this viewer may not read comes back with an empty
+/// `repo`, and the client draws it in the neutral it uses for everything
+/// outside the legend.
+///
+/// Every hidden repository shares that one empty label rather than getting an
+/// anonymous one each, because distinct anonymous labels are a slow leak: the
+/// colours alone would say how many private projects somebody keeps and
+/// roughly when each was worked on.
+///
+/// What this does disclose is that the person was active on a given day and
+/// how much. That is the deliberate trade -- an activity graph that hides
+/// activity is not one -- and it is why the names, the messages and the hashes
+/// stay behind the same access check every other listing uses. The feed at
+/// `/pushes` makes the opposite choice for the same reason: it exists to show
+/// what the work *was*, and there is no way to show that anonymously.
+///
+/// The counts are assembled per repository and then labelled rather than
+/// summed in SQL, because a total is not something you can redact afterwards.
 async fn get_activity(
     State(state): State<AppState>,
     viewer: Viewer,
@@ -1602,6 +1621,8 @@ async fn get_activity(
         None => (None, false, false),
     };
 
+    // Readable repositories get their name. The rest are not dropped -- see
+    // the note on hidden work above -- they simply have no name to give.
     let mut visible: std::collections::HashMap<Uuid, String> = std::collections::HashMap::new();
     for row in repos {
         let access =
@@ -1612,27 +1633,179 @@ async fn get_activity(
         }
     }
 
-    // Per day: the running total, and the repository holding the most of it.
-    let mut by_day: std::collections::BTreeMap<chrono::NaiveDate, (i64, i64, String)> =
+    // Per day: the total, and which label holds most of it.
+    //
+    // Every repository the viewer cannot read shares one label -- the empty
+    // string -- rather than getting one each. Distinct anonymous labels would
+    // be a slow leak: watch the squares change colour and you learn how many
+    // private projects somebody keeps and roughly when each was worked on,
+    // which is most of what the names would have told you.
+    let mut by_day: std::collections::BTreeMap<chrono::NaiveDate, (i64, Vec<(String, i64)>)> =
         std::collections::BTreeMap::new();
     for (day, repo_id, n) in rows {
-        let Some(full_name) = visible.get(&repo_id) else {
-            continue;
-        };
-        let slot = by_day.entry(day).or_insert_with(|| (0, 0, String::new()));
+        let label = visible.get(&repo_id).cloned().unwrap_or_default();
+        let slot = by_day.entry(day).or_insert_with(|| (0, Vec::new()));
         slot.0 += n;
-        if n > slot.1 {
-            slot.1 = n;
-            slot.2 = full_name.clone();
+        match slot.1.iter_mut().find(|(l, _)| *l == label) {
+            Some((_, c)) => *c += n,
+            None => slot.1.push((label, n)),
         }
     }
 
-    let total: i64 = by_day.values().map(|(n, _, _)| *n).sum();
-    let busiest: i64 = by_day.values().map(|(n, _, _)| *n).max().unwrap_or(0);
+    let total: i64 = by_day.values().map(|(n, _)| *n).sum();
+    let busiest: i64 = by_day.values().map(|(n, _)| *n).max().unwrap_or(0);
     let days = by_day
         .into_iter()
-        .map(|(date, (count, _, repo))| DayView { date, count, repo })
+        .map(|(date, (count, mut tally))| {
+            // Busiest label wins the square's colour. A tie between a named
+            // project and hidden work goes to the named one, which is the more
+            // useful answer and gives away nothing extra.
+            tally.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+            let repo = tally.first().map(|(l, _)| l.clone()).unwrap_or_default();
+            DayView { date, count, repo }
+        })
         .collect();
 
     Ok(Json(Activity { since, until, total, busiest, days }))
+}
+
+
+/// One commit somebody delivered.
+#[derive(Debug, Serialize)]
+struct PushView {
+    /// `owner/name`, which is both the label and the start of the link.
+    repo: String,
+    commit: String,
+    short: String,
+    summary: String,
+    /// What the commit claims about who wrote it. Shown as the claim it is --
+    /// the account is established by the push, not by this string.
+    author: String,
+    /// When it says it was written, and when it reached this server. Both,
+    /// because they answer different questions and a feed that showed only one
+    /// would be hiding the more interesting case: work that arrived in a lump
+    /// long after it was done.
+    committed_at: chrono::DateTime<chrono::Utc>,
+    pushed_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// `GET /users/{username}/pushes` -- the last commits this account delivered.
+///
+/// The graph says which seasons went where; this says what the work actually
+/// was. Same table, same visibility rule, and the same split between what is
+/// authenticated and what is claimed.
+///
+/// Over-fetches on purpose. Rows are dropped after the query by a per-
+/// repository access check, so asking for exactly the number wanted would
+/// return fewer than that whenever any of them turned out to be private -- and
+/// the shortfall would leak the fact that something was filtered.
+async fn get_pushes(
+    State(state): State<AppState>,
+    viewer: Viewer,
+    Path(username): Path<String>,
+) -> AppResult<Json<Vec<PushView>>> {
+    if state.policy().require_auth {
+        viewer.require()?;
+    }
+
+    const WANT: usize = 20;
+    const OVER: i64 = 120;
+
+    let username = username.trim().to_ascii_lowercase();
+    let owner: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM users WHERE username = $1 AND is_active = TRUE")
+            .bind(&username)
+            .fetch_optional(&state.db)
+            .await?;
+    let Some((owner_id,)) = owner else {
+        return Err(AppError::NotFound(format!("no user named {username}")));
+    };
+
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        commit_hash: Vec<u8>,
+        repo_id: Uuid,
+        committed_at: chrono::DateTime<chrono::Utc>,
+        pushed_at: chrono::DateTime<chrono::Utc>,
+    }
+
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT commit_hash, repo_id,
+                LEAST(COALESCE(committed_at, pushed_at), pushed_at) AS committed_at,
+                pushed_at
+           FROM commit_authors
+          WHERE user_id = $1 AND repo_id IS NOT NULL
+          ORDER BY LEAST(COALESCE(committed_at, pushed_at), pushed_at) DESC
+          LIMIT $2",
+    )
+    .bind(owner_id)
+    .bind(OVER)
+    .fetch_all(&state.db)
+    .await?;
+
+    let mut ids: Vec<Uuid> = rows.iter().map(|r| r.repo_id).collect();
+    ids.sort();
+    ids.dedup();
+
+    let repos: Vec<RepoWithOwner> = sqlx::query_as(
+        "SELECT r.*, u.username FROM repos r
+         JOIN users u ON u.id = r.owner_id
+         WHERE r.id = ANY($1)",
+    )
+    .bind(&ids)
+    .fetch_all(&state.db)
+    .await?;
+
+    let (uid, admin, can_write) = match &viewer.user {
+        Some(u) => (Some(u.id), u.is_admin, u.can_write),
+        None => (None, false, false),
+    };
+
+    // Resolved once per repository rather than once per commit: twenty commits
+    // on one project is one question, not twenty.
+    let mut ok: std::collections::HashMap<Uuid, (String, Uuid)> =
+        std::collections::HashMap::new();
+    for row in repos {
+        let access =
+            resolve(&state.db, &row.repo, uid, admin, can_write, state.policy().require_auth)
+                .await?;
+        if access.can_read() {
+            ok.insert(
+                row.repo.id,
+                (format!("{}/{}", row.username, row.repo.name), row.repo.network_id),
+            );
+        }
+    }
+
+    let mut out = Vec::with_capacity(WANT);
+    for r in rows {
+        if out.len() >= WANT {
+            break;
+        }
+        let Some((full_name, network)) = ok.get(&r.repo_id) else {
+            continue;
+        };
+        let Ok(bytes) = <[u8; 32]>::try_from(r.commit_hash.as_slice()) else {
+            continue;
+        };
+        let Ok(store) = state.store_for_network(*network) else {
+            continue;
+        };
+        // A row whose object is gone -- collected, or never fully received --
+        // is skipped rather than rendered as a commit with no message.
+        let Some(head) = head_view(&store, Hash(bytes)) else {
+            continue;
+        };
+        out.push(PushView {
+            repo: full_name.clone(),
+            commit: head.commit,
+            short: head.short,
+            summary: head.summary,
+            author: head.author,
+            committed_at: r.committed_at,
+            pushed_at: r.pushed_at,
+        });
+    }
+
+    Ok(Json(out))
 }
