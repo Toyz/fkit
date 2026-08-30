@@ -23,6 +23,8 @@ pub fn routes() -> Router<AppState> {
         .route("/repos/{owner}/{name}", patch(update_repo))
         .route("/repos/{owner}/{name}", delete(delete_repo))
         .route("/repos/{owner}/{name}/refs", get(list_refs).delete(delete_ref))
+        .route("/repos/{owner}/{name}/stashes", get(list_stashes).post(create_stash))
+        .route("/repos/{owner}/{name}/stashes/{id}", delete(delete_stash))
         .route("/repos/{owner}/{name}/rules", get(list_rules).post(create_rule))
         .route("/repos/{owner}/{name}/rules/{id}", patch(update_rule).delete(delete_rule))
         .route("/repos/{owner}/{name}/stats", get(repo_stats))
@@ -92,6 +94,105 @@ struct RepoStats {
     /// offer a download that the server would refuse, rather than handing
     /// someone a button whose only outcome is an error.
     archive_limit: u64,
+}
+
+// ---- stashes -------------------------------------------------------------
+
+/// What this account has parked here.
+///
+/// Read access is enough. Losing write access to a repository should not strand
+/// work you already put on it — you can still fetch it back and drop it.
+async fn list_stashes(
+    State(state): State<AppState>,
+    viewer: Viewer,
+    axum::extract::Path((owner, name)): axum::extract::Path<(String, String)>,
+) -> AppResult<Json<Vec<crate::stash::Stash>>> {
+    let (repo, access, _) = super::load_repo(&state, &viewer, &owner, &name).await?;
+    require_read(access, &owner, &name)?;
+    let me = viewer.require()?;
+    Ok(Json(crate::stash::list(&state.db, me.id, repo.id).await?))
+}
+
+#[derive(serde::Deserialize)]
+struct NewStash {
+    /// The stash commit, already pushed into the store.
+    commit: String,
+    message: String,
+    /// What the objects cost, for the quota. The server recomputes nothing
+    /// here; over-reporting only costs the pusher their own allowance.
+    #[serde(default)]
+    bytes: i64,
+}
+
+/// Register a stash whose objects are already in the store.
+///
+/// Write access, because parking one adds objects to somebody's repository.
+/// The base is read from the commit rather than taken on trust: it is the
+/// commit's own first parent, which is what makes the diff `base..commit` and
+/// what `stash pop` merges against.
+async fn create_stash(
+    State(state): State<AppState>,
+    viewer: Viewer,
+    axum::extract::Path((owner, name)): axum::extract::Path<(String, String)>,
+    Json(body): Json<NewStash>,
+) -> AppResult<Json<crate::stash::Stash>> {
+    let (repo, access, _) = super::load_repo(&state, &viewer, &owner, &name).await?;
+    require_write(access)?;
+    let me = viewer.require()?;
+
+    let id = Hash::from_hex(&body.commit)
+        .ok_or_else(|| AppError::bad("not a valid commit hash"))?;
+    let store = state.store_for_network(repo.network_id).map_err(AppError::Internal)?;
+
+    let fkit_core::Object::Commit(c) = store
+        .get(id)
+        .map_err(|_| AppError::bad("push the stash's objects before registering it"))?
+    else {
+        return Err(AppError::bad("that hash does not name a commit"));
+    };
+    let base = *c
+        .parents
+        .first()
+        .ok_or_else(|| AppError::bad("a stash must have the commit it was taken from as a parent"))?;
+
+    let message = body.message.trim();
+    let message = if message.is_empty() { "work in progress" } else { message };
+
+    // Tidy while we are here. A lapsed stash is already invisible and already
+    // not a root; this just stops the rows accumulating.
+    if let Err(e) = crate::stash::sweep(&state.db).await {
+        tracing::warn!("sweeping expired stashes: {e}");
+    }
+
+    let row = crate::stash::create(
+        &state.db,
+        me.id,
+        repo.id,
+        id,
+        base,
+        message,
+        body.bytes.max(0),
+        crate::stash::DEFAULT_DAYS,
+    )
+    .await?;
+
+    super::audit(&state, Some(me.id), Some(repo.id), "stash.push",
+        serde_json::json!({ "commit": body.commit })).await;
+    Ok(Json(row))
+}
+
+async fn delete_stash(
+    State(state): State<AppState>,
+    viewer: Viewer,
+    axum::extract::Path((owner, name, id)): axum::extract::Path<(String, String, Uuid)>,
+) -> AppResult<Json<serde_json::Value>> {
+    let (repo, access, _) = super::load_repo(&state, &viewer, &owner, &name).await?;
+    require_read(access, &owner, &name)?;
+    let me = viewer.require()?;
+    crate::stash::drop_one(&state.db, me.id, repo.id, id).await?;
+    super::audit(&state, Some(me.id), Some(repo.id), "stash.drop",
+        serde_json::json!({ "id": id })).await;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 // ---- branch rules --------------------------------------------------------
@@ -800,10 +901,13 @@ async fn collect_garbage(
         .bind(repo.network_id)
         .fetch_all(&state.db)
         .await?;
-        let roots: Vec<Hash> = roots
+        let mut roots: Vec<Hash> = roots
             .into_iter()
             .filter_map(|(b,)| Some(Hash(b.try_into().ok()?)))
             .collect();
+        // Parked work points at objects nothing else does, so without this the
+        // walk would reclaim exactly what somebody set aside to come back to.
+        roots.extend(crate::stash::roots(&state.db, repo.network_id).await?);
 
         let store = state.store_for_network(repo.network_id).map_err(AppError::Internal)?;
         // A graph walk plus file IO: minutes on a large repository, and none

@@ -21,6 +21,7 @@ mod ratelimit;
 mod rules;
 mod routes;
 mod settings;
+mod stash;
 mod state;
 mod sync;
 

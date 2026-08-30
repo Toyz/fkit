@@ -471,6 +471,16 @@ async fn commit_detail(
     let (repo, _, _) = super::load_repo(&state, &viewer, &owner, &name).await?;
     let store = state.store_for_network(repo.network_id).map_err(AppError::Internal)?;
     let id = Hash::from_hex(&hash).ok_or_else(|| AppError::bad("not a valid commit hash"))?;
+
+    // Every other object here belongs to the repository's published history,
+    // so these routes never had to ask who may see one. A stash is the first
+    // thing that is present but not public, and this resolves whatever hash it
+    // is given — so without the check a stash would render for anyone holding
+    // its hash. Absent rather than forbidden: which commits exist is not
+    // something to confirm to somebody who should not have them.
+    if !crate::stash::may_view(&state.db, viewer.id(), id).await? {
+        return Err(AppError::not_found("no such commit"));
+    }
     let c = content::commit_of(&store, id)?;
 
     Ok(Json(CommitDetail {
@@ -568,6 +578,16 @@ async fn patch(
     let (repo, _, _) = super::load_repo(&state, &viewer, &owner, &name).await?;
     let store = state.store_for_network(repo.network_id).map_err(AppError::Internal)?;
     let id = Hash::from_hex(&hash).ok_or_else(|| AppError::bad("not a valid commit hash"))?;
+
+    // Every other object here belongs to the repository's published history,
+    // so these routes never had to ask who may see one. A stash is the first
+    // thing that is present but not public, and this resolves whatever hash it
+    // is given — so without the check a stash would render for anyone holding
+    // its hash. Absent rather than forbidden: which commits exist is not
+    // something to confirm to somebody who should not have them.
+    if !crate::stash::may_view(&state.db, viewer.id(), id).await? {
+        return Err(AppError::not_found("no such commit"));
+    }
     let (files, truncated) = content::commit_patch(&store, id)?;
     Ok(Json(PatchResponse { files, truncated }))
 }
