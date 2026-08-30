@@ -6,7 +6,7 @@ import { route } from "@toyz/loom/router";
 import { base } from "../ui";
 import { type Repo } from "../api";
 import { linkHandler } from "../nav";
-import { repoRow, repoRowSheet, spansOwners } from "../repo-row";
+import { repoRow, repoRowSheet } from "../repo-row";
 import { Session } from "../session";
 
 const sheet = css`
@@ -53,7 +53,6 @@ export class PageRepos extends LoomElement {
     const all = this.repos.data ?? [];
     const priv = all.filter((r) => r.visibility === "private").length;
     // Worth a column of faces only if the faces differ.
-    const tiles = spansOwners(all);
     // Say what the list is, and — while filtering — how much of it you are
     // being shown, since a filtered count alone reads as the whole total.
     const value = this.repos.loading
@@ -107,7 +106,7 @@ export class PageRepos extends LoomElement {
                 ) : null}
               </div>
             ) : (
-              list.map((r) => repoRow(r, { withOwner: true, ownerTiles: tiles }))
+              list.map((r) => repoRow(r, { withOwner: true }))
             )}
           </fkit-list>
         </fkit-section>
