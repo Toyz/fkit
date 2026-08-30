@@ -47,6 +47,7 @@ import {
   type Ref,
   type RepoStats,
   type Repo,
+  type User,
 } from "../api";
 import { linkHandler, go } from "../nav";
 import { renderMarkdown, type MarkdownContext } from "../markdown";
@@ -2293,6 +2294,34 @@ export class PageRepo extends LoomElement {
   /** Cancels an in-flight wait, so two fragments in a row cannot both fire. */
   private pendingJump: (() => void) | null = null;
 
+  /**
+   * The session, mirrored so this page redraws when it resolves.
+   *
+   * A dozen places here ask whether there is anyone signed in -- the comment
+   * box, the label editors, every action that needs an account. Reading
+   * `session.isAuthed` straight out of the service subscribes to nothing, and
+   * before /auth/me answers it reads false, so the first draw was always the
+   * signed-out one and nothing brought it back. It corrected itself only
+   * because this page's own queries resolve afterwards and redraw for their
+   * own reasons, which is luck rather than a mechanism -- and the luck runs
+   * out exactly when those queries are already cached, which is to say on the
+   * second visit to a repository.
+   */
+  @reactive accessor user: User | null | undefined = undefined;
+
+  /** Whether anyone is signed in, from a field this component subscribes to. */
+  private get authed(): boolean {
+    return !!this.user;
+  }
+
+  @mount
+  watchSession() {
+    this.user = this.session.current;
+    return this.session.user.subscribe((u: User | null | undefined) => {
+      this.user = u;
+    });
+  }
+
   @mount
   init() {
     void this.reload();
@@ -3077,7 +3106,7 @@ export class PageRepo extends LoomElement {
           {this.linkCopied ? "copied" : "copy link"}
         </button>
 
-        {this.session.isAuthed ? (
+        {this.authed ? (
           <button
             class="act go"
             title="open an issue about these lines"
@@ -3467,7 +3496,7 @@ export class PageRepo extends LoomElement {
     const at = this.loc!;
     // Only a merge request has somewhere to attach a line comment, and only a
     // signed-in viewer can write one.
-    const canTalk = this.comments !== null && this.session.isAuthed;
+    const canTalk = this.comments !== null && this.authed;
 
     // Cut a long file down to its first hunks unless asked for the rest. The
     // limit is on lines rather than hunks, because one hunk can be the whole
@@ -3533,7 +3562,7 @@ export class PageRepo extends LoomElement {
           {/* Not gated on being able to comment: marking a file read is a
               note to yourself, kept in your own browser, and is as useful
               reading a commit as reviewing a change. */}
-          {this.session.isAuthed ? (
+          {this.authed ? (
             <label class={`viewed ${seen ? "on" : ""}`} title="Mark this file as read">
               <input
                 type="checkbox"
@@ -4055,7 +4084,7 @@ export class PageRepo extends LoomElement {
                 {shut ? "show" : "hide"}
               </button>
             ) : null}
-            {this.session.isAuthed ? (
+            {this.authed ? (
               <button type="button" class="bare" disabled={this.busy} onClick={() => flip(!done)}>
                 {done ? "unresolve" : "resolve"}
               </button>
@@ -4336,7 +4365,7 @@ export class PageRepo extends LoomElement {
                   here. One from another fork needs only read, which is the
                   whole point of forking — the server applies the same rule. */}
               {!c.up_to_date &&
-              this.session.isAuthed &&
+              this.authed &&
               (this.repo!.access === "admin" ||
                 this.repo!.access === "write" ||
                 (v.head.includes(":") && this.repo!.access === "read")) ? (
@@ -4553,7 +4582,7 @@ fkit push</pre>
                 </button>
               ))}
             </span>
-            {this.session.isAuthed ? (
+            {this.authed ? (
               <button class="btn" onClick={() => (this.newIssue = !this.newIssue)}>
                 <loom-icon name="plus" size={11}></loom-icon> new issue
               </button>
@@ -4880,7 +4909,7 @@ fkit push</pre>
               ))
             )}
 
-            {this.session.isAuthed ? (
+            {this.authed ? (
               <div class="tl last">
                 <fkit-composer
                   label="Comment"
@@ -4923,7 +4952,7 @@ fkit push</pre>
             <div class="sec">
               <div class="shead">
                 <span>Labels</span>
-                {this.session.isAuthed && all.length ? (
+                {this.authed && all.length ? (
                   <button
                     type="button"
                     class="bare"
@@ -5432,7 +5461,7 @@ fkit push</pre>
                   <div class="sec">
                     <div class="shead">
                       <span>Labels</span>
-                      {this.session.isAuthed && (this.labelsQuery.data ?? []).length ? (
+                      {this.authed && (this.labelsQuery.data ?? []).length ? (
                         <button
                           type="button"
                           class="bare"
@@ -5630,7 +5659,7 @@ fkit push</pre>
           )
         )}
 
-        {this.session.isAuthed ? (
+        {this.authed ? (
           <fkit-composer
             label="Comment"
             placeholder="Leave a comment on this merge request"
@@ -5706,7 +5735,7 @@ fkit push</pre>
             <span class="open">Unresolved — this blocks merging</span>
           )}
           <span class="grow"></span>
-          {this.session.isAuthed ? (
+          {this.authed ? (
             <>
               {replying ? null : (
                 <button type="button" class="bare" onClick={() => (this.writingAt = key)}>
@@ -5804,7 +5833,7 @@ fkit push</pre>
     // anonymous visitor being told to run `fkit push` is noise at best and a
     // confusing dead end at worst.
     const canPush = r.access === "write" || r.access === "admin";
-    const signedIn = this.session.isAuthed;
+    const signedIn = this.authed;
 
     return (
       <div class="setup">
