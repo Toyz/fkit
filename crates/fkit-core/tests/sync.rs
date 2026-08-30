@@ -203,11 +203,14 @@ fn a_lying_peer_is_rejected() {
 /// A receiver left with holes can still be filled.
 ///
 /// This is what a dropped connection leaves behind: some objects arrived, the
-/// ones beneath them did not, and the ref never moved. Asking for the closure
-/// again prunes at everything already present, so the gaps are skipped and the
-/// transfer "succeeds" while the history is still broken -- which is why a
-/// retry used to fail identically every time, and why the only way out was to
-/// delete the repository and start again.
+/// ones beneath them did not, and the ref never moved.
+///
+/// The hard part is that asking for the closure prunes at everything already
+/// present, so the objects above a gap are seen, skipped, and the gap with
+/// them. That made a retry transfer nothing and fail on exactly the objects
+/// the interruption lost, identically every time -- the only way out being to
+/// delete the repository. So a transfer now looks for holes before it reports
+/// itself finished, and simply running it again is the repair.
 #[test]
 fn a_receiver_with_holes_is_repaired_rather_than_refused() {
     let (a, b) = (Tmp::new("holesend"), Tmp::new("holerecv"));
@@ -240,19 +243,17 @@ fn a_receiver_with_holes_is_repaired_rather_than_refused() {
     let hole = hole.expect("the history should contain a leaf to remove");
     assert!(!receiver.has(hole), "the hole must actually be missing");
 
-    // Asking for the closure prunes at what is present, so it fetches nothing
-    // and leaves the gap exactly where it was. This is the trap.
-    let stats = transfer(&sender, &receiver, commit);
-    assert_eq!(stats.objects, 0, "pruning at what is present is what makes this stick");
-    assert!(!receiver.has(hole), "so the hole survives a plain retry");
-
-    // Naming what is absent is what breaks out of it.
+    // The gap is real, and a walk of the closure names it.
     let mut seen = std::collections::HashSet::new();
     let missing = fkit_core::proto::missing_in_closure(&receiver, commit, &mut seen).unwrap();
     assert_eq!(missing, vec![hole], "the walk should name exactly the gap");
 
-    let filled = transfer(&sender, &receiver, hole);
-    assert_eq!(filled.objects, 1, "and fetching it should bring exactly that object");
+    // Simply asking again is enough. Pruning at what is present would skip
+    // straight past this hole -- that is what used to make the failure
+    // permanent -- so the transfer checks itself before reporting success.
+    let stats = transfer(&sender, &receiver, commit);
+    assert_eq!(stats.objects, 1, "a retry should fetch the one missing object");
+    assert!(receiver.has(hole), "and the hole should be filled");
 
     let mut seen = std::collections::HashSet::new();
     assert!(

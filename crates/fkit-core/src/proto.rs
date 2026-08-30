@@ -74,6 +74,12 @@ impl Transport for WebSocket {
 /// most of the wall clock.
 pub const BATCH: usize = 4096;
 
+/// How many times a transfer may go back for objects an earlier one lost.
+///
+/// A handful. Each round fills the gaps the previous one revealed, and a
+/// history broken more deeply than that wants looking at rather than retrying.
+const MAX_REPAIR_ROUNDS: usize = 8;
+
 /// Refuse to follow an unbounded graph from an untrusted peer.
 pub const MAX_OBJECTS_PER_SYNC: usize = 5_000_000;
 
@@ -240,6 +246,33 @@ impl Msg {
     }
 }
 
+impl Msg {
+    /// What kind of message this is, without its contents.
+    ///
+    /// An error that says what it received should not print an entire history
+    /// at somebody: a `Want` carries thousands of hashes, and a mismatch used
+    /// to spell every one of them out on the terminal.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Msg::Hello { .. } => "Hello",
+            Msg::Welcome { .. } => "Welcome",
+            Msg::PushRef { .. } => "PushRef",
+            Msg::PushStash { .. } => "PushStash",
+            Msg::ListStashes { .. } => "ListStashes",
+            Msg::StashList { .. } => "StashList",
+            Msg::PullStash { .. } => "PullStash",
+            Msg::DropStash { .. } => "DropStash",
+            Msg::PullRef { .. } => "PullRef",
+            Msg::RefIs { .. } => "RefIs",
+            Msg::Want { .. } => "Want",
+            Msg::Objects { .. } => "Objects",
+            Msg::Done { .. } => "Done",
+            Msg::Ok { .. } => "Ok",
+            Msg::Error { .. } => "Error",
+        }
+    }
+}
+
 pub fn send<T: Transport + ?Sized>(t: &mut T, m: &Msg) -> Result<()> {
     t.send_bytes(&m.encode())
 }
@@ -368,6 +401,63 @@ pub fn fetch_closure_watched<T: Transport + ?Sized>(
         }
     }
 
+    // Before saying we are finished, make sure we actually are.
+    //
+    // The walk above prunes at anything already here, which is what makes an
+    // incremental transfer cheap -- and also what makes it skip the gaps a
+    // previously interrupted transfer left, since the objects above a gap are
+    // present and get pruned at. So once the queue empties, look for holes and
+    // go back for them.
+    //
+    // This has to happen before `Done`, not after: `Done` is what releases the
+    // other side from answering, and a `Want` sent afterwards arrives at a peer
+    // that has stopped listening for one.
+    let mut rounds = 0;
+    loop {
+        let mut seen = HashSet::new();
+        let mut holes = Vec::new();
+        for &r in roots {
+            holes.extend(missing_in_closure(store, r, &mut seen)?);
+        }
+        if holes.is_empty() {
+            break;
+        }
+        rounds += 1;
+        if rounds > MAX_REPAIR_ROUNDS {
+            bail!(
+                "still incomplete after {rounds} attempts to fill the gaps; \
+                 {} object(s) missing, the first being {}",
+                holes.len(),
+                holes[0].short()
+            );
+        }
+
+        let before = stats.objects;
+        for chunk in holes.chunks(BATCH) {
+            send(ws, &Msg::Want { hashes: chunk.to_vec() })?;
+            stats.round_trips += 1;
+            let Msg::Objects { objects } = recv(ws)? else {
+                bail!("expected an Objects message while filling gaps");
+            };
+            for (claimed, framed) in objects {
+                if store.has(claimed) {
+                    continue;
+                }
+                store.put_raw(claimed, &framed)?;
+                stats.objects += 1;
+                stats.bytes += framed.len() as u64;
+            }
+        }
+        if stats.objects == before {
+            bail!(
+                "the peer cannot supply {}, which this repository needs \
+                 and does not have",
+                holes[0].short()
+            );
+        }
+        progress(&stats);
+    }
+
     send(ws, &Msg::Done)?;
     Ok(stats)
 }
@@ -410,7 +500,7 @@ pub fn serve_wants_watched<T: Transport + ?Sized>(
                 progress(&stats);
             }
             Msg::Done => return Ok(stats),
-            other => bail!("expected Want or Done, got {other:?}"),
+            other => bail!("expected Want or Done, got {}", other.name()),
         }
     }
 }
