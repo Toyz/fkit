@@ -109,6 +109,11 @@ impl PgHost {
         let mut seen = std::collections::HashSet::new();
         let mut stack = vec![tip];
         let mut batch: Vec<Vec<u8>> = Vec::new();
+        // What each commit says about when it was made. Taken here because the
+        // object is already open to read its parents, and because it is the
+        // only record of when the work happened -- `pushed_at` is when it
+        // arrived, which is a different fact and a poor stand-in for this one.
+        let mut when: Vec<chrono::DateTime<chrono::Utc>> = Vec::new();
 
         while let Some(h) = stack.pop() {
             if batch.len() >= MAX {
@@ -128,6 +133,13 @@ impl PgHost {
             }
             let Ok(fkit_core::object::Object::Commit(c)) = self.store.get(h) else { continue };
             batch.push(h.0.to_vec());
+            // A commit's timestamp is content, so it can say anything at all --
+            // including a time that cannot be represented. Falling back to now
+            // keeps a nonsense value from dropping the attribution itself,
+            // which is the part that is actually known.
+            when.push(
+                chrono::DateTime::from_timestamp(c.timestamp, 0).unwrap_or_else(chrono::Utc::now),
+            );
             stack.extend(c.parents);
         }
 
@@ -140,13 +152,14 @@ impl PgHost {
         // somewhere else, must not reattribute what someone else delivered.
         let done = self.rt.block_on(
             sqlx::query(
-                "INSERT INTO commit_authors (commit_hash, user_id, repo_id)
-                 SELECT h, $2, $3 FROM UNNEST($1::bytea[]) AS h
+                "INSERT INTO commit_authors (commit_hash, user_id, repo_id, committed_at)
+                 SELECT h, $2, $3, t FROM UNNEST($1::bytea[], $4::timestamptz[]) AS u(h, t)
                  ON CONFLICT (commit_hash) DO NOTHING",
             )
             .bind(&batch)
             .bind(user_id)
             .bind(self.repo.id)
+            .bind(&when)
             .execute(&self.state.db),
         );
 

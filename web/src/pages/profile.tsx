@@ -16,12 +16,13 @@
 import { LoomElement, component, css, styles, reactive, mount, on, inject } from "@toyz/loom";
 import { route } from "@toyz/loom/router";
 import { base } from "../ui";
-import { api, relativeTime, type MyStash, type Profile, type Repo } from "../api";
+import { api, relativeTime, type Activity, type MyStash, type Profile, type Repo } from "../api";
 import { linkHandler } from "../nav";
 import { repoRow, repoRowSheet } from "../repo-row";
 import { Session } from "../session";
 import { confirmAction } from "../components/fkit-dialog";
 import "../components/fkit-tabs";
+import "../components/fkit-activity";
 
 /**
  * The topics this person's repositories carry, most-used first.
@@ -67,14 +68,58 @@ const sheet = css`
    * the same rule every heading in the app draws — so the page reads top to
    * bottom like the rest of it instead of as two unrelated halves.
    */
-  .band {
-    display: grid;
-    grid-template-columns: auto minmax(0, 1fr);
-    gap: 0 18px;
-    align-items: center;
-    margin-bottom: 30px;
-  }
+  /* The identity, laid out down its column rather than across a page: the
+     tile and the name share the top line, and everything true of the person
+     hangs under them. */
+  .band { display: block; margin-bottom: 30px; }
   .band .who { min-width: 0; }
+  .band fkit-avatar { float: left; margin: 2px 12px 0 0; }
+
+  /* Who they are, and what they have been doing, as one band with two halves.
+   *
+   * The year of pushes was sitting loose between the band and the tabs: the
+   * largest and only coloured thing on the page, wearing no frame, between two
+   * things that had one. It is not a section of the page -- nothing switches to
+   * it and nothing else belongs with it -- it is the second half of the answer
+   * to who this is, so it goes where that answer already is.
+   *
+   * The hairline is the whole reason this is not the sidebar that was tried
+   * here before and taken out again. That one had blocks stacked in a column
+   * aligned to nothing, reading as two unrelated halves of a page; this shares
+   * one top line, one baseline and one rule, which is what makes two columns
+   * read as one band.
+   */
+  .id {
+    display: grid;
+    /* A fixed column, not an automatic one. Left to size itself the identity
+       took the width of its longest sentence -- some seven hundred pixels of
+       "joined, 21 repositories, last push, hash" on one line -- which pushed
+       the grid into a scroller and hid the most recent weeks, the ones anybody
+       actually came to look at. Pinned, the sentence wraps into a paragraph
+       the shape of the column it is in, and the year gets the rest. */
+    grid-template-columns: 320px minmax(0, 1fr);
+    gap: 0 30px;
+    align-items: start;
+    margin-bottom: 26px;
+  }
+  .id .band { margin-bottom: 0; }
+  .id .year {
+    border-left: 1px solid var(--border);
+    padding-left: 30px; min-width: 0;
+  }
+  /* Nothing pushed yet, so there is no second half and the first should not
+     be squeezed into a column two thirds of the way across the page. */
+  .id.solo { grid-template-columns: minmax(0, 1fr); }
+
+  /* Under about this width the grid cannot sit beside anything without one of
+     them being unreadable, so the band stacks and the rule moves with it. */
+  @media (max-width: 1080px) {
+    .id { grid-template-columns: minmax(0, 1fr); gap: 22px 0; }
+    .id .year {
+      border-left: 0; padding-left: 0;
+      border-top: 1px solid var(--border); padding-top: 20px;
+    }
+  }
 
   .nm {
     display: flex; align-items: center; flex-wrap: wrap; gap: 9px;
@@ -88,19 +133,31 @@ const sheet = css`
     font-size: 13px; margin-top: 3px;
   }
 
-  /* The facts read as a sentence about the person, because that is what they
-     are — a stacked table of four rows was three more lines than they need. */
+  /* One row per fact, label left and value right, aligned down the column. */
   .facts {
-    display: flex; flex-wrap: wrap; align-items: center; gap: 4px 9px;
-    margin-top: 9px; font-size: 11.5px; color: var(--faint);
+    display: grid; grid-template-columns: auto minmax(0, 1fr);
+    gap: 3px 12px; margin: 14px 0 0; clear: both;
+    font-size: 11.5px;
   }
-  .facts .sep { opacity: .45; }
-  .facts b { font-weight: 400; color: var(--muted); }
-  .facts .at { font-family: var(--mono); color: var(--accent); }
+  .facts dt {
+    color: var(--faint); white-space: nowrap;
+    font-size: 10px; text-transform: uppercase; letter-spacing: .08em;
+    align-self: baseline; padding-top: 1px;
+  }
+  .facts dd { margin: 0; color: var(--muted); min-width: 0; }
+  .facts .q { color: var(--faint); }
+  .facts .at {
+    font-family: var(--mono); color: var(--accent);
+    text-decoration: none; margin-left: 7px;
+  }
+  .facts .at:hover { text-decoration: underline; }
 
   /* What they work on, from their own repositories rather than from a bio
      nobody fills in. */
-  .works { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; margin-top: 11px; }
+  .works {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 5px;
+    margin-top: 14px; clear: both;
+  }
   .works .lbl {
     font-size: 10px; text-transform: uppercase; letter-spacing: .09em;
     color: var(--faint); margin-right: 3px;
@@ -138,6 +195,7 @@ const sheet = css`
   .grp .n {
     margin-left: auto; color: var(--faint); font-variant-numeric: tabular-nums;
   }
+
 `;
 
 @route("/:owner")
@@ -169,18 +227,40 @@ export class PageProfile extends LoomElement {
    */
   @reactive accessor tab: "repos" | "stashes" = "repos";
   @reactive accessor stashes: MyStash[] | null = null;
+  @reactive accessor activity: Activity | null = null;
   @reactive accessor busy = false;
+  /** A fetch is already out; a second caller should not start another. */
+  private loading = false;
 
   @mount
   readTab() {
     const sync = () => {
       const want = new URLSearchParams(location.search).get("tab");
       this.tab = want === "stashes" ? "stashes" : "repos";
-      if (this.tab === "stashes" && this.stashes === null) void this.loadStashes();
+      this.maybeLoadStashes();
     };
     sync();
     addEventListener("popstate", sync);
     return () => removeEventListener("popstate", sync);
+  }
+
+  /**
+   * Fetch the list once we know it is ours to fetch.
+   *
+   * Called from everywhere that could be the moment we find out: the tab, the
+   * session arriving, the profile arriving. Whichever is last wins and the
+   * other two are a no-op, which is cheaper than working out an order.
+   *
+   * The tab wears the count, so waiting for the tab to be opened before asking
+   * meant the count only appeared after you had already gone looking -- which
+   * is exactly when a number telling you there is something to look at is of
+   * no use to anybody.
+   */
+  private maybeLoadStashes() {
+    if (this.stashes !== null || this.loading) return;
+    if (!this.me || this.me !== this.profile?.username) return;
+    this.loading = true;
+    void this.loadStashes();
   }
 
   private async loadStashes() {
@@ -190,12 +270,17 @@ export class PageProfile extends LoomElement {
       // Not fatal: the rest of the profile is still worth showing, and an
       // empty list reads the same as a failed one here.
       this.stashes = [];
+    } finally {
+      this.loading = false;
     }
   }
 
   @mount
   watchUser() {
-    const take = (u: { username: string } | null | undefined) => (this.me = u?.username ?? null);
+    const take = (u: { username: string } | null | undefined) => {
+      this.me = u?.username ?? null;
+      this.maybeLoadStashes();
+    };
     take(this.session.current);
     return this.session.user.subscribe(take);
   }
@@ -211,9 +296,21 @@ export class PageProfile extends LoomElement {
     this.profile = null;
     this.error = "";
     this.filter = "";
+    this.stashes = null;
+    this.activity = null;
+    // Its own request: a year of pushes is a different question from a list of
+    // repositories, it is the slower of the two, and a profile that will not
+    // render until both have landed is a worse profile than one that fills in.
+    api
+      .activity(who)
+      .then((a) => (this.activity = a))
+      .catch(() => (this.activity = null));
     api
       .profile(who)
-      .then((p) => (this.profile = p))
+      .then((p) => {
+        this.profile = p;
+        this.maybeLoadStashes();
+      })
       .catch((e) => (this.error = (e as Error).message));
   }
 
@@ -252,7 +349,8 @@ export class PageProfile extends LoomElement {
 
     return (
       <div class="wrap">
-        <div class="band">
+        <div class={`id${this.activity && this.activity.total > 0 ? "" : " solo"}`}>
+          <div class="band">
           {p ? (
             <>
               <fkit-avatar name={p.username} size={58}></fkit-avatar>
@@ -264,30 +362,53 @@ export class PageProfile extends LoomElement {
                 </div>
                 {p.display_name ? <div class="dn">{p.display_name}</div> : null}
 
-                {/* One line, because that is what these facts amount to. */}
-                <div class="facts">
-                  <span>joined <b>{relativeTime(p.created_at)}</b></span>
-                  <span class="sep">·</span>
-                  <span>
-                    <b>{p.repos.length}</b>{" "}
-                    {p.repos.length === 1 ? "repository" : "repositories"}
-                  </span>
+                {/* Labelled rows rather than one sentence.
+                    As a sentence these ran to about seven hundred pixels, which
+                    is fine across a page and unreadable down a column -- it
+                    wrapped wherever it ran out of room and stranded its own
+                    separators at the start of lines. Labelled, each fact ends
+                    where it ends, they align with each other, and the column
+                    fills to something near the height of the grid beside it. */}
+                <dl class="facts">
+                  <dt>joined</dt>
+                  <dd>{relativeTime(p.created_at)}</dd>
+
+                  <dt>repositories</dt>
+                  <dd>
+                    {p.repos.length}
+                    {priv && mine ? <span class="q"> · {priv} private</span> : null}
+                  </dd>
+
                   {latest ? (
                     <>
-                      <span class="sep">·</span>
-                      <span>last push <b>{relativeTime(latest.updated_at)}</b></span>
+                      <dt>last push</dt>
+                      <dd>
+                        {relativeTime(latest.updated_at)}
+                        {/* The tip of that push. A hash is the only thing here
+                            that means exactly one state of exactly one tree, so
+                            it is the honest answer to what someone is on. */}
+                        {latest.head ? (
+                          <a
+                            class="at"
+                            href={`/${latest.owner}/${latest.name}/commit/${latest.head.commit}`}
+                            onClick={linkHandler(
+                              `/${latest.owner}/${latest.name}/commit/${latest.head.commit}`,
+                            )}
+                          >
+                            {latest.head.short}
+                          </a>
+                        ) : null}
+                      </dd>
                     </>
                   ) : null}
-                  {/* The tip of that push. A hash is the only thing here that
-                      means exactly one state of exactly one tree, so it is the
-                      honest answer to what someone is on right now. */}
-                  {latest?.head ? (
+
+                  {this.activity && this.activity.total > 0 ? (
                     <>
-                      <span class="sep">·</span>
-                      <span class="at">{latest.head.short}</span>
+                      <dt>pushed</dt>
+                      <dd>{this.activity.total} commits this year</dd>
                     </>
                   ) : null}
-                </div>
+                </dl>
 
                 {topics.length ? (
                   <div class="works">
@@ -308,6 +429,21 @@ export class PageProfile extends LoomElement {
               </div>
             </>
           )}
+          </div>
+
+          {/* The band's other half. Not gated on the tab: this is part of who
+              the page is about, so it does not come and go as you switch
+              between what they own and what they parked. Absent only when
+              there is nothing to draw -- a new account should not be met with
+              a year of empty squares as its welcome. */}
+          {this.activity && this.activity.total > 0 ? (
+            <div class="year">
+              <fkit-activity
+                data={this.activity}
+                who={p?.username ?? ""}
+              ></fkit-activity>
+            </div>
+          ) : null}
         </div>
 
         {mine ? (

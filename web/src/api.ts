@@ -558,6 +558,26 @@ export interface Profile {
   repos: Repo[];
 }
 
+/** One day in somebody's push history. */
+export interface ActivityDay {
+  /** `YYYY-MM-DD`, in UTC -- the day the server counted it in. */
+  date: string;
+  count: number;
+  /** `owner/name` of whatever took most of that day. */
+  repo: string;
+}
+
+/** A year of pushes, for the grid on a profile. */
+export interface Activity {
+  since: string;
+  until: string;
+  total: number;
+  /** The busiest single day, so shading scales to this person's own year. */
+  busiest: number;
+  /** Only the days with something on them. */
+  days: ActivityDay[];
+}
+
 export interface Invite {
   id: string;
   email: string | null;
@@ -936,6 +956,8 @@ export const api = {
     request<NewToken>("/tokens", { method: "POST", body: body(input) }),
   updateToken: (id: string, input: { name?: string; attributes?: boolean }) =>
     request<{ ok: boolean }>(`/tokens/${id}`, { method: "PATCH", body: body(input) }),
+  activity: (username: string) =>
+    request<Activity>(`/users/${encodeURIComponent(username)}/activity`),
   myStashes: () => request<MyStash[]>("/auth/stashes"),
   dropStash: (owner: string, name: string, id: string) =>
     request<{ ok: boolean }>(`/repos/${owner}/${name}/stashes/${id}`, { method: "DELETE" }),

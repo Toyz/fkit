@@ -19,6 +19,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/repos", get(list_repos).post(create_repo))
         .route("/users/{username}", get(get_profile))
+        .route("/users/{username}/activity", get(get_activity))
         .route("/repos/{owner}/{name}", get(get_repo))
         .route("/repos/{owner}/{name}", patch(update_repo))
         .route("/repos/{owner}/{name}", delete(delete_repo))
@@ -1464,4 +1465,174 @@ async fn remove_collaborator(
     super::audit(&state, viewer.id(), Some(repo.id), "collaborator.remove",
         serde_json::json!({ "username": username })).await;
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+
+/* ------------------------------------------------------------------ activity */
+
+/// A day somebody pushed something.
+#[derive(Debug, Serialize)]
+struct DayView {
+    date: chrono::NaiveDate,
+    count: i64,
+    /// The repository that took most of that day's commits, as `owner/name`.
+    ///
+    /// One name rather than a breakdown: the grid tints a square by it, and a
+    /// square is four pixels wide. Ties go to whichever the database returned
+    /// first, which is arbitrary and does not matter -- on a day split evenly
+    /// between two projects, either answer is true.
+    repo: String,
+}
+
+/// What somebody has pushed, by day.
+#[derive(Debug, Serialize)]
+struct Activity {
+    /// The window, inclusive. The client draws every day in it, including the
+    /// empty ones, so it needs the bounds rather than inferring them from the
+    /// days that happen to be present.
+    since: chrono::NaiveDate,
+    until: chrono::NaiveDate,
+    total: i64,
+    /// The busiest single day, so the client can scale its shading against
+    /// this person's own year rather than against a number picked in advance.
+    busiest: i64,
+    /// Only the days with something on them. A year is 365 entries and most of
+    /// them are noughts.
+    days: Vec<DayView>,
+}
+
+/// `GET /users/{username}/activity` -- a year of pushes, day by day.
+///
+/// # Whose, and when
+///
+/// These are known in different ways and the graph should not blur them.
+///
+/// *Whose* is authenticated. `commit_authors` records the account that
+/// delivered a commit, because the push carried a session or a token and the
+/// server therefore knows -- an author string is content, and content is
+/// whatever its writer typed. A token with `attributes` off records nothing,
+/// which is the point of that switch: a mirror's traffic leaves no mark here.
+///
+/// *When* is the commit's own timestamp, which is claimed rather than
+/// observed. It is used anyway, because the alternative is worse: bucketing by
+/// arrival draws a five-year import as one enormous Tuesday and a fortnight of
+/// offline work as a fortnight of nothing. Claimed time is the only record of
+/// when work happened, and an imported history did happen on the days it says.
+///
+/// It is clamped to the push, though. A commit cannot have been written after
+/// it was delivered, so a timestamp past its own `pushed_at` is a clock that
+/// is wrong or a claim that is false, and either way today is the honest
+/// answer. Backdating within that bound remains possible, exactly as it is in
+/// git, and no amount of arithmetic here would change that.
+///
+/// # What it must not leak
+///
+/// Everything, if the visibility filter is skipped. A grid built from every
+/// commit an account pushed would publish the shape of its private work --
+/// which days somebody was busy, and how busy, on repositories the viewer is
+/// not allowed to know exist. That is why the counts are assembled per
+/// repository and then filtered, rather than summed in SQL: a total is not
+/// something you can redact after the fact.
+async fn get_activity(
+    State(state): State<AppState>,
+    viewer: Viewer,
+    Path(username): Path<String>,
+) -> AppResult<Json<Activity>> {
+    if state.policy().require_auth {
+        viewer.require()?;
+    }
+
+    let username = username.trim().to_ascii_lowercase();
+    let owner: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM users WHERE username = $1 AND is_active = TRUE")
+            .bind(&username)
+            .fetch_optional(&state.db)
+            .await?;
+    let Some((owner_id,)) = owner else {
+        return Err(AppError::NotFound(format!("no user named {username}")));
+    };
+
+    let until = chrono::Utc::now().date_naive();
+    // A year back, then out to the start of that week, so the first column of
+    // the grid is a whole one rather than a stub of two days.
+    let since = until - chrono::Duration::days(364);
+    let back = chrono::Datelike::weekday(&since).num_days_from_sunday() as i64;
+    let since = since - chrono::Duration::days(back);
+
+    // Grouped by repository as well as by day, because the filtering below is
+    // per repository and a day's total cannot be split up after it is summed.
+    // A commit whose repository is gone has no visibility to check, so it is
+    // dropped rather than guessed at.
+    let rows: Vec<(chrono::NaiveDate, Uuid, i64)> = sqlx::query_as(
+        "SELECT (LEAST(COALESCE(committed_at, pushed_at), pushed_at)
+                   AT TIME ZONE 'UTC')::date AS day,
+                repo_id, count(*)
+           FROM commit_authors
+          WHERE user_id = $1
+            AND repo_id IS NOT NULL
+            AND LEAST(COALESCE(committed_at, pushed_at), pushed_at) >= $2
+          GROUP BY day, repo_id",
+    )
+    .bind(owner_id)
+    .bind(
+        since
+            .and_hms_opt(0, 0, 0)
+            .unwrap_or_default()
+            .and_utc(),
+    )
+    .fetch_all(&state.db)
+    .await?;
+
+    // Which of those repositories may this viewer be told about at all.
+    let mut ids: Vec<Uuid> = rows.iter().map(|(_, id, _)| *id).collect();
+    ids.sort();
+    ids.dedup();
+
+    let repos: Vec<RepoWithOwner> = sqlx::query_as(
+        "SELECT r.*, u.username FROM repos r
+         JOIN users u ON u.id = r.owner_id
+         WHERE r.id = ANY($1)",
+    )
+    .bind(&ids)
+    .fetch_all(&state.db)
+    .await?;
+
+    let (uid, admin, can_write) = match &viewer.user {
+        Some(u) => (Some(u.id), u.is_admin, u.can_write),
+        None => (None, false, false),
+    };
+
+    let mut visible: std::collections::HashMap<Uuid, String> = std::collections::HashMap::new();
+    for row in repos {
+        let access =
+            resolve(&state.db, &row.repo, uid, admin, can_write, state.policy().require_auth)
+                .await?;
+        if access.can_read() {
+            visible.insert(row.repo.id, format!("{}/{}", row.username, row.repo.name));
+        }
+    }
+
+    // Per day: the running total, and the repository holding the most of it.
+    let mut by_day: std::collections::BTreeMap<chrono::NaiveDate, (i64, i64, String)> =
+        std::collections::BTreeMap::new();
+    for (day, repo_id, n) in rows {
+        let Some(full_name) = visible.get(&repo_id) else {
+            continue;
+        };
+        let slot = by_day.entry(day).or_insert_with(|| (0, 0, String::new()));
+        slot.0 += n;
+        if n > slot.1 {
+            slot.1 = n;
+            slot.2 = full_name.clone();
+        }
+    }
+
+    let total: i64 = by_day.values().map(|(n, _, _)| *n).sum();
+    let busiest: i64 = by_day.values().map(|(n, _, _)| *n).max().unwrap_or(0);
+    let days = by_day
+        .into_iter()
+        .map(|(date, (count, _, repo))| DayView { date, count, repo })
+        .collect();
+
+    Ok(Json(Activity { since, until, total, busiest, days }))
 }
