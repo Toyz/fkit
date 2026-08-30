@@ -40,6 +40,14 @@ pub struct AppState {
     /// rather than inferred: by the time anyone has the `Arc`, the config that
     /// chose between one tier and two is gone.
     pub cache_backend: String,
+    /// `owner/name` of the repository holding this server's own history.
+    pub self_repo: String,
+    /// The fkit commit this build corresponds to, once it has been looked for.
+    ///
+    /// Cached because the answer cannot change while the process runs -- the
+    /// build is the build -- and because finding it means reading commit
+    /// objects, which is not work to repeat for every page footer.
+    pub build: Arc<tokio::sync::OnceCell<Option<String>>>,
 }
 
 impl AppState {

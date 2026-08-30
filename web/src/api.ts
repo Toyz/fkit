@@ -698,6 +698,19 @@ export interface AdminStats {
 
 export interface Meta {
   site_name?: string;
+  /** The release this server is running. */
+  version?: string;
+  /**
+   * The fkit commit this build corresponds to, as a full hash.
+   *
+   * Found rather than stamped: the mirror that produces it runs after the
+   * image is built, so the hash does not exist at build time. Null when the
+   * server could not match itself, which is the ordinary case for a local
+   * build or a fork.
+   */
+  build?: string | null;
+  /** `owner/name` of the repository that hash lives in, for the link. */
+  self_repo?: string | null;
   email_enabled?: boolean;
   open_registration: boolean;
   require_auth: boolean;

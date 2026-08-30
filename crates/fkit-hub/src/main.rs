@@ -112,6 +112,8 @@ async fn main() -> Result<()> {
         object_cache,
         blob_cache,
         cache_backend,
+        self_repo: cfg.self_repo.clone(),
+        build: Default::default(),
     };
 
     let api = Router::new()

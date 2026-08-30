@@ -102,8 +102,13 @@ async fn meta(State(state): State<AppState>) -> Json<serde_json::Value> {
         .await
         .unwrap_or(false);
 
+    let build = build_commit(&state).await;
+
     Json(serde_json::json!({
         "site_name": p.site_name,
+        "version": env!("CARGO_PKG_VERSION"),
+        "build": build,
+        "self_repo": (!state.self_repo.is_empty()).then(|| state.self_repo.clone()),
         "email_enabled": p.email_configured(),
         "open_registration": p.open_registration,
         "require_auth": p.require_auth,
@@ -934,4 +939,95 @@ async fn revoke_token(
     }
     super::audit(&state, Some(u.id), None, "token.revoke", serde_json::json!({ "id": id })).await;
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// Which fkit commit this server is running, in fkit's own terms.
+///
+/// # Why this is looked up rather than stamped in
+///
+/// fkit is developed in one version control system and mirrors that history
+/// into a repository on this server, one commit for one commit, each carrying
+/// a `git <sha>` trailer naming where it came from. The mirror runs *after*
+/// the image is built, using the fkit binary out of that image, so at the
+/// moment a build would want to record its own fkit hash, that hash does not
+/// exist yet. It cannot be stamped in. It can only be found afterwards.
+///
+/// So the binary carries the one identifier it can know at build time, the
+/// upstream revision it was built from, and that is used purely as a lookup
+/// key. It is never displayed: a program whose whole premise is that a digest
+/// names one exact state should not label its own build with a foreign hash.
+///
+/// # What it will not say
+///
+/// Anything at all, unless the repository is public. `/meta` is
+/// unauthenticated, and an operator who points this at a private repository
+/// should not thereby publish one of its hashes to everyone who loads a page.
+///
+/// The walk is bounded, and the answer is cached for the life of the process,
+/// which is exactly as long as it can possibly stay true.
+async fn build_commit(state: &AppState) -> Option<String> {
+    state
+        .build
+        .get_or_init(|| async { find_build(state).await })
+        .await
+        .clone()
+}
+
+async fn find_build(state: &AppState) -> Option<String> {
+    let key = env!("FKIT_COMMIT");
+    if key.is_empty() || state.self_repo.is_empty() {
+        return None;
+    }
+    let (owner, name) = state.self_repo.split_once('/')?;
+
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        id: uuid::Uuid,
+        network_id: uuid::Uuid,
+        default_branch: String,
+        visibility: String,
+    }
+    let repo: Row = sqlx::query_as(
+        "SELECT r.id, r.network_id, r.default_branch, r.visibility
+           FROM repos r JOIN users u ON u.id = r.owner_id
+          WHERE u.username = $1 AND r.name = $2",
+    )
+    .bind(owner.trim().to_ascii_lowercase())
+    .bind(name.trim().to_ascii_lowercase())
+    .fetch_optional(&state.db)
+    .await
+    .ok()??;
+
+    if repo.visibility != "public" {
+        return None;
+    }
+
+    let (target,): (Vec<u8>,) =
+        sqlx::query_as("SELECT target FROM refs WHERE repo_id = $1 AND name = $2")
+            .bind(repo.id)
+            .bind(&repo.default_branch)
+            .fetch_optional(&state.db)
+            .await
+            .ok()??;
+
+    let bytes = <[u8; 32]>::try_from(target.as_slice()).ok()?;
+    let store = state.store_for_network(repo.network_id).ok()?;
+
+    // Newest first, because the build being asked about is nearly always the
+    // most recently mirrored one. The bound is what stops a server whose
+    // revision was never mirrored -- a local build, a fork -- from reading its
+    // entire history to discover that, once.
+    const MAX: usize = 4_000;
+    let needle = format!("git {key}");
+    let mut at = fkit_core::Hash(bytes);
+    for _ in 0..MAX {
+        let fkit_core::Object::Commit(c) = store.get(at).ok()? else {
+            return None;
+        };
+        if c.message.contains(&needle) {
+            return Some(at.to_hex());
+        }
+        at = *c.parents.first()?;
+    }
+    None
 }

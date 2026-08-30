@@ -53,8 +53,15 @@ const shell = css`
     min-height: calc(100vh - 140px);
   }
 
-  footer { border-top: 1px solid var(--border); padding: 10px 0; color: var(--faint); font-size: 11px; }
-  footer .wrap { display: flex; gap: 16px; flex-wrap: wrap; }
+  footer { border-top: 1px solid var(--border); padding: 11px 0; color: var(--faint); font-size: 11px; }
+  footer .wrap { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
+  footer .fill { flex: 1; }
+  footer .who { color: var(--muted); }
+  footer a { color: var(--faint); text-decoration: none; }
+  footer a:hover { color: var(--accent); text-decoration: underline; }
+  /* The build, set as what it is: a version and a hash. */
+  footer .build { font-family: var(--mono); display: inline-flex; gap: 7px; }
+  footer .sha { color: var(--muted); }
 `;
 
 @component("fkit-app")
@@ -121,6 +128,15 @@ export class FkitApp extends LoomElement {
 
   update() {
     const u = this.user;
+    // Where this build can be read, when the server was able to find itself.
+    const build =
+      this.meta?.build && this.meta?.self_repo
+        ? {
+            hash: this.meta.build,
+            href: `/${this.meta.self_repo}/commit/${this.meta.build}`,
+          }
+        : null;
+
     return (
       <div>
         <header>
@@ -162,10 +178,56 @@ export class FkitApp extends LoomElement {
           <loom-outlet></loom-outlet>
         </main>
 
+        {/* What this server is, and what it is running.
+            It used to carry a tagline and a clone command with the words
+            "owner/repo" in it -- a line nobody could run, explaining the site
+            on every page of it. The masthead on the front page says what fkit
+            is, once, to the people who have not been told. A footer is for the
+            facts about this particular server, and the useful one is which
+            build you are looking at: a self-hosted thing is deployed from
+            whatever was on the branch that day, and "which version is this"
+            is the first question anybody asks when something is wrong. */}
         <footer>
           <div class="wrap">
-            <span>content-addressed version control</span>
-            <span>fkit clone {location.protocol === "https:" ? "wss" : "ws"}://{location.host}/owner/repo</span>
+            <span class="who">{this.meta?.site_name || "fkit"}</span>
+            <span class="fill"></span>
+            {/* Its own repository, on its own server, when it holds one. A
+                forge that hosts its own source should not send you somewhere
+                else to read it; upstream is the fallback for an instance that
+                does not mirror. */}
+            {this.meta?.self_repo ? (
+              <a
+                href={`/${this.meta.self_repo}`}
+                onClick={linkHandler(`/${this.meta.self_repo}`)}
+              >
+                source
+              </a>
+            ) : (
+              <a href="https://github.com/Toyz/fkit" rel="noreferrer noopener" target="_blank">
+                source
+              </a>
+            )}
+            {this.meta?.version ? (
+              <span class="build">
+                {this.meta.version}
+                {/* The build, named the way this program names everything: by
+                    the hash of the commit it is, in the repository that holds
+                    it, on this server. It links to its own commit page, which
+                    is the point -- the software can be read from inside
+                    itself. Absent when the server could not match its own
+                    build, which is ordinary for a local one. */}
+                {build ? (
+                  <a
+                    class="sha"
+                    href={build.href}
+                    onClick={linkHandler(build.href)}
+                    title={`This server is running ${build.hash}`}
+                  >
+                    {build.hash.slice(0, 10)}
+                  </a>
+                ) : null}
+              </span>
+            ) : null}
           </div>
         </footer>
       </div>

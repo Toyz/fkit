@@ -112,6 +112,9 @@ struct ServerSection {
     require_auth: Option<bool>,
     /// Visibility applied to a new repository when the request does not say.
     default_repo_visibility: Option<String>,
+    /// The repository on this server that holds fkit's own history, as
+    /// `owner/name`. Set it to nothing to turn the footer's build link off.
+    self_repo: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -189,6 +192,18 @@ pub struct Config {
     pub open_registration: bool,
     pub require_auth: bool,
     pub default_repo_visibility: String,
+    /// Where this server's own source lives, on this server.
+    ///
+    /// fkit mirrors its git history into a repository here, and every mirrored
+    /// commit carries a `git <sha>` trailer naming the commit it came from. The
+    /// binary knows which git commit built it, so the pair is enough to find
+    /// the fkit commit this server is running -- and to say so in fkit's own
+    /// terms rather than another version control system's.
+    ///
+    /// It has to be found rather than stamped in. The mirror runs after the
+    /// image is built, using the fkit binary out of that image, so the hash
+    /// does not exist yet at the moment a build would want to record it.
+    pub self_repo: String,
     pub max_connections: u32,
     pub max_inline_blob: u64,
     pub max_push_bytes: u64,
@@ -222,6 +237,7 @@ impl Default for Config {
             cache_memory_bytes: fkit_core::cache::DEFAULT_CAPACITY,
             cache_ttl_secs: fkit_core::cache::DEFAULT_TTL.as_secs(),
             cache_redis_url: None,
+            self_repo: "helba/fkit".into(),
             open_registration: true,
             require_auth: false,
             default_repo_visibility: "private".into(),
@@ -295,6 +311,7 @@ impl Config {
         if let Some(v) = f.server.web_dir { self.web_dir = v }
         if let Some(v) = f.server.secure_cookies { self.secure_cookies = v }
         if let Some(v) = f.server.trust_proxy { self.trust_proxy = v }
+        if let Some(v) = &f.server.self_repo { self.self_repo = v.clone() }
         // The old spelling first, so the new one wins if somehow both are set.
         if let Some(v) = f.cache.memory_mb {
             self.cache_memory_bytes = v * 1024 * 1024;
@@ -348,6 +365,7 @@ impl Config {
         // to silently fail. All three read the same way now.
         if let Some(v) = flag_env("FKIT_SECURE_COOKIES") { self.secure_cookies = v }
         if let Some(v) = flag_env("FKIT_TRUST_PROXY") { self.trust_proxy = v }
+        if let Ok(v) = std::env::var("FKIT_SELF_REPO") { self.self_repo = v }
         // A cache URL is a piece of infrastructure wiring, so the environment
         // is where a container-run server will most naturally set it.
         if let Ok(v) = std::env::var("FKIT_CACHE_REDIS_URL")
