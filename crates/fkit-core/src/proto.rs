@@ -258,7 +258,7 @@ impl Msg {
             Msg::Welcome { .. } => "Welcome",
             Msg::PushRef { .. } => "PushRef",
             Msg::PushStash { .. } => "PushStash",
-            Msg::ListStashes { .. } => "ListStashes",
+            Msg::ListStashes => "ListStashes",
             Msg::StashList { .. } => "StashList",
             Msg::PullStash { .. } => "PullStash",
             Msg::DropStash { .. } => "DropStash",
@@ -266,7 +266,7 @@ impl Msg {
             Msg::RefIs { .. } => "RefIs",
             Msg::Want { .. } => "Want",
             Msg::Objects { .. } => "Objects",
-            Msg::Done { .. } => "Done",
+            Msg::Done => "Done",
             Msg::Ok { .. } => "Ok",
             Msg::Error { .. } => "Error",
         }
