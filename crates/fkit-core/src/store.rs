@@ -282,6 +282,16 @@ impl Store {
     /// Store an object, returning its id. Idempotent: storing the same object
     /// twice is a no-op the second time.
     pub fn put(&self, obj: &Object) -> Result<(Hash, WriteStats)> {
+        self.put_based(obj, None)
+    }
+
+    /// Store an object, offering `base` as something it may be a small edit
+    /// away from.
+    ///
+    /// A hint and nothing more: the pack decides whether a patch against it is
+    /// actually smaller, and stores the object whole when it is not. Callers
+    /// never have to be right, only plausible.
+    pub fn put_based(&self, obj: &Object, base: Option<Hash>) -> Result<(Hash, WriteStats)> {
         let body = obj.encode();
         let mut file = Vec::with_capacity(body.len() + 1);
         file.push(obj.kind().tag());
@@ -289,7 +299,7 @@ impl Store {
         let id = Hash(*blake3::hash(&file).as_bytes());
         debug_assert_eq!(id, obj.id(), "store framing must match Object::id()");
 
-        self.put_raw(id, &file)
+        self.put_raw_based(id, &file, base)
     }
 
     /// Store pre-framed bytes under a claimed id — the path used when receiving
@@ -300,6 +310,16 @@ impl Store {
     /// that does not hash to those bytes, so a verified root hash pins every
     /// byte beneath it.
     pub fn put_raw(&self, claimed: Hash, framed: &[u8]) -> Result<(Hash, WriteStats)> {
+        self.put_raw_based(claimed, framed, None)
+    }
+
+    /// As `put_raw`, with a hint about what this object may be a patch against.
+    pub fn put_raw_based(
+        &self,
+        claimed: Hash,
+        framed: &[u8],
+        base: Option<Hash>,
+    ) -> Result<(Hash, WriteStats)> {
         let actual = Hash(*blake3::hash(framed).as_bytes());
         if actual != claimed {
             bail!(
@@ -316,7 +336,7 @@ impl Store {
         {
             let mut slot = self.pack.lock().unwrap();
             if let Some(pack) = slot.as_mut() {
-                let wrote = pack.put(actual, framed)?;
+                let wrote = pack.put_based(actual, framed, base)?;
                 return Ok((
                     actual,
                     if wrote {
@@ -579,8 +599,14 @@ impl<'a> Sink<'a> {
     }
 
     pub fn put(&self, obj: &Object) -> Result<(Hash, WriteStats)> {
+        self.put_based(obj, None)
+    }
+
+    /// Store an object, offering `base` as a likely predecessor. See
+    /// [`Store::put_based`].
+    pub fn put_based(&self, obj: &Object, base: Option<Hash>) -> Result<(Hash, WriteStats)> {
         if !self.dry {
-            return self.store.put(obj);
+            return self.store.put_based(obj, base);
         }
         let id = obj.id();
         let size = obj.encode().len() as u64 + 1; // +1 for the framing tag

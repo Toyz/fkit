@@ -398,9 +398,26 @@ impl Repo {
     }
 
     /// Hash the working tree and persist every object.
+    ///
+    /// The tree at HEAD is handed to ingest as the version this one is a
+    /// revision of, so each chunk can be stored as a patch against whatever
+    /// occupied its position before. That is only ever a hint: a first commit
+    /// has none, and a wrong guess is noticed and discarded by the pack.
     pub fn snapshot_writing(&self) -> Result<crate::ingest::Ingested> {
-        ingest_dir(&Sink::writing(&self.store), &self.root, &self.ignore(), &self.mounts()?)
+        let prior = self.head_tree().unwrap_or(None);
+        let prior = match prior {
+            Some(root) => crate::ingest::Prior::at(&self.store, root),
+            None => crate::ingest::Prior::none(),
+        };
+        crate::ingest::ingest_dir_after(
+            &Sink::writing(&self.store),
+            &self.root,
+            &self.ignore(),
+            &self.mounts()?,
+            &prior,
+        )
     }
+
 
     /// Submodule pins as currently recorded beside this repository.
     ///

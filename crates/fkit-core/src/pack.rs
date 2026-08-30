@@ -323,24 +323,89 @@ impl Pack {
         Ok(Some(buf))
     }
 
+    /// The payload of an object exactly as it sits in its segment.
+    fn stored_bytes(&self, loc: &Located) -> Option<Vec<u8>> {
+        let path = self.names.get(&loc.segment)?;
+        let mut f = File::open(path).ok()?;
+        f.seek(SeekFrom::Start(loc.offset)).ok()?;
+        let mut buf = vec![0u8; loc.stored as usize];
+        f.read_exact(&mut buf).ok()?;
+        Some(buf)
+    }
+
+    /// Append an object's stored form verbatim, keeping how it was encoded.
+    ///
+    /// For relocation only. The bytes are already whatever they are -- literal,
+    /// compressed, or a patch -- and this must not change that, because a patch
+    /// re-encoded as a literal is a patch destroyed.
+    fn put_stored(&mut self, id: Hash, payload: &[u8], flags: u8, raw: u32) -> Result<bool> {
+        if self.index.contains(id) {
+            return Ok(false);
+        }
+        self.ensure_segment(payload.len() as u64)?;
+        let (seg_id, seg, idx, offset) = self.current.as_mut().expect("segment open");
+        seg.write_all(payload)?;
+        seg.flush()?;
+
+        let mut entry = Vec::with_capacity(IDX_ENTRY);
+        entry.extend_from_slice(&id.0);
+        entry.extend_from_slice(&offset.to_le_bytes());
+        entry.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        entry.extend_from_slice(&raw.to_le_bytes());
+        entry.push(flags);
+        idx.write_all(&entry)?;
+        idx.flush()?;
+
+        let loc = Located {
+            segment: *seg_id,
+            offset: *offset,
+            stored: payload.len() as u32,
+            raw,
+            flags,
+        };
+        *offset += payload.len() as u64;
+        self.index.insert(id, loc);
+        Ok(true)
+    }
+
     /// Append `framed` under `id`. Returns false if it was already packed.
     pub fn put(&mut self, id: Hash, framed: &[u8]) -> Result<bool> {
         self.put_based(id, framed, None)
     }
 
-    /// An object this one is probably a small edit away from.
+    /// The object a new one should be stored as a patch against.
     ///
-    /// Returns the base's bytes only if it is stored *literally*. That single
-    /// condition is what keeps depth at one: a patch never names a patch, so
-    /// reading is fetch-base then apply, with nothing to walk and no limit to
-    /// enforce. It also means a base can always be read without reading
-    /// anything else, which is what makes the recursion in `get` safe.
-    fn literal_base(&self, base: Hash) -> Option<Vec<u8>> {
+    /// Given what occupied this position in the previous version, returns an
+    /// anchor: that object if it is stored literally, or *its* base if it is
+    /// itself a patch. One hop, never more, because a patch's base is always
+    /// literal -- which is the invariant this function exists to maintain.
+    ///
+    /// Following that hop is the whole difference between re-anchoring every
+    /// second version and holding one anchor for as long as it keeps paying.
+    /// Refusing to patch against a patch would force literal, patch, literal,
+    /// patch down the history and throw away half the saving; hopping instead
+    /// lets a run of revisions all diff against the same literal, and the size
+    /// check in `squeeze_delta` re-anchors on its own once drift has made the
+    /// patch no longer worth it. Depth stays at one either way.
+    fn anchor_for(&self, base: Hash) -> Option<(Hash, Vec<u8>)> {
         let loc = self.index.get(base)?;
-        if loc.is_delta() {
-            return None;
+        if !loc.is_delta() {
+            return Some((base, self.get(base).ok().flatten()?));
         }
-        self.get(base).ok().flatten()
+        let anchor = self.base_named_by(&loc)?;
+        // A patch always names a literal, so this cannot recurse further.
+        debug_assert!(!self.index.get(anchor)?.is_delta());
+        Some((anchor, self.get(anchor).ok().flatten()?))
+    }
+
+    /// The base a stored patch names, read from the front of its payload.
+    fn base_named_by(&self, loc: &Located) -> Option<Hash> {
+        let path = self.names.get(&loc.segment)?;
+        let mut f = File::open(path).ok()?;
+        f.seek(SeekFrom::Start(loc.offset)).ok()?;
+        let mut name = [0u8; HASH_LEN];
+        f.read_exact(&mut name).ok()?;
+        Some(Hash(name))
     }
 
     /// Append `framed` under `id`, storing it as a patch against `base` when
@@ -355,9 +420,12 @@ impl Pack {
         }
 
         let patch = base.filter(|b| *b != id).and_then(|b| {
-            let bytes = self.literal_base(b)?;
+            let (anchor, bytes) = self.anchor_for(b)?;
+            if anchor == id {
+                return None;
+            }
             let mut p = squeeze_delta(framed, &bytes)?;
-            p[..HASH_LEN].copy_from_slice(&b.0);
+            p[..HASH_LEN].copy_from_slice(&anchor.0);
             Some(p)
         });
 
@@ -533,17 +601,29 @@ impl Pack {
     pub fn compact(&mut self, segments: &[u32], keep: &std::collections::HashSet<Hash>) -> Result<CompactStats> {
         let mut stats = CompactStats::default();
 
-        // Read everything we intend to preserve *before* touching the originals.
-        let mut carry: Vec<(Hash, Vec<u8>)> = Vec::new();
+        // Read everything we intend to preserve *before* touching the
+        // originals -- and read it exactly as it is stored.
+        //
+        // Materializing here and writing the result back would silently undo
+        // every patch in these segments: expanding a patch yields the whole
+        // object, and storing that again with no base makes it literal. Since
+        // this runs whenever a repository has collected a couple of dozen
+        // segments, that quietly flattened almost everything back to whole
+        // copies as fast as it was written.
+        //
+        // Compaction moves bytes. It does not re-encode them. That keeps the
+        // patches, and is also less work than decompressing and recompressing
+        // every object in the store.
+        let mut carry: Vec<(Hash, Vec<u8>, u8, u32)> = Vec::new();
         for seg in segments {
             for id in self.ids_in(*seg) {
                 let Some(loc) = self.index.get(id) else { continue };
                 stats.examined += 1;
                 if keep.contains(&id) {
-                    let bytes = self
-                        .get(id)?
-                        .with_context(|| format!("object {} vanished mid-compaction", id.short()))?;
-                    carry.push((id, bytes));
+                    let bytes = self.stored_bytes(&loc).with_context(|| {
+                        format!("object {} vanished mid-compaction", id.short())
+                    })?;
+                    carry.push((id, bytes, loc.flags, loc.raw));
                 } else {
                     stats.dropped += 1;
                     stats.reclaimed += loc.stored as u64;
@@ -566,8 +646,8 @@ impl Pack {
         // Force a fresh segment so survivors never land back in a file we are
         // about to delete.
         self.current = None;
-        for (id, bytes) in carry {
-            self.put(id, &bytes)?;
+        for (id, bytes, flags, raw) in carry {
+            self.put_stored(id, &bytes, flags, raw)?;
             stats.kept += 1;
         }
         self.sync()?;

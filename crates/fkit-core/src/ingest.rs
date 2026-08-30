@@ -55,6 +55,145 @@ pub struct Ingested {
 /// The root hash commits to every byte in the file. Two files with identical
 /// contents get the same root hash even if they have different names, live in
 /// different repos, or were committed by different people a decade apart.
+/// What a path held in the commit this one is built on.
+///
+/// This is the whole reason fkit can patch without guessing. Git has to *hunt*
+/// for something to delta against -- it sorts objects by type, size and a hash
+/// of the path, then slides a window looking for a candidate, because a
+/// packfile is a bag of blobs with no record of which are versions of which.
+/// A tree already knows. When `src/foo.c` is ingested, the parent commit's tree
+/// says exactly which chunks were there last time, in order, and the chunk at
+/// position *i* is overwhelmingly the predecessor of the new chunk at position
+/// *i*. No search, no heuristic, no window.
+///
+/// Lookups happen once per file and only for files being written, so there is
+/// nothing to cache and nothing to invalidate.
+pub struct Prior<'a> {
+    store: Option<&'a Store>,
+    root: Option<Hash>,
+}
+
+impl<'a> Prior<'a> {
+    /// No previous version: every object is stored whole. What a first commit
+    /// gets, and what every caller that has not been taught about this gets.
+    pub fn none() -> Prior<'a> {
+        Prior { store: None, root: None }
+    }
+
+    /// The tree of the commit being built on.
+    pub fn at(store: &'a Store, root: Hash) -> Prior<'a> {
+        Prior { store: Some(store), root: Some(root) }
+    }
+
+    /// The chunks that `rel` was made of last time, in order.
+    ///
+    /// Empty for a new file, a path that was a directory, or anything this
+    /// cannot resolve -- all of which simply mean "store it whole", so no error
+    /// is worth raising. A wrong answer here costs a few bytes, never
+    /// correctness: the pack verifies that a patch is smaller before keeping
+    /// it, and every reader verifies the hash after materializing.
+    pub fn chunks_for(&self, rel: &str) -> Vec<Hash> {
+        let (Some(store), Some(root)) = (self.store, self.root) else {
+            return Vec::new();
+        };
+        let mut at = root;
+        let mut parts = rel.split('/').peekable();
+        while let Some(name) = parts.next() {
+            let Ok(entries) = read_entries(store, at) else {
+                return Vec::new();
+            };
+            let Some(e) = entries.into_iter().find(|e| e.name == name) else {
+                return Vec::new();
+            };
+            if parts.peek().is_some() {
+                if e.kind != EntryKind::Dir {
+                    return Vec::new();
+                }
+                at = e.hash;
+            } else {
+                return match e.kind {
+                    EntryKind::File { .. } | EntryKind::Symlink => leaves(store, e.hash),
+                    _ => Vec::new(),
+                };
+            }
+        }
+        Vec::new()
+    }
+}
+
+impl Prior<'_> {
+    /// The `Entries` runs that directory held last time, in order.
+    ///
+    /// A directory listing is the thing that actually churns: change one file
+    /// and every directory from it to the root is rewritten, even though a
+    /// single 32-byte hash moved. Runs are cut content-defined, exactly like a
+    /// file's chunks, so run *i* is the predecessor of run *i* for the same
+    /// reason.
+    ///
+    /// `""` is the root.
+    pub fn entries_for(&self, dir: &str) -> Vec<Hash> {
+        let (Some(store), Some(root)) = (self.store, self.root) else {
+            return Vec::new();
+        };
+        let mut at = root;
+        if !dir.is_empty() {
+            for name in dir.split('/') {
+                let Ok(entries) = read_entries(store, at) else {
+                    return Vec::new();
+                };
+                match entries.into_iter().find(|e| e.name == name) {
+                    Some(e) if e.kind == EntryKind::Dir => at = e.hash,
+                    _ => return Vec::new(),
+                }
+            }
+        }
+        runs_of(store, at)
+    }
+}
+
+/// A tree's `Entries` objects, left to right.
+fn runs_of(store: &Store, root: Hash) -> Vec<Hash> {
+    let mut out = Vec::new();
+    let mut stack = vec![root];
+    while let Some(h) = stack.pop() {
+        match store.get(h) {
+            Ok(Object::Tree { level, children }) => {
+                if level == 0 {
+                    out.extend(children.into_iter().map(|c| c.hash));
+                } else {
+                    stack.extend(children.into_iter().rev().map(|c| c.hash));
+                }
+            }
+            _ => return out,
+        }
+    }
+    out
+}
+
+/// A file's chunk hashes, left to right.
+///
+/// Bounded by the same limit the rest of the walk uses: a file node cannot name
+/// more children than fit in an object, so this cannot run away.
+fn leaves(store: &Store, root: Hash) -> Vec<Hash> {
+    let mut out = Vec::new();
+    let mut stack = vec![root];
+    while let Some(h) = stack.pop() {
+        match store.get(h) {
+            Ok(Object::File { level, children }) => {
+                if level == 0 {
+                    out.extend(children.into_iter().map(|(c, _)| c));
+                } else {
+                    // Reversed, because the stack pops last-in-first-out and
+                    // the order of chunks is the whole point.
+                    stack.extend(children.into_iter().rev().map(|(c, _)| c));
+                }
+            }
+            _ => return out,
+        }
+    }
+    out
+}
+
 pub fn ingest_file(sink: &Sink, path: &Path) -> Result<Ingested> {
     let f = fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
     ingest_reader(sink, std::io::BufReader::new(f))
@@ -65,14 +204,30 @@ pub fn ingest_bytes(sink: &Sink, bytes: &[u8]) -> Result<Ingested> {
 }
 
 pub fn ingest_reader<R: std::io::Read>(sink: &Sink, reader: R) -> Result<Ingested> {
+    ingest_reader_after(sink, reader, &[])
+}
+
+/// Ingest, knowing what this file was made of last time.
+///
+/// `was` is the previous version's chunks in order. The chunk arriving at
+/// position *i* is offered `was[i]` as something it may be a small edit away
+/// from -- which is right far more often than not, because content-defined
+/// boundaries only move where the content moved. Where it is wrong the pack
+/// notices the patch is not smaller and stores the object whole, so a bad
+/// guess costs a little work and never correctness.
+pub fn ingest_reader_after<R: std::io::Read>(
+    sink: &Sink,
+    reader: R,
+    was: &[Hash],
+) -> Result<Ingested> {
     let mut stats = WriteStats::default();
 
     // Pass 1: cut into content-defined chunks and store each leaf.
     let mut level_refs: Vec<(Hash, u64)> = Vec::new();
-    for chunk in Chunker::new(reader) {
+    for (i, chunk) in Chunker::new(reader).enumerate() {
         let chunk = chunk?;
         let len = chunk.len() as u64;
-        let (h, st) = sink.put(&Object::Chunk(chunk))?;
+        let (h, st) = sink.put_based(&Object::Chunk(chunk), was.get(i).copied())?;
         stats.merge(st);
         level_refs.push((h, len));
     }
@@ -164,6 +319,15 @@ fn cut_runs(entries: &[TreeEntry]) -> Vec<&[TreeEntry]> {
 /// Mirrors [`ingest_reader`]: cut into runs, store each run, then fold upward
 /// with the same `FANOUT` until one root remains.
 pub fn build_tree(sink: &Sink, entries: Vec<TreeEntry>) -> Result<(Hash, u64, u32)> {
+    build_tree_after(sink, entries, &[])
+}
+
+/// Build a tree, knowing the runs the same directory was made of last time.
+pub fn build_tree_after(
+    sink: &Sink,
+    entries: Vec<TreeEntry>,
+    was: &[Hash],
+) -> Result<(Hash, u64, u32)> {
     debug_assert!(
         entries.windows(2).all(|w| w[0].name <= w[1].name),
         "entries must be sorted before hashing"
@@ -173,9 +337,10 @@ pub fn build_tree(sink: &Sink, entries: Vec<TreeEntry>) -> Result<(Hash, u64, u3
     let total_entries = entries.len() as u32;
 
     let mut level_refs: Vec<TreeChild> = Vec::new();
-    for run in cut_runs(&entries) {
+    for (i, run) in cut_runs(&entries).into_iter().enumerate() {
         let size = run.iter().map(|e| e.size).sum();
-        let (h, _) = sink.put(&Object::Entries(run.to_vec()))?;
+        let (h, _) =
+            sink.put_based(&Object::Entries(run.to_vec()), was.get(i).copied())?;
         level_refs.push(TreeChild { hash: h, entries: run.len() as u32, size });
     }
 
@@ -299,7 +464,7 @@ fn walk(
 }
 
 /// Ingest one job's content. Runs on a worker thread.
-fn run_job(sink: &Sink, job: &Job) -> Result<(String, TreeEntry, WriteStats)> {
+fn run_job(sink: &Sink, job: &Job, prior: &Prior) -> Result<(String, TreeEntry, WriteStats)> {
     let (hash, size, stats, kind) = match job.kind {
         JobKind::Symlink => {
             // Store the link *target* as content. A symlink then costs one small
@@ -309,7 +474,12 @@ fn run_job(sink: &Sink, job: &Job) -> Result<(String, TreeEntry, WriteStats)> {
             (ing.hash, ing.size, ing.stats, EntryKind::Symlink)
         }
         JobKind::File { exec } => {
-            let ing = ingest_file(sink, &job.abs)?;
+            // What this path was made of in the commit being built on, so
+            // each chunk can be offered its own predecessor.
+            let was = prior.chunks_for(&job.rel);
+            let f = fs::File::open(&job.abs)
+                .with_context(|| format!("reading {}", job.abs.display()))?;
+            let ing = ingest_reader_after(sink, std::io::BufReader::new(f), &was)?;
             (ing.hash, ing.size, ing.stats, EntryKind::File { exec })
         }
     };
@@ -326,6 +496,21 @@ pub fn ingest_dir(
     dir: &Path,
     ignore: &Ignore,
     mounts: &Mounts,
+) -> Result<Ingested> {
+    ingest_dir_after(sink, dir, ignore, mounts, &Prior::none())
+}
+
+/// Ingest a directory, knowing the tree it is a revision of.
+///
+/// Everything the previous tree offers is a hint about which chunk each new
+/// chunk is a small edit away from. Pass [`Prior::none`] and this behaves
+/// exactly as it always did.
+pub fn ingest_dir_after(
+    sink: &Sink,
+    dir: &Path,
+    ignore: &Ignore,
+    mounts: &Mounts,
+    prior: &Prior,
 ) -> Result<Ingested> {
     let sk = enumerate(dir, ignore, mounts)?;
 
@@ -349,7 +534,7 @@ pub fn ingest_dir(
                         loop {
                             let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let Some(job) = jobs.get(i) else { break };
-                            mine.push(run_job(sink, job)?);
+                            mine.push(run_job(sink, job, prior)?);
                         }
                         Ok(mine)
                     })
@@ -386,7 +571,7 @@ pub fn ingest_dir(
 
     // Tree building is serial and deterministic: identical contents must give an
     // identical hash no matter how the work was scheduled.
-    let (hash, size) = build_nested(sink, &files, &sk.dirs, "")?;
+    let (hash, size) = build_nested(sink, &files, &sk.dirs, "", prior)?;
     Ok(Ingested { hash, size, stats })
 }
 
@@ -397,6 +582,7 @@ fn build_nested(
     files: &BTreeMap<String, TreeEntry>,
     dirs: &[String],
     prefix: &str,
+    prior: &Prior,
 ) -> Result<(Hash, u64)> {
     let strip = |path: &str| -> Option<String> {
         if prefix.is_empty() {
@@ -429,12 +615,15 @@ fn build_nested(
     for name in subdirs {
         let child_prefix =
             if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
-        let (hash, size) = build_nested(sink, files, dirs, &child_prefix)?;
+        let (hash, size) = build_nested(sink, files, dirs, &child_prefix, prior)?;
         entries.push(TreeEntry { name, kind: EntryKind::Dir, hash, size });
     }
 
     entries.sort_by(|a, b| a.name.cmp(&b.name));
-    let (hash, size, _) = build_tree(sink, entries)?;
+    // What this directory's listing was made of before, so a run that differs
+    // by one entry is stored as the few bytes that differ.
+    let was = prior.entries_for(prefix);
+    let (hash, size, _) = build_tree_after(sink, entries, &was)?;
     Ok((hash, size))
 }
 
