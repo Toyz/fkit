@@ -55,10 +55,21 @@ impl Located {
     pub fn compressed(&self) -> bool {
         self.flags & FLAG_ZSTD != 0
     }
+
+    /// The stored bytes are a patch against another object, whose name is the
+    /// first 32 bytes of the payload.
+    pub fn is_delta(&self) -> bool {
+        self.flags & FLAG_DELTA != 0
+    }
 }
 
 /// `flags` bit 0: the stored bytes are zstd-compressed.
 pub const FLAG_ZSTD: u8 = 1;
+
+/// `flags` bit 1: the stored bytes are a patch against the object named by the
+/// first 32 bytes of the payload. See `pack::FLAG_DELTA` for what that means
+/// and why it never forms a chain.
+pub const FLAG_DELTA: u8 = 2;
 
 /// Encode one record. The layout is on-disk format; do not reorder.
 pub fn encode(id: Hash, loc: &Located) -> [u8; IDX_ENTRY] {

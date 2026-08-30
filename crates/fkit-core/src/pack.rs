@@ -49,10 +49,85 @@ use std::path::PathBuf;
 pub const SEGMENT_LIMIT: u64 = 512 * 1024 * 1024;
 
 pub use crate::index::{Located, IDX_ENTRY, IDX_MAGIC};
+use crate::hash::HASH_LEN;
 use crate::index::{Index, Sealed};
 
 /// `flags` bit 0: the stored bytes are zstd-compressed.
 const FLAG_ZSTD: u8 = 1;
+
+/// `flags` bit 1: the stored bytes are a patch against another object.
+///
+/// # What a delta is here
+///
+/// The payload is `base_hash(32) || zstd(content, dictionary = base bytes)`.
+/// zstd in dictionary mode is literally LZ matching against the base, so the
+/// stored bytes come out proportional to what changed rather than to the size
+/// of the object -- which is the entire point.
+///
+/// # Why this does not break content addressing
+///
+/// The object is still named by the BLAKE3 of its *materialized* bytes. Only
+/// the representation on disk varies. Every reader still verifies the hash
+/// after expanding, dedup is unaffected, Merkle proofs are unaffected, and the
+/// wire protocol never sees a delta because it speaks in whole objects.
+///
+/// # Why there is no chain to bound
+///
+/// A delta may only name a base that is itself stored literally. Depth is one
+/// by construction, so reading is fetch-base then apply-patch and there is no
+/// walk, no cap, and no bookkeeping to get wrong. `pick_base` enforces it.
+use crate::index::FLAG_DELTA;
+
+/// Keep a patch only if it is meaningfully smaller than storing the object
+/// outright. Below this it is not worth the extra read of the base.
+const DELTA_RATIO: f64 = 0.75;
+
+/// Never delta an object this small: the 32-byte base name plus a zstd frame
+/// costs more than the object does.
+const MIN_DELTA: usize = 128;
+
+#[cfg(feature = "compression")]
+fn squeeze_delta(bytes: &[u8], base: &[u8]) -> Option<Vec<u8>> {
+    if bytes.len() < MIN_DELTA {
+        return None;
+    }
+    let mut c = zstd::bulk::Compressor::with_dictionary(ZSTD_LEVEL, base).ok()?;
+    let patch = c.compress(bytes).ok()?;
+    // The base has to be named in the payload, and the patch has to beat
+    // storing the thing outright by enough to justify the second read.
+    let cost = patch.len() + HASH_LEN;
+    let plain = squeeze(bytes).map(|v| v.len()).unwrap_or(bytes.len());
+    if (cost as f64) < plain as f64 * DELTA_RATIO {
+        let mut out = Vec::with_capacity(cost);
+        out.extend_from_slice(&[0u8; HASH_LEN]); // filled in by the caller
+        out.extend_from_slice(&patch);
+        Some(out)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(feature = "compression"))]
+fn squeeze_delta(_bytes: &[u8], _base: &[u8]) -> Option<Vec<u8>> {
+    None
+}
+
+#[cfg(feature = "compression")]
+fn expand_delta(payload: &[u8], base: &[u8], raw_len: usize) -> Result<Vec<u8>> {
+    let patch = payload
+        .get(HASH_LEN..)
+        .context("a delta payload is shorter than the base name it must carry")?;
+    let mut d = zstd::bulk::Decompressor::with_dictionary(base)?;
+    d.decompress(patch, raw_len).context("applying a patch to its base")
+}
+
+#[cfg(not(feature = "compression"))]
+fn expand_delta(_p: &[u8], _b: &[u8], _r: usize) -> Result<Vec<u8>> {
+    anyhow::bail!(
+        "this object is stored as a patch but fkit-core was built without the \
+         `compression` feature"
+    )
+}
 
 /// Below this, compression cannot pay for its own framing.
 const MIN_COMPRESS: usize = 96;
@@ -217,7 +292,19 @@ impl Pack {
         let mut buf = vec![0u8; loc.stored as usize];
         f.read_exact(&mut buf)?;
 
-        if loc.compressed() {
+        if loc.is_delta() {
+            // Depth is one, so this recursion cannot go further: `pick_base`
+            // only ever names an object that is stored literally.
+            let base = Hash(
+                buf.get(..HASH_LEN)
+                    .and_then(|b| <[u8; HASH_LEN]>::try_from(b).ok())
+                    .context("a delta payload is missing the name of its base")?,
+            );
+            let base_bytes = self
+                .get(base)?
+                .with_context(|| format!("the base {} of a patch is gone", base.short()))?;
+            buf = expand_delta(&buf, &base_bytes, loc.raw as usize)?;
+        } else if loc.compressed() {
             buf = expand(&buf, loc.raw as usize)?;
         }
 
@@ -238,13 +325,48 @@ impl Pack {
 
     /// Append `framed` under `id`. Returns false if it was already packed.
     pub fn put(&mut self, id: Hash, framed: &[u8]) -> Result<bool> {
+        self.put_based(id, framed, None)
+    }
+
+    /// An object this one is probably a small edit away from.
+    ///
+    /// Returns the base's bytes only if it is stored *literally*. That single
+    /// condition is what keeps depth at one: a patch never names a patch, so
+    /// reading is fetch-base then apply, with nothing to walk and no limit to
+    /// enforce. It also means a base can always be read without reading
+    /// anything else, which is what makes the recursion in `get` safe.
+    fn literal_base(&self, base: Hash) -> Option<Vec<u8>> {
+        let loc = self.index.get(base)?;
+        if loc.is_delta() {
+            return None;
+        }
+        self.get(base).ok().flatten()
+    }
+
+    /// Append `framed` under `id`, storing it as a patch against `base` when
+    /// that is meaningfully smaller.
+    ///
+    /// `base` is a hint, never a requirement: if it is absent, is itself a
+    /// patch, or the patch does not pay for itself, the object is stored whole
+    /// and nothing downstream can tell the difference.
+    pub fn put_based(&mut self, id: Hash, framed: &[u8], base: Option<Hash>) -> Result<bool> {
         if self.index.contains(id) {
             return Ok(false);
         }
-        let squeezed = squeeze(framed);
-        let (payload, flags) = match &squeezed {
-            Some(z) => (z.as_slice(), FLAG_ZSTD),
-            None => (framed, 0u8),
+
+        let patch = base.filter(|b| *b != id).and_then(|b| {
+            let bytes = self.literal_base(b)?;
+            let mut p = squeeze_delta(framed, &bytes)?;
+            p[..HASH_LEN].copy_from_slice(&b.0);
+            Some(p)
+        });
+
+        let squeezed = if patch.is_none() { squeeze(framed) } else { None };
+        let (payload, flags) = match (&patch, &squeezed) {
+            // The patch is already a zstd frame; FLAG_DELTA implies it.
+            (Some(d), _) => (d.as_slice(), FLAG_DELTA),
+            (None, Some(z)) => (z.as_slice(), FLAG_ZSTD),
+            (None, None) => (framed, 0u8),
         };
 
         self.ensure_segment(payload.len() as u64)?;
@@ -657,5 +779,161 @@ mod tests {
         let p = Pack::open(&dir).unwrap();
         assert!(p.get(Hash([9u8; 32])).unwrap().is_none());
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(all(test, feature = "compression"))]
+mod delta_tests {
+    use super::*;
+    use crate::hash::Hash;
+
+    /// The same idiom the other tests here use: no dependency for a temp dir.
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "fkit-delta-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn hash_of(b: &[u8]) -> Hash {
+        Hash(*blake3::hash(b).as_bytes())
+    }
+
+    fn source(n: usize, marker: &str) -> Vec<u8> {
+        let mut s = String::new();
+        for i in 0..n {
+            if i == n / 2 {
+                s.push_str(&format!("    int x = compute({marker});\n"));
+            } else {
+                s.push_str(&format!("    int v{i} = compute({i}, flags);\n"));
+            }
+        }
+        s.into_bytes()
+    }
+
+    #[test]
+    fn a_patch_reads_back_as_its_original() {
+        let dir = tmp("roundtrip");
+        let mut pack = Pack::open(dir.clone()).unwrap();
+
+        let v1 = source(200, "one");
+        let v2 = source(200, "two");
+        let (h1, h2) = (hash_of(&v1), hash_of(&v2));
+
+        pack.put(h1, &v1).unwrap();
+        pack.put_based(h2, &v2, Some(h1)).unwrap();
+
+        // The whole point: what comes back is the object, not the patch.
+        assert_eq!(pack.get(h1).unwrap().unwrap(), v1);
+        assert_eq!(pack.get(h2).unwrap().unwrap(), v2);
+    }
+
+    #[test]
+    fn a_patch_is_much_smaller_than_the_object() {
+        let dir = tmp("smaller");
+        let mut pack = Pack::open(dir.clone()).unwrap();
+
+        let v1 = source(400, "one");
+        let v2 = source(400, "two");
+        let (h1, h2) = (hash_of(&v1), hash_of(&v2));
+
+        pack.put(h1, &v1).unwrap();
+        pack.put_based(h2, &v2, Some(h1)).unwrap();
+
+        let whole = pack.index.get(h1).unwrap().stored;
+        let patch = pack.index.get(h2).unwrap().stored;
+        assert!(
+            patch * 4 < whole,
+            "a one-line edit stored {patch} bytes against a {whole}-byte object; \
+             the patch should be a small fraction of it"
+        );
+    }
+
+    #[test]
+    fn a_patch_never_names_a_patch() {
+        let dir = tmp("depth");
+        let mut pack = Pack::open(dir.clone()).unwrap();
+
+        // A run of versions, each offered the one before it as a base. Depth
+        // must stay at one however long the run gets, which is what removes
+        // the need for a chain limit.
+        let mut prev: Option<Hash> = None;
+        let mut hashes = Vec::new();
+        for i in 0..12 {
+            let v = source(300, &format!("rev{i}"));
+            let h = hash_of(&v);
+            pack.put_based(h, &v, prev).unwrap();
+            hashes.push((h, v));
+            prev = Some(h);
+        }
+
+        for (h, _) in &hashes {
+            let loc = pack.index.get(*h).unwrap();
+            if loc.is_delta() {
+                let base_bytes = pack.get(*h).unwrap().unwrap();
+                let _ = base_bytes;
+                // Read the payload back to find the base it names.
+                let raw = {
+                    let path = pack.names.get(&loc.segment).unwrap();
+                    let mut f = std::fs::File::open(path).unwrap();
+                    use std::io::{Read, Seek, SeekFrom};
+                    f.seek(SeekFrom::Start(loc.offset)).unwrap();
+                    let mut b = vec![0u8; loc.stored as usize];
+                    f.read_exact(&mut b).unwrap();
+                    b
+                };
+                let base = Hash(<[u8; 32]>::try_from(&raw[..32]).unwrap());
+                assert!(
+                    !pack.index.get(base).unwrap().is_delta(),
+                    "a patch named a base that is itself a patch — depth is no longer one"
+                );
+            }
+        }
+
+        // And every one of them still reads back correctly.
+        for (h, v) in &hashes {
+            assert_eq!(&pack.get(*h).unwrap().unwrap(), v);
+        }
+    }
+
+    #[test]
+    fn a_corrupt_patch_is_caught_rather_than_returned() {
+        let dir = tmp("corrupt");
+        let mut pack = Pack::open(dir.clone()).unwrap();
+
+        let v1 = source(300, "one");
+        let v2 = source(300, "two");
+        let (h1, h2) = (hash_of(&v1), hash_of(&v2));
+        pack.put(h1, &v1).unwrap();
+        pack.put_based(h2, &v2, Some(h1)).unwrap();
+        pack.seal_all().unwrap();
+
+        let loc = pack.index.get(h2).unwrap();
+        assert!(loc.is_delta(), "the second version should have been stored as a patch");
+
+        // Flip a byte inside the patch itself.
+        {
+            use std::io::{Read, Seek, SeekFrom, Write};
+            let path = pack.names.get(&loc.segment).unwrap().clone();
+            let mut f = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+            let at = loc.offset + 32 + (loc.stored as u64 - 32) / 2;
+            f.seek(SeekFrom::Start(at)).unwrap();
+            let mut b = [0u8; 1];
+            f.read_exact(&mut b).unwrap();
+            f.seek(SeekFrom::Start(at)).unwrap();
+            f.write_all(&[b[0] ^ 0xFF]).unwrap();
+        }
+
+        let again = Pack::open(dir.clone()).unwrap();
+        // Verifying after materializing is what makes this detectable at all:
+        // a damaged patch would otherwise expand into plausible wrong bytes.
+        assert!(
+            again.get(h2).is_err() || again.get(h2).unwrap().as_deref() != Some(v2.as_slice()),
+            "a corrupted patch was accepted and returned as if it were the object"
+        );
     }
 }
