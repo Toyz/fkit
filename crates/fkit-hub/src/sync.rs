@@ -187,6 +187,85 @@ impl PgHost {
 }
 
 impl RepoHost for PgHost {
+    // ---- stashes ----
+    //
+    // Parked work belongs to an account, so an anonymous session has nobody to
+    // park it for and every one of these refuses. The repository is the one the
+    // session opened, which is what keeps a stash from crossing repositories.
+
+    fn put_stash(&self, tip: Hash, message: &str) -> anyhow::Result<()> {
+        let Some(uid) = self.user_id else {
+            anyhow::bail!("sign in to keep stashes on this server");
+        };
+        let Ok(fkit_core::Object::Commit(c)) = self.store.get(tip) else {
+            anyhow::bail!("that hash does not name a commit");
+        };
+        let Some(&base) = c.parents.first() else {
+            anyhow::bail!("a stash must have the commit it was taken from as a parent");
+        };
+
+        // What the closure actually occupies here, for the quota. Measured
+        // rather than taken on trust from the client.
+        let bytes = crate::stash::closure_bytes(&self.store, tip);
+
+        self.rt.block_on(async {
+            if let Err(e) = crate::stash::sweep(&self.state.db).await {
+                tracing::warn!("sweeping expired stashes: {e}");
+            }
+            crate::stash::create(
+                &self.state.db,
+                uid,
+                self.repo.id,
+                tip,
+                base,
+                message,
+                bytes,
+                crate::stash::DEFAULT_DAYS,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| anyhow!("{e}"))
+        })
+    }
+
+    fn list_stashes(&self) -> anyhow::Result<Vec<(Hash, String)>> {
+        let Some(uid) = self.user_id else { return Ok(Vec::new()) };
+        let rows = self
+            .rt
+            .block_on(crate::stash::list(&self.state.db, uid, self.repo.id))?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|s| {
+                let h: [u8; 32] = s.commit_hash.try_into().ok()?;
+                Some((Hash(h), s.message))
+            })
+            .collect())
+    }
+
+    fn owns_stash(&self, commit: Hash) -> anyhow::Result<bool> {
+        let Some(uid) = self.user_id else { return Ok(false) };
+        Ok(self.rt.block_on(crate::stash::owned_by(
+            &self.state.db,
+            uid,
+            self.repo.id,
+            commit,
+        ))?)
+    }
+
+    fn drop_stash(&self, commit: Hash) -> anyhow::Result<()> {
+        let Some(uid) = self.user_id else {
+            anyhow::bail!("sign in to keep stashes on this server");
+        };
+        self.rt
+            .block_on(crate::stash::drop_by_commit(
+                &self.state.db,
+                uid,
+                self.repo.id,
+                commit,
+            ))
+            .map_err(|e| anyhow!("{e}"))
+    }
+
     fn store(&self) -> &Store {
         &self.store
     }

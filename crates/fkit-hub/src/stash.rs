@@ -144,6 +144,63 @@ pub async fn drop_one(db: &sqlx::PgPool, user: Uuid, repo: Uuid, id: Uuid) -> Ap
     Ok(())
 }
 
+/// Is this commit a stash of `user` in this repository?
+pub async fn owned_by(
+    db: &sqlx::PgPool,
+    user: Uuid,
+    repo: Uuid,
+    commit: Hash,
+) -> sqlx::Result<bool> {
+    let hit: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM stashes
+          WHERE user_id = $1 AND repo_id = $2 AND commit_hash = $3 AND expires_at > now()",
+    )
+    .bind(user)
+    .bind(repo)
+    .bind(commit.0.to_vec())
+    .fetch_optional(db)
+    .await?;
+    Ok(hit.is_some())
+}
+
+/// Drop one by the commit it holds, which is what a client knows it by.
+pub async fn drop_by_commit(
+    db: &sqlx::PgPool,
+    user: Uuid,
+    repo: Uuid,
+    commit: Hash,
+) -> AppResult<()> {
+    let done = sqlx::query(
+        "DELETE FROM stashes WHERE user_id = $1 AND repo_id = $2 AND commit_hash = $3",
+    )
+    .bind(user)
+    .bind(repo)
+    .bind(commit.0.to_vec())
+    .execute(db)
+    .await?;
+    if done.rows_affected() == 0 {
+        return Err(AppError::not_found("no such stash"));
+    }
+    Ok(())
+}
+
+/// What a stash's closure occupies here.
+///
+/// Walked rather than taken from the client: the quota is the server's to
+/// enforce, and a figure the pusher supplies is a figure the pusher chooses.
+/// Objects shared with history already on the server still count — measuring
+/// what is *new* would mean asking what else references them, which is the
+/// question collection exists to answer and not one worth answering per push.
+pub fn closure_bytes(store: &fkit_core::Store, tip: Hash) -> i64 {
+    match fkit_core::gc::reachable(store, &[tip]) {
+        Ok(live) => live
+            .iter()
+            .filter_map(|h| store.get_raw(*h).ok().map(|b| b.len() as i64))
+            .sum(),
+        Err(_) => 0,
+    }
+}
+
 /// Commits that must survive collection: every live stash anywhere in this
 /// fork network, whoever it belongs to.
 ///

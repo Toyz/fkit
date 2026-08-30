@@ -39,6 +39,9 @@ SNAPSHOTS
     stash pop [<n>]          restore the newest, or <n>, and drop it
     stash apply [<n>]        restore without dropping
     stash drop [<n>]         discard one
+    stash push [<n>]         send one to the remote so it follows you
+    stash remote             what is parked on the remote
+    stash fetch [<hash>]     bring parked work back to this machine
 
 BRANCHES
     branch [<name>]          list branches, or create one at HEAD
@@ -316,6 +319,21 @@ pub enum StashCommand {
     Apply { which: Option<usize> },
     /// Discard a stash without restoring it.
     Drop { which: Option<usize> },
+
+    /// Send a stash to the remote, so it can be picked up elsewhere.
+    ///
+    /// Never automatic: `fkit push` sends commits and tags, and unfinished
+    /// work is not something to upload without being asked.
+    Push { which: Option<usize> },
+
+    /// List what this account has parked on the remote.
+    Remote,
+
+    /// Bring one back. Without a hash, everything the remote is holding.
+    Fetch { commit: Option<String> },
+
+    /// Remove one from the remote. The local copy is untouched.
+    Forget { commit: String },
 }
 
 #[derive(Subcommand, Debug)]

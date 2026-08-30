@@ -81,6 +81,10 @@ fn run() -> Result<()> {
             Some(SC::Pop { which }) => cmd_stash_restore(which, true),
             Some(SC::Apply { which }) => cmd_stash_restore(which, false),
             Some(SC::Drop { which }) => cmd_stash_drop(which),
+            Some(SC::Push { which }) => cmd_stash_remote_push(which),
+            Some(SC::Remote) => cmd_stash_remote_list(),
+            Some(SC::Fetch { commit }) => cmd_stash_fetch(commit.as_deref()),
+            Some(SC::Forget { commit }) => cmd_stash_forget(&commit),
         },
         C::Merge { branch, message } => cmd_merge(&branch, message),
         C::Checkout { commit, force } => cmd_checkout(&commit, force),
@@ -813,6 +817,139 @@ fn cmd_stash_drop(which: Option<usize>) -> Result<()> {
     repo.drop_stash(n)?;
     println!("dropped stash@{n} ({})", id.short());
     println!("  the commit stays in the store until `fkit gc` runs");
+    Ok(())
+}
+
+// ---- stashes that follow you ---------------------------------------------
+//
+// A stash on the server is the same commit it is here, kept alive by a record
+// belonging to the account that pushed it rather than by a ref. It is never
+// sent automatically: `fkit push` carries commits and tags, and unfinished work
+// is not something to upload without being asked.
+
+fn cmd_stash_remote_push(which: Option<usize>) -> Result<()> {
+    let repo = here()?;
+    let (n, id) = pick_stash(&repo, which)?;
+    let message = match repo.store.get(id)? {
+        fkit_core::Object::Commit(c) => c.message,
+        _ => bail!("stash@{n} is not a commit"),
+    };
+
+    let url = remote_url(&repo)?;
+    println!("sending stash@{n} ({}) to {url}", id.short());
+    let (mut ws, _refs) = connect(&url, Some(&repo))?;
+    send(&mut ws, &Msg::PushStash { tip: id, message })?;
+    serve_wants(&repo.store, &mut ws)?;
+    match recv(&mut ws)? {
+        Msg::Ok { message } => println!("  {message}"),
+        other => bail!("unexpected reply: {other:?}"),
+    }
+    ws.close();
+    Ok(())
+}
+
+fn cmd_stash_remote_list() -> Result<()> {
+    let repo = here()?;
+    let url = remote_url(&repo)?;
+    let (mut ws, _refs) = connect(&url, Some(&repo))?;
+    send(&mut ws, &Msg::ListStashes)?;
+    let entries = match recv(&mut ws)? {
+        Msg::StashList { entries } => entries,
+        Msg::Error { message } => bail!("{message}"),
+        other => bail!("unexpected reply: {other:?}"),
+    };
+    ws.close();
+
+    if entries.is_empty() {
+        println!("nothing parked on {url}");
+        return Ok(());
+    }
+    for (h, msg) in &entries {
+        // Say which are already here, so it is obvious what fetching would do.
+        let mark = if repo.store.has(*h) { " " } else { "*" };
+        println!("  {mark} {}  {msg}", h.short());
+    }
+    if entries.iter().any(|(h, _)| !repo.store.has(*h)) {
+        println!("\n* not on this machine — `fkit stash fetch` brings them over");
+    }
+    Ok(())
+}
+
+fn cmd_stash_fetch(commit: Option<&str>) -> Result<()> {
+    let repo = here()?;
+    let url = remote_url(&repo)?;
+    let (mut ws, _refs) = connect(&url, Some(&repo))?;
+
+    send(&mut ws, &Msg::ListStashes)?;
+    let entries = match recv(&mut ws)? {
+        Msg::StashList { entries } => entries,
+        Msg::Error { message } => bail!("{message}"),
+        other => bail!("unexpected reply: {other:?}"),
+    };
+
+    let wanted: Vec<(Hash, String)> = match commit {
+        Some(spec) => {
+            let hit = entries
+                .iter()
+                .find(|(h, _)| h.to_hex().starts_with(spec))
+                .cloned();
+            vec![hit.with_context(|| format!("the remote has no stash matching {spec}"))?]
+        }
+        None => entries,
+    };
+    if wanted.is_empty() {
+        println!("nothing parked on {url}");
+        return Ok(());
+    }
+
+    let mut added = 0usize;
+    for (h, message) in &wanted {
+        if repo.store.has(*h) {
+            continue;
+        }
+        send(&mut ws, &Msg::PullStash { commit: *h })?;
+        let stats = fetch_closure(&repo.store, &mut ws, &[*h])?;
+        // Drain the server's trailing Ok.
+        let _ = recv(&mut ws);
+        verify_closure(&repo.store, *h)?;
+
+        let n = repo.push_stash(*h)?;
+        println!("  stash@{n}  {}  {message}  ({} objects)", h.short(), stats.objects);
+        added += 1;
+    }
+    ws.close();
+
+    match added {
+        0 => println!("already have everything parked on {url}"),
+        n => println!("{n} stash(es) brought over — `fkit stash list` to see them"),
+    }
+    Ok(())
+}
+
+fn cmd_stash_forget(spec: &str) -> Result<()> {
+    let repo = here()?;
+    let url = remote_url(&repo)?;
+    let (mut ws, _refs) = connect(&url, Some(&repo))?;
+
+    send(&mut ws, &Msg::ListStashes)?;
+    let entries = match recv(&mut ws)? {
+        Msg::StashList { entries } => entries,
+        Msg::Error { message } => bail!("{message}"),
+        other => bail!("unexpected reply: {other:?}"),
+    };
+    let (h, _) = entries
+        .iter()
+        .find(|(h, _)| h.to_hex().starts_with(spec))
+        .with_context(|| format!("the remote has no stash matching {spec}"))?;
+
+    send(&mut ws, &Msg::DropStash { commit: *h })?;
+    match recv(&mut ws)? {
+        Msg::Ok { message } => println!("  {message}"),
+        Msg::Error { message } => bail!("{message}"),
+        other => bail!("unexpected reply: {other:?}"),
+    }
+    ws.close();
+    println!("  the copy on this machine is untouched");
     Ok(())
 }
 
