@@ -1354,7 +1354,28 @@ fn cmd_push(branch: Option<&str>, force: bool, no_tags: bool, only: &[String]) -
     send(&mut ws, &Msg::PushRef { branch: branch.clone(), tip, force })?;
 
     // The server drives: it asks for what it lacks, we answer.
-    let stats = serve_wants(&repo.store, &mut ws)?;
+    //
+    // Reported as it goes. A large history takes minutes here, and a silent
+    // minute is indistinguishable from a stall -- which matters, because a
+    // stall is a thing that actually happens.
+    let start = std::time::Instant::now();
+    let mut last = std::time::Instant::now();
+    let stats = fkit_core::proto::serve_wants_watched(&repo.store, &mut ws, &mut |s| {
+        if last.elapsed() >= std::time::Duration::from_secs(2) {
+            last = std::time::Instant::now();
+            let secs = start.elapsed().as_secs_f64().max(0.001);
+            eprint!(
+                "\r  sent {} object(s), {} ({:.0}/s)      ",
+                s.objects,
+                human(s.bytes),
+                s.objects as f64 / secs
+            );
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+        }
+    })?;
+    if stats.objects > 0 {
+        eprintln!();
+    }
 
     match recv(&mut ws)? {
         Msg::Ok { message } => {

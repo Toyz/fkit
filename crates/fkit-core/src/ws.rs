@@ -131,6 +131,16 @@ impl WebSocket {
     /// Returns the requested path alongside the socket, so the server can route
     /// `/my-repo` to the right repository.
     pub fn accept(mut stream: TcpStream) -> Result<(WebSocket, String)> {
+        // The connecting side already does this; this side never did.
+        //
+        // Without it every reply is held by Nagle's algorithm waiting to be
+        // coalesced with whatever comes next -- and since the protocol is
+        // strictly request and reply, nothing comes next until this reply
+        // arrives. The result is a stall per round trip, which on a transfer
+        // made of thousands of them is nearly all of the wall clock. It is not
+        // fatal, which is why it went unnoticed: everything worked, slowly.
+        let _ = stream.set_nodelay(true);
+
         let request = read_http_head(&mut stream)?;
         let mut lines = request.lines();
         let start = lines.next().unwrap_or_default();
@@ -306,20 +316,27 @@ impl WebSocket {
             header.extend_from_slice(&(len as u64).to_be_bytes());
         }
 
+        // Header and payload go out together.
+        //
+        // Written separately they are two segments on the wire, and with Nagle
+        // in play the second waits on an acknowledgement of the first. Even
+        // without it, it is two syscalls per frame for no reason. Joining them
+        // costs one copy of the payload, which is already being copied when
+        // masked.
         if self.masking {
             self.mask_counter = self.mask_counter.wrapping_mul(6364136223846793005).wrapping_add(1);
             let key = (self.mask_counter >> 16) as u32;
             let key = key.to_be_bytes();
             header.extend_from_slice(&key);
-            let mut masked = payload.to_vec();
-            for (i, b) in masked.iter_mut().enumerate() {
-                *b ^= key[i % 4];
+            header.reserve(payload.len());
+            for (i, b) in payload.iter().enumerate() {
+                header.push(b ^ key[i % 4]);
             }
             self.stream.write_all(&header)?;
-            self.stream.write_all(&masked)?;
         } else {
+            header.reserve(payload.len());
+            header.extend_from_slice(payload);
             self.stream.write_all(&header)?;
-            self.stream.write_all(payload)?;
         }
         self.stream.flush()?;
         Ok(())

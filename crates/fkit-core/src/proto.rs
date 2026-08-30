@@ -65,7 +65,14 @@ impl Transport for WebSocket {
 
 /// Objects requested per round trip. Bounds the size of any single message
 /// while keeping the number of round trips low.
-pub const BATCH: usize = 256;
+/// Objects asked for in one round trip.
+///
+/// The exchange is strictly request-and-reply, so every batch is a full stop:
+/// the sender is idle while the receiver writes and vice versa. At 256 a push
+/// of a large history spends thousands of those stops doing nothing. Raising
+/// it costs a larger message in flight and saves the round trips that were
+/// most of the wall clock.
+pub const BATCH: usize = 4096;
 
 /// Refuse to follow an unbounded graph from an untrusted peer.
 pub const MAX_OBJECTS_PER_SYNC: usize = 5_000_000;
@@ -270,6 +277,21 @@ pub fn fetch_closure<T: Transport + ?Sized>(
     ws: &mut T,
     roots: &[Hash],
 ) -> Result<TransferStats> {
+    fetch_closure_watched(store, ws, roots, &mut |_| {})
+}
+
+/// As [`fetch_closure`], reporting as it goes.
+///
+/// A transfer of a large history runs for minutes. Without this it prints
+/// nothing at all until it finishes, which is indistinguishable from being
+/// stuck -- and the one time it really was stuck, that is exactly how it
+/// looked.
+pub fn fetch_closure_watched<T: Transport + ?Sized>(
+    store: &Store,
+    ws: &mut T,
+    roots: &[Hash],
+    progress: &mut dyn FnMut(&TransferStats),
+) -> Result<TransferStats> {
     let mut stats = TransferStats::default();
     let mut queue: VecDeque<Hash> = VecDeque::new();
     let mut requested: HashSet<Hash> = HashSet::new();
@@ -297,22 +319,46 @@ pub fn fetch_closure<T: Transport + ?Sized>(
         let mut delivered = HashSet::new();
 
         for (claimed, framed) in objects {
-            if !wanted.contains(&claimed) {
-                bail!("peer sent object {} that we never asked for", claimed.short());
+            // Objects beyond what was asked for are welcome: the peer runs
+            // ahead into the closure so this side does not have to discover it
+            // a layer at a time. Taking them on trust costs nothing, because
+            // `put_raw` below names every object by the hash of its own bytes
+            // -- an object nobody wanted is at worst wasted bytes, never a way
+            // to store something under a name that does not describe it.
+            if store.has(claimed) {
+                delivered.insert(claimed);
+                requested.insert(claimed);
+                continue;
             }
-            // put_raw recomputes the hash; a lying peer is rejected here.
+            // The edges are read out of the bytes we were handed, before they
+            // are written. Asking the store for them instead meant writing the
+            // object, flushing it, and then reopening its segment to read,
+            // decompress and re-verify what was already in memory -- once per
+            // object, which over a large history is most of the time a push
+            // takes.
+            let links = Store::decode_framed(&framed)
+                .with_context(|| format!("peer sent object {} that will not decode", claimed.short()))?
+                .links();
+
+            // put_raw recomputes the hash; a lying peer is rejected here, so
+            // decoding first costs nothing in trust: a forged object cannot be
+            // stored, and its links can only ever add work, never bypass a
+            // check.
             let (id, _) = store.put_raw(claimed, &framed)?;
             delivered.insert(id);
+            requested.insert(id);
             stats.objects += 1;
             stats.bytes += framed.len() as u64;
 
             // Follow the newly-revealed edges.
-            for link in store.get(id)?.links() {
+            for link in links {
                 if !store.has(link) && requested.insert(link) {
                     queue.push_back(link);
                 }
             }
         }
+
+        progress(&stats);
 
         if let Some(missing) = wanted.iter().find(|h| !delivered.contains(h)) {
             bail!(
@@ -328,13 +374,31 @@ pub fn fetch_closure<T: Transport + ?Sized>(
 
 /// **Sending half.** Answer `Want` messages until the peer says `Done`.
 pub fn serve_wants<T: Transport + ?Sized>(store: &Store, ws: &mut T) -> Result<TransferStats> {
+    serve_wants_watched(store, ws, &mut |_| {})
+}
+
+/// As [`serve_wants`], reporting after every reply.
+///
+/// A push of a large history is this side answering for minutes. Saying
+/// nothing while it does is indistinguishable from having hung, which is
+/// exactly how a push that had genuinely hung looked.
+pub fn serve_wants_watched<T: Transport + ?Sized>(
+    store: &Store,
+    ws: &mut T,
+    progress: &mut dyn FnMut(&TransferStats),
+) -> Result<TransferStats> {
     let mut stats = TransferStats::default();
+    let mut sent: HashSet<Hash> = HashSet::new();
     loop {
         match recv(ws)? {
             Msg::Want { hashes } => {
                 stats.round_trips += 1;
+
                 let mut objects = Vec::with_capacity(hashes.len());
                 for h in hashes {
+                    if !sent.insert(h) {
+                        continue;
+                    }
                     let framed = store
                         .get_raw(h)
                         .with_context(|| format!("peer wants {} which we do not have", h.short()))?;
@@ -343,6 +407,7 @@ pub fn serve_wants<T: Transport + ?Sized>(store: &Store, ws: &mut T) -> Result<T
                     objects.push((h, framed));
                 }
                 send(ws, &Msg::Objects { objects })?;
+                progress(&stats);
             }
             Msg::Done => return Ok(stats),
             other => bail!("expected Want or Done, got {other:?}"),
