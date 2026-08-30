@@ -38,7 +38,13 @@ const sheet = css`
      The active underline then lands on that rule instead of floating over
      nothing, which is what makes one of them look chosen. */
   :host { display: block; border-bottom: 1px solid var(--border); margin-bottom: 18px; }
-  .tabs { display: flex; gap: 2px; }
+  /* Tabs on the left, whatever acts on the view they select on the right.
+     They belong on this line: a filter over the list is scoped to the tab you
+     are on, and a row of its own would say otherwise while costing a band of
+     page to say it. */
+  .row { display: flex; align-items: center; gap: 12px; }
+  .tabs { display: flex; gap: 2px; flex: 1; min-width: 0; }
+  .acts { display: flex; align-items: center; gap: 8px; padding-bottom: 4px; }
   .tabs a {
     display: flex; align-items: center; gap: 6px;
     padding: 5px 10px; color: var(--muted); font-size: 12px;
@@ -69,7 +75,8 @@ export class FkitTabs extends LoomElement {
 
   update() {
     return (
-      <nav class="tabs" aria-label="Sections">
+      <div class="row">
+        <nav class="tabs" aria-label="Sections">
         {this.tabs.map((t) => (
           <a
             class={t.key === this.current ? "on" : ""}
@@ -83,8 +90,12 @@ export class FkitTabs extends LoomElement {
                 empty rather than decorated with a nought. */}
             {t.count ? <span class="tabn">{t.count}</span> : null}
           </a>
-        ))}
-      </nav>
+          ))}
+        </nav>
+        {/* Controls belonging to the selected view. Slotted, so the page that
+            knows what they do owns them and styles them. */}
+        <span class="acts"><slot name="action"></slot></span>
+      </div>
     );
   }
 }

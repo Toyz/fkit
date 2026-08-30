@@ -215,7 +215,7 @@ export class FkitActivity extends LoomElement {
           <span
             title="Placed by when each commit says it was written, and credited to the account that pushed it."
           >
-            in the last year
+            {a.full_year ? "in the last year" : "since joining"}
           </span>
           <span class="fill"></span>
           {a.busiest > 0 ? <span>busiest day {a.busiest}</span> : null}

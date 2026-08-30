@@ -356,6 +356,14 @@ export class PageProfile extends LoomElement {
   @on(window, "popstate")
   private load() {
     const who = location.pathname.split("/").filter(Boolean)[0] ?? "";
+
+    // A tab is a query string, so switching one fires popstate at the same
+    // handler that loads the page. Without this the profile, the year, the
+    // feed and the stashes were all thrown away and fetched again to move
+    // between two views of the same person -- which is a page reload wearing
+    // a router, and looked like one.
+    if (who && who === this.profile?.username) return;
+
     this.profile = null;
     this.error = "";
     this.filter = "";
@@ -440,7 +448,15 @@ export class PageProfile extends LoomElement {
                   <dt>repositories</dt>
                   <dd>
                     {p.repos.length}
-                    {priv && mine ? <span class="q"> · {priv} private</span> : null}
+                    {/* What the number means depends on who is reading it. To
+                        the owner it is a split; to anybody else it is only
+                        ever what they were allowed to see, and saying so is
+                        better than letting a short list read as the whole. */}
+                    {mine ? (
+                      priv ? <span class="q"> · {priv} private</span> : null
+                    ) : (
+                      <span class="q"> you can see</span>
+                    )}
                   </dd>
 
                   {latest ? (
@@ -469,7 +485,14 @@ export class PageProfile extends LoomElement {
                   {this.activity && this.activity.total > 0 ? (
                     <>
                       <dt>pushed</dt>
-                      <dd>{this.activity.total} commits this year</dd>
+                      {/* Same window the grid beside it draws, said the same
+                          way. A young account gets a short one, and calling
+                          eleven weeks "this year" here while the heading says
+                          "since joining" is two labels for one number. */}
+                      <dd>
+                        {this.activity.total} commits{" "}
+                        {this.activity.full_year ? "this year" : "since joining"}
+                      </dd>
                     </>
                   ) : null}
                 </dl>
@@ -533,40 +556,43 @@ export class PageProfile extends LoomElement {
                   ]
                 : []),
             ]}
-          ></fkit-tabs>
+          >
+            {/* On the tab row rather than on the section heading below it.
+                A section renders no heading bar when it has no heading -- and
+                a profile's own repository list has none, because the tab
+                already names it -- which quietly took the filter and the new
+                button down with it. They were invisible on exactly the page
+                whose owner has the most repositories to sift. */}
+            {this.tab === "repos" && (filterable || (mine && this.session.canCreateRepo)) ? (
+              <span slot="action" class="head-acts">
+                {filterable ? (
+                  <input
+                    class="filter"
+                    placeholder="filter"
+                    aria-label="Filter repositories"
+                    value={this.filter}
+                    onInput={(e: Event) => (this.filter = (e.target as HTMLInputElement).value)}
+                  />
+                ) : null}
+                {mine && this.session.canCreateRepo ? (
+                  <a class="btn" href="/new" onClick={linkHandler("/new")}>
+                    <loom-icon name="plus" size={11}></loom-icon> new repository
+                  </a>
+                ) : null}
+              </span>
+            ) : null}
+          </fkit-tabs>
         ) : null}
 
         {mine && this.tab === "stashes" ? this.renderStashes() : this.tab === "activity" ? (
           this.renderPushes()
         ) : (
-        <fkit-section
-          heading={mine ? "" : "Repositories"}
-          value={
-            p === null
-              ? ""
-              : mine || priv === 0
-                ? `${pub} public${priv ? ` · ${priv} private` : ""}`
-                : `${p.repos.length} you can see`
-          }
-        >
-          {filterable || mine ? (
-            <span slot="action" class="head-acts">
-              {filterable ? (
-                <input
-                  class="filter"
-                  placeholder="filter"
-                  value={this.filter}
-                  onInput={(e: Event) => (this.filter = (e.target as HTMLInputElement).value)}
-                />
-              ) : null}
-              {mine && this.session.canCreateRepo ? (
-                <a class="btn" href="/new" onClick={linkHandler("/new")}>
-                  <loom-icon name="plus" size={11}></loom-icon> new repository
-                </a>
-              ) : null}
-            </span>
-          ) : null}
-
+        /* No heading: the tab above already says "repositories" and carries
+           the count, and a bar repeating both under it was a band of page
+           spent saying nothing twice. The public/private split it used to
+           carry lives in the facts column, where the rest of the numbers
+           about this person are. */
+        <fkit-section>
           <fkit-list>
             {p === null ? (
               [0, 1, 2].map(() => (

@@ -1494,8 +1494,15 @@ struct Activity {
     /// The window, inclusive. The client draws every day in it, including the
     /// empty ones, so it needs the bounds rather than inferring them from the
     /// days that happen to be present.
+    ///
+    /// Not always a year: an account younger than that gets a window starting
+    /// when it joined, so a new profile shows a short full grid instead of a
+    /// year of squares nobody was here for.
     since: chrono::NaiveDate,
     until: chrono::NaiveDate,
+    /// True when `since` is a year back, so the heading can say so honestly
+    /// rather than calling eleven weeks "the last year".
+    full_year: bool,
     total: i64,
     /// The busiest single day, so the client can scale its shading against
     /// this person's own year rather than against a number picked in advance.
@@ -1562,19 +1569,36 @@ async fn get_activity(
     }
 
     let username = username.trim().to_ascii_lowercase();
-    let owner: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM users WHERE username = $1 AND is_active = TRUE")
-            .bind(&username)
-            .fetch_optional(&state.db)
-            .await?;
-    let Some((owner_id,)) = owner else {
+    let owner: Option<(Uuid, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "SELECT id, created_at FROM users WHERE username = $1 AND is_active = TRUE",
+    )
+    .bind(&username)
+    .fetch_optional(&state.db)
+    .await?;
+    let Some((owner_id, joined)) = owner else {
         return Err(AppError::NotFound(format!("no user named {username}")));
     };
 
     let until = chrono::Utc::now().date_naive();
-    // A year back, then out to the start of that week, so the first column of
-    // the grid is a whole one rather than a stub of two days.
-    let since = until - chrono::Duration::days(364);
+
+    // A year, unless the account has not been here a year.
+    //
+    // Drawing the full fifty-three columns for somebody who joined on Tuesday
+    // gives three hundred and sixty empty squares and two full ones, which
+    // reads as a broken graph rather than as a new account -- and the empty
+    // part is not even a claim about them, since they were not here for it.
+    // The window starts at whichever is later, and grows into the year as they
+    // do.
+    //
+    // The floor keeps it a shape. One column of squares is not a grid, and the
+    // heading above it says more than the picture would.
+    const FLOOR_WEEKS: i64 = 12;
+    let year_ago = until - chrono::Duration::days(364);
+    let floor = until - chrono::Duration::weeks(FLOOR_WEEKS);
+    let since = year_ago.max(joined.date_naive().min(floor));
+
+    // Out to the start of that week, so the first column of the grid is a
+    // whole one rather than a stub of two days.
     let back = chrono::Datelike::weekday(&since).num_days_from_sunday() as i64;
     let since = since - chrono::Duration::days(back);
 
@@ -1666,7 +1690,8 @@ async fn get_activity(
         })
         .collect();
 
-    Ok(Json(Activity { since, until, total, busiest, days }))
+    let full_year = since <= year_ago;
+    Ok(Json(Activity { since, until, full_year, total, busiest, days }))
 }
 
 

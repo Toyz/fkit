@@ -10,6 +10,43 @@ import { repoRow, repoRowSheet } from "../repo-row";
 import { Session } from "../session";
 
 const sheet = css`
+  /* The front door, for people who have not been through it.
+     Deliberately not a hero: no gradient, no slab of type, nothing that would
+     make the repository list below it look like an afterthought. It is a
+     masthead -- the name, what the thing is, and the one command that gets you
+     started -- closed by the same hairline every heading here draws. */
+  .hail {
+    padding: 4px 0 22px; margin-bottom: 26px;
+    border-bottom: 1px solid var(--border);
+  }
+  .hail h1 {
+    display: flex; align-items: baseline; flex-wrap: wrap; gap: 10px;
+    margin: 0 0 10px; font-size: 15px; font-weight: 500;
+  }
+  .hail .mark {
+    font-family: var(--mono); font-weight: 700; letter-spacing: -0.02em;
+    font-size: 21px; color: var(--text);
+  }
+  .hail .tag {
+    font-family: var(--sans); font-size: 12px; color: var(--muted);
+  }
+  .hail .lede {
+    font-family: var(--sans); font-size: 12.5px; line-height: 1.6;
+    color: var(--muted); margin: 0; max-width: 68ch;
+  }
+  /* The command is the point of the row, so it is the thing set in type you
+     could copy, and the buttons sit at the far end of it. */
+  .hail .try {
+    display: flex; align-items: center; flex-wrap: wrap; gap: 10px;
+    margin-top: 16px;
+  }
+  .hail code {
+    font-family: var(--mono); font-size: 11.5px; color: var(--faint);
+    background: var(--raised); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 5px 10px;
+    overflow-x: auto; max-width: 100%;
+  }
+  .hail .fill { flex: 1; }
 
   .empty { padding: 40px 14px; text-align: center; }
   .empty h2 { color: var(--muted); }
@@ -42,6 +79,12 @@ export class PageRepos extends LoomElement {
   @query<Repo[]>({ url: "/api/repos", init: { credentials: "same-origin" } })
   accessor repos!: ApiState<Repo[]>;
 
+  /** This server, spelled the way the CLI wants it. */
+  private origin(): string {
+    const scheme = location.protocol === "https:" ? "wss" : "ws";
+    return `${scheme}://${location.host}`;
+  }
+
   private visible(): Repo[] {
     const q = this.filter.trim().toLowerCase();
     const all = this.repos.data ?? [];
@@ -64,6 +107,35 @@ export class PageRepos extends LoomElement {
     return (
       <div class="wrap">
         {this.repos.error ? <fkit-notice message={this.repos.error.message}></fkit-notice> : null}
+
+        {/* Somebody arriving with no account got a bare list under the word
+            "Repositories" and no indication of what any of it is. The only
+            explanation on the page was in the footer, under the fold, in grey.
+            Signed in you already know where you are, so this is for the people
+            who do not -- and it says what the thing does rather than selling
+            it, because a self-hosted forge has nothing to sell. */}
+        {!this.session.isAuthed ? (
+          <div class="hail">
+            <h1>
+              <span class="mark">fkit</span>
+              <span class="tag">content-addressed version control</span>
+            </h1>
+            <p class="lede">
+              Every chunk, file, tree and commit is named by the BLAKE3 digest of
+              what it holds. A hash means one exact state of one exact tree, and
+              content that is identical is stored once — across branches, across
+              forks, across every repository on this server that has it.
+            </p>
+            <div class="try">
+              <code>fkit clone {this.origin()}/owner/repo</code>
+              <span class="fill"></span>
+              <a class="btn" href="/login" onClick={linkHandler("/login")}>sign in</a>
+              <a class="btn primary" href="/register" onClick={linkHandler("/register")}>
+                register
+              </a>
+            </div>
+          </div>
+        ) : null}
 
         <fkit-section heading="Repositories" value={value}>
           <span slot="action" class="head-acts">
