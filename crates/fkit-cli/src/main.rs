@@ -2119,6 +2119,16 @@ fn cmd_fast_import(branch: Option<&str>, every: u64) -> Result<()> {
     if tags > 0 {
         println!("  tags: {tags}");
     }
+    if report.skipped_submodules > 0 {
+        // Said plainly rather than buried: the imported tree genuinely differs
+        // from the exported one at these paths, and anybody comparing the two
+        // should know why before they go looking.
+        println!(
+            "  {} submodule pin(s) dropped: they name commits in repositories \
+             that were not part of this stream",
+            report.skipped_submodules
+        );
+    }
 
     if landed.contains(&want) {
         repo.set_head(&Head::Branch(want.clone()))?;

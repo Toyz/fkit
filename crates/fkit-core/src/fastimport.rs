@@ -80,6 +80,8 @@ struct Branch {
 pub struct Report {
     pub commits: u64,
     pub blobs: u64,
+    /// Submodule pins naming a repository that was not in the stream.
+    pub skipped_submodules: u64,
     pub refs: Vec<(String, Hash)>,
 }
 
@@ -90,6 +92,7 @@ pub struct FastImport<'a> {
     branches: HashMap<String, Branch>,
     commits: u64,
     blobs: u64,
+    skipped_submodules: u64,
     pending_bytes: usize,
     every: u64,
     on_progress: Option<Box<dyn Fn(u64, u64) + 'a>>,
@@ -104,6 +107,7 @@ impl<'a> FastImport<'a> {
             branches: HashMap::new(),
             commits: 0,
             blobs: 0,
+            skipped_submodules: 0,
             pending_bytes: 0,
             every: 0,
             on_progress: None,
@@ -148,7 +152,12 @@ impl<'a> FastImport<'a> {
             .iter()
             .filter_map(|(name, b)| b.tip.map(|t| (name.clone(), t)))
             .collect();
-        Ok(Report { commits: self.commits, blobs: self.blobs, refs })
+        Ok(Report {
+            commits: self.commits,
+            blobs: self.blobs,
+            skipped_submodules: self.skipped_submodules,
+            refs,
+        })
     }
 
     /// Refuse the features that would silently change what we build.
@@ -454,12 +463,25 @@ impl<'a> FastImport<'a> {
                         }
                         None => bail!("mark :{m} was used before it was defined"),
                     }
-                } else {
-                    // A raw hash, which for a submodule pin is a commit in this
-                    // same store and otherwise something we were never given.
-                    let h = Hash::from_hex(&dataref)
-                        .with_context(|| format!("not a hash or mark: {dataref}"))?;
+                } else if let Some(h) = Hash::from_hex(&dataref) {
+                    // A hash this store can name, which for a submodule is a
+                    // commit already imported here.
                     (h, 0)
+                } else if kind == EntryKind::Submodule {
+                    // A pin naming a commit in a repository that is not this
+                    // one and was never in the stream. fkit points a submodule
+                    // at a commit in this same store, so there is nothing
+                    // truthful to record -- the entry is dropped and counted,
+                    // and the count is reported, because a tree that quietly
+                    // differs from the one exported is worse than a loud gap.
+                    self.skipped_submodules += 1;
+                    return Ok(Change::Skip);
+                } else {
+                    bail!(
+                        "{path} refers to content that is not in this stream \
+                         ({dataref}); a stream exported without its blobs cannot \
+                         be imported"
+                    )
                 };
                 Ok(Change::Set(path, kind, hash, size))
             }
@@ -469,6 +491,7 @@ impl<'a> FastImport<'a> {
 
     fn apply(&self, paths: &mut BTreeMap<String, TreeEntry>, c: Change) -> Result<()> {
         match c {
+            Change::Skip => {}
             Change::All => paths.clear(),
             Change::Set(path, kind, hash, size) => {
                 let name = leaf(&path);
@@ -590,6 +613,8 @@ fn c_kind(_a: &str, _b: &str) {}
 
 enum Change {
     Set(String, EntryKind, Hash, u64),
+    /// Something the stream described that this repository cannot hold.
+    Skip,
     Del(String),
     Copy(String, String),
     Move(String, String),
