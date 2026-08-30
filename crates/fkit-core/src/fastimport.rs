@@ -39,12 +39,29 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::BufRead;
 
 /// What a `:N` mark refers to.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum Mark {
+    /// Content that has arrived but has not been given a path yet.
+    ///
+    /// A stream announces a blob before the commit that places it, so at the
+    /// moment it arrives there is nothing to say which file it is a new
+    /// version *of*. Storing it there and then means storing it whole, every
+    /// time, for every version of every file -- which is most of what a
+    /// repository is. Held instead until an `M` names its path, at which point
+    /// the previous version of that path is known and the content can be
+    /// stored as the difference from it.
+    Pending(Vec<u8>),
     /// A file's content: its Merkle root and its length.
     Blob(Hash, u64),
     Commit(Hash),
 }
+
+/// How much unplaced blob content to hold before storing some of it whole.
+///
+/// A stream normally names a blob's path within a commit or two, so this stays
+/// far below the cap. It exists so that a producer which front-loads every
+/// blob cannot make the importer hold an entire repository in memory.
+const PENDING_LIMIT: usize = 256 * 1024 * 1024;
 
 /// One branch being built: every path it holds, and where its tip is.
 ///
@@ -73,6 +90,7 @@ pub struct FastImport<'a> {
     branches: HashMap<String, Branch>,
     commits: u64,
     blobs: u64,
+    pending_bytes: usize,
     every: u64,
     on_progress: Option<Box<dyn Fn(u64, u64) + 'a>>,
 }
@@ -86,6 +104,7 @@ impl<'a> FastImport<'a> {
             branches: HashMap::new(),
             commits: 0,
             blobs: 0,
+            pending_bytes: 0,
             every: 0,
             on_progress: None,
         }
@@ -162,10 +181,19 @@ impl<'a> FastImport<'a> {
                     let rest = rest.to_string();
                     r.take();
                     let bytes = r.data(&rest)?;
-                    let ing = crate::ingest::ingest_bytes(self.sink, &bytes)?;
                     self.blobs += 1;
-                    if let Some(m) = mark {
-                        self.marks.insert(m, Mark::Blob(ing.hash, ing.size));
+                    match mark {
+                        // Held until a path is known. See `Mark::Pending`.
+                        Some(m) => {
+                            self.pending_bytes += bytes.len();
+                            self.marks.insert(m, Mark::Pending(bytes));
+                            self.relieve_pressure()?;
+                        }
+                        // Nothing can refer to it later, so it is only useful
+                        // now, and there is no path coming for it.
+                        None => {
+                            crate::ingest::ingest_bytes(self.sink, &bytes)?;
+                        }
                     }
                     return Ok(());
                 }
@@ -190,6 +218,11 @@ impl<'a> FastImport<'a> {
         let mut merges: Vec<Hash> = Vec::new();
         let mut changes: Vec<Change> = Vec::new();
         let mut saw_from = false;
+
+        // The store, copied out of `self` so that holding a `Prior` built from
+        // it does not borrow the importer for the rest of the loop.
+        let store = self.store;
+        let mut prior: Option<crate::ingest::Prior> = None;
 
         while let Some(line) = r.peek()? {
             let (word, rest) = split_once(&line);
@@ -231,8 +264,27 @@ impl<'a> FastImport<'a> {
                     r.take();
                 }
                 "M" | "D" | "C" | "R" | "deleteall" => {
+                    // The tree this commit is built on, needed before any
+                    // content is stored so each new version can be kept as the
+                    // difference from the old one. Safe to resolve here and
+                    // not earlier: the format puts `from` and `merge` ahead of
+                    // every file command, so by now the parent is known.
+                    if prior.is_none() {
+                        let base = if saw_from {
+                            from
+                        } else {
+                            self.branches.get(&refname).and_then(|b| b.tip)
+                        };
+                        prior = Some(match base.and_then(|c| self.tree_of(c)) {
+                            Some(t) => crate::ingest::Prior::at(store, t),
+                            None => crate::ingest::Prior::none(),
+                        });
+                    }
                     r.take();
-                    changes.push(self.parse_change(r, &word, &rest)?);
+                    let p = prior.take().expect("just set");
+                    let change = self.parse_change(r, &word, &rest, &p);
+                    prior = Some(p);
+                    changes.push(change?);
                 }
                 _ => break,
             }
@@ -340,6 +392,7 @@ impl<'a> FastImport<'a> {
         r: &mut Reader<R>,
         word: &str,
         rest: &str,
+        prior: &crate::ingest::Prior,
     ) -> Result<Change> {
         match word {
             "deleteall" => Ok(Change::All),
@@ -373,13 +426,32 @@ impl<'a> FastImport<'a> {
                         bail!("expected data after an inline modify, got {w}");
                     }
                     let bytes = r.data(dr)?;
-                    let ing = crate::ingest::ingest_bytes(self.sink, &bytes)?;
+                    let was = prior.chunks_for(&path);
+                    let ing =
+                        crate::ingest::ingest_reader_after(self.sink, bytes.as_slice(), &was)?;
                     (ing.hash, ing.size)
                 } else if let Some(m) = dataref.strip_prefix(':') {
                     let m: u32 = m.parse().context("a mark that is not a number")?;
                     match self.marks.get(&m) {
                         Some(Mark::Blob(h, n)) => (*h, *n),
                         Some(Mark::Commit(h)) => (*h, 0), // a submodule pin
+                        // Held content, now that there is a path for it. The
+                        // mark becomes an ordinary blob so that a second use
+                        // of the same content costs nothing.
+                        Some(Mark::Pending(_)) => {
+                            let Some(Mark::Pending(bytes)) = self.marks.remove(&m) else {
+                                unreachable!("just matched on Pending")
+                            };
+                            self.pending_bytes -= bytes.len();
+                            let was = prior.chunks_for(&path);
+                            let ing = crate::ingest::ingest_reader_after(
+                                self.sink,
+                                bytes.as_slice(),
+                                &was,
+                            )?;
+                            self.marks.insert(m, Mark::Blob(ing.hash, ing.size));
+                            (ing.hash, ing.size)
+                        }
                         None => bail!("mark :{m} was used before it was defined"),
                     }
                 } else {
@@ -435,6 +507,46 @@ impl<'a> FastImport<'a> {
         Ok(())
     }
 
+    /// The tree a commit points at, if it is one we can read.
+    fn tree_of(&self, commit: Hash) -> Option<Hash> {
+        for b in self.branches.values() {
+            if b.tip == Some(commit) {
+                return b.tree;
+            }
+        }
+        match self.store.get(commit) {
+            Ok(Object::Commit(c)) => Some(c.tree),
+            _ => None,
+        }
+    }
+
+    /// Store held content whose path never arrived.
+    ///
+    /// Only reached by a producer that emits a great many blobs before placing
+    /// any of them. Storing the oldest whole is a worse outcome than patching
+    /// it, and a far better one than running out of memory.
+    fn relieve_pressure(&mut self) -> Result<()> {
+        if self.pending_bytes <= PENDING_LIMIT {
+            return Ok(());
+        }
+        let marks: Vec<u32> = self
+            .marks
+            .iter()
+            .filter(|(_, m)| matches!(m, Mark::Pending(_)))
+            .map(|(k, _)| *k)
+            .collect();
+        for m in marks {
+            if self.pending_bytes <= PENDING_LIMIT / 2 {
+                break;
+            }
+            let Some(Mark::Pending(bytes)) = self.marks.remove(&m) else { continue };
+            self.pending_bytes -= bytes.len();
+            let ing = crate::ingest::ingest_bytes(self.sink, &bytes)?;
+            self.marks.insert(m, Mark::Blob(ing.hash, ing.size));
+        }
+        Ok(())
+    }
+
     /// The state a branch would have if it continued from `commit`.
     fn branch_at(&mut self, commit: Hash) -> Result<Branch> {
         // Almost always the tip of a branch we already hold, which costs
@@ -458,6 +570,12 @@ impl<'a> FastImport<'a> {
             let m: u32 = m.parse().context("a mark that is not a number")?;
             return match self.marks.get(&m) {
                 Some(Mark::Commit(h)) | Some(Mark::Blob(h, _)) => Ok(*h),
+                // `from` and `merge` name commits. Blob content that has not
+                // been placed yet is not one, and treating it as a parent
+                // would build a history that never existed.
+                Some(Mark::Pending(_)) => {
+                    bail!("mark :{m} is file content, but was used where a commit belongs")
+                }
                 None => bail!("mark :{m} was used before it was defined"),
             };
         }
