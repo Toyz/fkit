@@ -579,6 +579,14 @@ export interface Profile {
   /** Ranked over everything visible, not over the page. */
   topics: string[];
   last_push: LastPush | null;
+  /**
+   * Whether the year graph will hold anything.
+   *
+   * On the profile rather than left to the activity request, because the page
+   * lays itself out around it. Waiting to find out means laying the identity
+   * band out one way and then the other in front of the reader.
+   */
+  has_activity: boolean;
 }
 
 /** One page of a repository listing. */

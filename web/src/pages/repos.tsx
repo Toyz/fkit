@@ -78,10 +78,18 @@ export class PageRepos extends LoomElement {
   @reactive accessor total = 0;
   @reactive accessor busy = false;
   @reactive accessor failed = "";
+  /** Whether this load has gone on long enough to be worth a placeholder. */
+  @reactive accessor slow = false;
 
   @mount
   first() {
     void this.load();
+  }
+
+  /** Placeholders only once the wait is long enough to need them. */
+  @debounce(180)
+  private admitSlow() {
+    if (this.items === null) this.slow = true;
   }
 
   /**
@@ -107,6 +115,7 @@ export class PageRepos extends LoomElement {
   private async load() {
     this.busy = true;
     this.failed = "";
+    if (this.items === null) this.admitSlow();
     try {
       const page = await api.repoPage({ q: this.filter });
       this.items = page.items;
@@ -216,7 +225,11 @@ export class PageRepos extends LoomElement {
 
           <fkit-list>
             {loading ? (
-              [0, 1, 2, 3, 4].map(() => (
+              /* Still the loading branch either way: falling through to the
+                 next one would render "nothing here yet" at somebody whose
+                 list is on its way, which is a worse thing to flash than a
+                 placeholder. Empty until the wait earns the placeholder. */
+              (this.slow ? [0, 1, 2, 3, 4] : []).map(() => (
                 <div class="rr sk-row">
                   <span class="ic"><span class="sk" style="width:19px;height:19px"></span></span>
                   <span class="top"><span class="sk tall" style="width:min(38%,220px)"></span></span>

@@ -553,6 +553,18 @@ struct Profile {
     topics: Vec<String>,
     /// The most recent push to anything with a commit in it.
     last_push: Option<LastPush>,
+    /// Whether the year graph will have anything in it.
+    ///
+    /// Here, on the profile, rather than left for the activity request to
+    /// answer, because the page lays itself out around it: the identity band
+    /// is one column or two depending on whether there is a year to put
+    /// beside it. Waiting for a second request to find out means laying the
+    /// band out one way and then the other, in front of the reader, on every
+    /// profile that has nothing -- which on a new server is all of them.
+    ///
+    /// It counts private work like the graph does, since the graph counts it
+    /// too. What it never does is say whose.
+    has_activity: bool,
 }
 
 /// The tip of whatever this person pushed to most recently.
@@ -658,6 +670,18 @@ async fn get_profile(
         Some(LastPush { repo: name, at, short: hex[..10].to_string(), commit: hex })
     });
 
+    let (has_activity,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS(
+                  SELECT 1 FROM commit_authors ca
+                   WHERE ca.user_id = $1
+                     AND ca.repo_id IS NOT NULL
+                     AND LEAST(COALESCE(ca.committed_at, ca.pushed_at), ca.pushed_at)
+                           >= now() - interval '1 year')",
+    )
+    .bind(owner.id)
+    .fetch_one(&state.db)
+    .await?;
+
     Ok(Json(Profile {
         username: owner.username,
         display_name: owner.display_name,
@@ -669,6 +693,7 @@ async fn get_profile(
         private_count,
         topics: topics.into_iter().map(|(t,)| t).collect(),
         last_push,
+        has_activity,
     }))
 }
 

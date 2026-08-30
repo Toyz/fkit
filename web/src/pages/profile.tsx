@@ -356,6 +356,17 @@ export class PageProfile extends LoomElement {
   @reactive accessor cursor: string | null = null;
   @reactive accessor matched = 0;
   @reactive accessor searching = false;
+  /**
+   * Whether this load has gone on long enough to be worth admitting to.
+   *
+   * A skeleton is a promise that something is coming, and it is only worth
+   * making when the wait is long enough to need one. This profile answers in
+   * about twenty milliseconds on the same machine, so the placeholder was
+   * appearing for a frame or two and going again -- which does not read as
+   * loading, it reads as a glitch. Nothing at all for a moment is calmer than
+   * a shape that flashes.
+   */
+  @reactive accessor slow = false;
 
   @reactive accessor busy = false;
   /** A fetch is already out; a second caller should not start another. */
@@ -431,6 +442,17 @@ export class PageProfile extends LoomElement {
     this.load();
   }
 
+  /**
+   * Turn the placeholders on, but only if the data has not landed by now.
+   *
+   * Debounced rather than timed by hand so it cancels itself when the element
+   * goes away, and so a second navigation re-arms it instead of stacking.
+   */
+  @debounce(180)
+  private admitSlow() {
+    if (this.profile === null) this.slow = true;
+  }
+
   @on(window, "popstate")
   private load() {
     const who = location.pathname.split("/").filter(Boolean)[0] ?? "";
@@ -451,6 +473,8 @@ export class PageProfile extends LoomElement {
     this.shown = [];
     this.cursor = null;
     this.matched = 0;
+    this.slow = false;
+    this.admitSlow();
     // Its own request: a year of pushes is a different question from a list of
     // repositories, it is the slower of the two, and a profile that will not
     // render until both have landed is a worse profile than one that fills in.
@@ -506,7 +530,13 @@ export class PageProfile extends LoomElement {
 
     return (
       <div class="wrap">
-        <div class={`id${this.activity && this.activity.total > 0 ? "" : " solo"}`}>
+        {/* One column or two, decided by the profile itself rather than by
+            whether the year has arrived yet. Waiting for that second request
+            meant every profile laid its band out one way and then the other,
+            and a profile with nothing to show -- all of them, on a new server
+            -- did it the more visible way round. Before the profile lands the
+            band has no content, so the class it carries cannot be seen. */}
+        <div class={`id${p && !p.has_activity ? " solo" : ""}`}>
           <div class="band">
           {p ? (
             <>
@@ -583,7 +613,7 @@ export class PageProfile extends LoomElement {
                 ) : null}
               </div>
             </>
-          ) : (
+          ) : this.slow ? (
             <>
               <fkit-avatar size={58}></fkit-avatar>
               <div class="who">
@@ -591,7 +621,7 @@ export class PageProfile extends LoomElement {
                 <div class="facts"><span class="sk" style="width:230px"></span></div>
               </div>
             </>
-          )}
+          ) : null}
           </div>
 
           {/* The band's other half. Not gated on the tab: this is part of who
@@ -671,7 +701,7 @@ export class PageProfile extends LoomElement {
         <fkit-section>
           <fkit-list>
             {p === null ? (
-              [0, 1, 2].map(() => (
+              (this.slow ? [0, 1, 2] : []).map(() => (
                 <div class="r sk-row">
                   <span class="sk" style="width:13px;height:13px"></span>
                   <span class="name"><span class="sk tall" style="width:min(38%,200px)"></span></span>
