@@ -43,6 +43,83 @@ const SECTIONS: [Section, string, string][] = [
 ];
 
 const sheet = css`
+  /* The process panel.
+     
+     It was nine identical cells, so the number that says whether anything is
+     happening right now looked exactly like the number that says how many
+     bytes have ever moved, and nought per cent looked exactly like ninety.
+     Live state gets weight and a bar it can fill; totals since start get one
+     quiet line. */
+  .sys {
+    display: grid; grid-template-columns: minmax(140px, auto) minmax(0, 1fr);
+    gap: 18px 28px; align-items: center;
+    padding: 15px 14px;
+  }
+  @media (max-width: 720px) { .sys { grid-template-columns: minmax(0, 1fr); } }
+
+  /* The one number worth reading first. */
+  .now b {
+    display: block; font-family: var(--mono); font-size: 30px; font-weight: 600;
+    line-height: 1; letter-spacing: -0.03em; color: var(--accent);
+    font-variant-numeric: tabular-nums;
+  }
+  .now.idle b { color: var(--muted); }
+  .now span {
+    display: block; font-size: 10.5px; text-transform: uppercase;
+    letter-spacing: .07em; color: var(--muted); margin-top: 7px;
+  }
+
+  .meters { display: grid; gap: 10px; }
+  /* Label, reading, bar, then what the reading is a share of -- one line, so
+     the number sits beside the thing it describes rather than at the far edge
+     of the panel with a bar stretched between them. */
+  .meter {
+    display: grid; align-items: center; gap: 2px 12px;
+    grid-template-columns: 52px 48px minmax(70px, 200px) minmax(0, 1fr);
+  }
+  .meter .k {
+    font-size: 10.5px; text-transform: uppercase; letter-spacing: .07em;
+    color: var(--muted);
+  }
+  .meter .track {
+    height: 5px; border-radius: var(--radius-pill);
+    background: var(--raised); overflow: hidden;
+  }
+  .meter .fill {
+    display: block; height: 100%; background: var(--accent);
+    border-radius: var(--radius-pill);
+    transition: width .5s ease, background-color .5s ease;
+  }
+  /* Busy and struggling read differently without anyone having to compare
+     numbers. */
+  .meter .fill.warm { background: var(--modified); }
+  .meter .fill.hot { background: var(--removed); }
+  .meter .v {
+    font-family: var(--mono); font-size: 12.5px; color: var(--text);
+    text-align: right; font-variant-numeric: tabular-nums;
+  }
+  .meter .d { font-size: 11px; color: var(--faint); }
+  /* Where a row cannot hold all four, the detail drops under the bar rather
+     than squeezing it to nothing. */
+  @media (max-width: 900px) {
+    .meter { grid-template-columns: 52px 48px minmax(70px, 1fr); }
+    .meter .d { grid-column: 3; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .meter .fill { transition: none; }
+  }
+
+  /* Everything that is a total rather than a state. */
+  .since {
+    display: flex; flex-wrap: wrap; gap: 4px 16px;
+    border-top: 1px solid var(--border);
+    padding: 10px 14px; font-size: 11.5px; color: var(--faint);
+  }
+  .since b {
+    font-family: var(--mono); font-weight: 500; color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+
   .panel-body { padding: 14px; }
   /* One line per account, columns that line up down the list. The previous
      row stacked a name and an email into a single inline span, so a username
@@ -358,63 +435,110 @@ export class PageAdmin extends LoomElement {
 
   private renderSystem() {
     const y = this.system;
-    const secs = (n: number) => {
+    const brief = (n: number) => {
       const d = Math.floor(n / 86400);
       const h = Math.floor((n % 86400) / 3600);
       const m = Math.floor((n % 3600) / 60);
       return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`;
     };
+
+    /** A bar, its reading, and what the reading is a share of. */
+    const meter = (name: string, share: number | null, value: string, detail: string) => {
+      const pct = share === null ? 0 : Math.max(0, Math.min(100, share));
+      const heat = share === null ? "" : share >= 90 ? " hot" : share >= 70 ? " warm" : "";
+      return (
+        <div class="meter">
+          <span class="k">{name}</span>
+          <span class="v">{value}</span>
+          <span class="track">
+            <span class={`fill${heat}`} style={`width:${pct}%`}></span>
+          </span>
+          <span class="d">{detail}</span>
+        </div>
+      );
+    };
+
     const used =
       y && y.memory_total_bytes && y.memory_available_bytes
         ? y.memory_total_bytes - y.memory_available_bytes
         : null;
+    const memShare =
+      y && used !== null && y.memory_total_bytes ? (used / y.memory_total_bytes) * 100 : null;
+    const loadShare = y && y.load ? (y.load[0] / Math.max(1, y.cores)) * 100 : null;
 
     return (
       <fkit-section heading="This process">
-        <fkit-list>
-          {y === null ? (
+        {y === null ? (
+          <fkit-list>
             <fkit-empty><span class="sk" style="width:200px"></span></fkit-empty>
-          ) : (
-            <div class="stat-grid">
-              <div class="stat-cell">
+          </fkit-list>
+        ) : (
+          <div>
+            <div class="sys">
+              <div class={y.transfers_open > 0 ? "now" : "now idle"}>
                 <b>{y.transfers_open}</b>
                 <span>transfers in flight</span>
               </div>
-              <div class="stat-cell">
-                <b>{y.cpu_percent === null ? "—" : `${y.cpu_percent.toFixed(0)}%`}</b>
-                <span>of one core</span>
-              </div>
-              <div class="stat-cell">
-                <b>{y.load ? y.load[0].toFixed(2) : "—"}</b>
-                <span>load, 1 min</span>
-              </div>
-              <div class="stat-cell">
-                <b>{y.rss_bytes === null ? "—" : humanSize(y.rss_bytes)}</b>
-                <span>memory here</span>
-              </div>
-              <div class="stat-cell">
-                <b>{used === null ? "—" : humanSize(used)}</b>
-                <span>of {humanSize(y.memory_total_bytes ?? 0)} on the machine</span>
-              </div>
-              <div class="stat-cell">
-                <b>{secs(y.uptime)}</b>
-                <span>up</span>
-              </div>
-              <div class="stat-cell">
-                <b>{y.pushes.count.toLocaleString()}</b>
-                <span>pushes served</span>
-              </div>
-              <div class="stat-cell">
-                <b>{y.pulls.count.toLocaleString()}</b>
-                <span>pulls served</span>
-              </div>
-              <div class="stat-cell">
-                <b>{humanSize(y.pushes.bytes + y.pulls.bytes)}</b>
-                <span>moved</span>
+
+              <div class="meters">
+                {/* Measured against the whole machine, not against one core.
+                    A server pinned at ninety-odd per cent of a single core on
+                    a thirty-two core box is not in trouble, and colouring that
+                    like it is trains people to ignore the colour. */}
+                {meter(
+                  "CPU",
+                  y.cpu_percent === null ? null : y.cpu_percent / Math.max(1, y.cores),
+                  y.cpu_percent === null
+                    ? "—"
+                    : `${(y.cpu_percent / Math.max(1, y.cores)).toFixed(0)}%`,
+                  y.cpu_percent === null
+                    ? "waiting for a second sample"
+                    : `of ${y.cores} core${y.cores === 1 ? "" : "s"}` +
+                      ` · ${y.cpu_percent.toFixed(0)}% of one, since this page last asked`,
+                )}
+                {meter(
+                  "Memory",
+                  memShare,
+                  memShare === null ? "—" : `${memShare.toFixed(0)}%`,
+                  used === null
+                    ? "not readable here"
+                    : `${humanSize(used)} of ${humanSize(y.memory_total_bytes ?? 0)} on the machine` +
+                      (y.rss_bytes === null ? "" : ` · ${humanSize(y.rss_bytes)} of it this process`),
+                )}
+                {meter(
+                  "Load",
+                  loadShare,
+                  y.load ? y.load[0].toFixed(2) : "—",
+                  y.load
+                    ? `over one minute, across ${y.cores} core${y.cores === 1 ? "" : "s"}` +
+                      ` · ${y.load[1].toFixed(2)} at five, ${y.load[2].toFixed(2)} at fifteen`
+                    : "not readable here",
+                )}
               </div>
             </div>
-          )}
-        </fkit-list>
+
+            {/* Totals, not state. They only ever go up, and none of them
+                survive a restart, so they belong out of the way of the
+                readings that change. */}
+            <div class="since">
+              <span>
+                up <b>{brief(y.uptime)}</b>
+              </span>
+              <span>
+                <b>{y.pushes.count.toLocaleString()}</b> pushes
+              </span>
+              <span>
+                <b>{y.pulls.count.toLocaleString()}</b> pulls
+              </span>
+              <span>
+                <b>{humanSize(y.pushes.bytes + y.pulls.bytes)}</b> moved
+              </span>
+              <span>
+                <b>{y.transfers_accepted.toLocaleString()}</b> connections
+              </span>
+            </div>
+          </div>
+        )}
       </fkit-section>
     );
   }

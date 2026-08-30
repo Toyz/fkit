@@ -709,6 +709,8 @@ export interface SystemView {
   /** Share of one core since this was last asked. Null on the first ask. */
   cpu_percent: number | null;
   load: [number, number, number] | null;
+  /** Cores available to the server process. */
+  cores: number;
   rss_bytes: number | null;
   memory_total_bytes: number | null;
   memory_available_bytes: number | null;

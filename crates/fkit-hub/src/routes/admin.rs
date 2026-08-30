@@ -176,6 +176,9 @@ struct SystemView {
     cpu_percent: Option<f64>,
     /// Load averages over one, five and fifteen minutes.
     load: Option<[f64; 3]>,
+    /// Cores available to this process, so a load average has a denominator.
+    /// A load of 4 is idle on a big machine and desperate on a small one.
+    cores: usize,
     /// Resident memory of this process.
     rss_bytes: Option<u64>,
     memory_total_bytes: Option<u64>,
@@ -195,6 +198,7 @@ async fn system(State(state): State<AppState>, viewer: Viewer) -> AppResult<Json
         uptime: state.live.uptime_secs(),
         cpu_percent: state.live.cpu_percent(),
         load: crate::live::load_average(),
+        cores: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
         rss_bytes: crate::live::process_rss(),
         memory_total_bytes: total,
         memory_available_bytes: available,
