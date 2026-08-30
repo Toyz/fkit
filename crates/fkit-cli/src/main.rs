@@ -2083,18 +2083,26 @@ fn cmd_fast_import(branch: Option<&str>, every: u64) -> Result<()> {
     // usually carries several branches; without being told, prefer the one
     // this repository already calls its default.
     let want = branch.map(str::to_string).unwrap_or_else(|| "main".to_string());
+    // Branches are branches and tags are tags. Folding everything that is not
+    // a branch onto the target branch would let a thousand tag refs each
+    // overwrite it in turn, leaving it wherever the last one happened to
+    // point -- which is how `--all` behaves, so this is not a corner case.
     let mut landed = Vec::new();
+    let mut tags = 0usize;
     for (name, tip) in &report.refs {
-        // `refs/heads/main` is spelled `main` here. Anything else -- a tag, or
-        // the raw commit id that `fast-export` uses when handed a detached
-        // revision rather than a ref -- is not a branch name anybody wants, so
-        // it becomes the branch that was asked for.
-        let short = match name.strip_prefix("refs/heads/") {
-            Some(b) if !b.is_empty() => b.to_string(),
-            _ => want.clone(),
-        };
-        repo.write_ref(&short, *tip)?;
-        landed.push(short);
+        if let Some(b) = name.strip_prefix("refs/heads/").filter(|b| !b.is_empty()) {
+            repo.write_ref(b, *tip)?;
+            landed.push(b.to_string());
+        } else if let Some(t) = name.strip_prefix("refs/tags/").filter(|t| !t.is_empty()) {
+            repo.write_tag(t, *tip, true)?;
+            tags += 1;
+        } else {
+            // `fast-export` names the ref after the commit when it is handed a
+            // revision rather than a ref. There is one such history, so it
+            // becomes the branch that was asked for.
+            repo.write_ref(&want, *tip)?;
+            landed.push(want.clone());
+        }
     }
     landed.sort();
     landed.dedup();
@@ -2108,6 +2116,9 @@ fn cmd_fast_import(branch: Option<&str>, every: u64) -> Result<()> {
         report.commits as f64 / secs
     );
     println!("  branches: {}", landed.join(", "));
+    if tags > 0 {
+        println!("  tags: {tags}");
+    }
 
     if landed.contains(&want) {
         repo.set_head(&Head::Branch(want.clone()))?;
