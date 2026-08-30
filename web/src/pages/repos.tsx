@@ -2,7 +2,7 @@
 import { LoomElement, component, css, styles, reactive, inject, mount, debounce } from "@toyz/loom";
 import { route } from "@toyz/loom/router";
 import { base } from "../ui";
-import { api, type Repo } from "../api";
+import { api, type Repo, type User } from "../api";
 import { linkHandler } from "../nav";
 import { repoRow, repoRowSheet } from "../repo-row";
 import { Session } from "../session";
@@ -80,6 +80,30 @@ export class PageRepos extends LoomElement {
   @reactive accessor failed = "";
   /** Whether this load has gone on long enough to be worth a placeholder. */
   @reactive accessor slow = false;
+
+  /**
+   * The session, mirrored so this page re-renders when it resolves.
+   *
+   * Reading `session.isAuthed` straight out of the service does not subscribe
+   * to anything, so nothing re-rendered when the answer arrived: whatever the
+   * page happened to draw first was what stayed. And before the answer
+   * arrives `isAuthed` is false, so the first draw was the signed-out one --
+   * a signed-in visitor refreshing this page got the front-door masthead with
+   * "sign in" and "register" on it, and kept it until some unrelated state
+   * change happened to redraw.
+   *
+   * `undefined` here means "not known yet", which is a different thing from
+   * "signed out" and is deliberately not collapsed into it.
+   */
+  @reactive accessor user: User | null | undefined = undefined;
+
+  @mount
+  watchSession() {
+    this.user = this.session.current;
+    return this.session.user.subscribe((u: User | null | undefined) => {
+      this.user = u;
+    });
+  }
 
   @mount
   first() {
@@ -185,7 +209,7 @@ export class PageRepos extends LoomElement {
             Signed in you already know where you are, so this is for the people
             who do not -- and it says what the thing does rather than selling
             it, because a self-hosted forge has nothing to sell. */}
-        {!this.session.isAuthed ? (
+        {this.user === null ? (
           <div class="hail">
             <h1>
               <span class="mark">fkit</span>
@@ -201,9 +225,16 @@ export class PageRepos extends LoomElement {
               <code>fkit clone {this.origin()}/owner/repo</code>
               <span class="fill"></span>
               <a class="btn" href="/login" onClick={linkHandler("/login")}>sign in</a>
-              <a class="btn primary" href="/register" onClick={linkHandler("/register")}>
-                register
-              </a>
+              {/* Offered only where it leads somewhere. The header has always
+                  checked this; the front page did not, so a server with
+                  registration closed put its most prominent button on the one
+                  page a stranger is most likely to land on, and the only thing
+                  behind it was a refusal. */}
+              {this.session.meta.value?.open_registration !== false ? (
+                <a class="btn primary" href="/register" onClick={linkHandler("/register")}>
+                  register
+                </a>
+              ) : null}
             </div>
           </div>
         ) : null}
@@ -243,7 +274,7 @@ export class PageRepos extends LoomElement {
                 <p class="prose">
                   {this.filter
                     ? "No repository matches that filter."
-                    : this.session.isAuthed
+                    : this.user
                       ? "Create a repository, then push to it from the fkit CLI."
                       : "Sign in to see private repositories you have access to."}
                 </p>

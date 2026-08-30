@@ -47,7 +47,17 @@ const router = new LoomRouter({ mode: "history" });
 app.use(router);
 app.start();
 
-// Resolve the session before first paint so the header does not flash "Sign in"
-// for an already-authenticated user.
+// Ask who this is, immediately.
+//
+// Deliberately not awaited: blocking here would hold back the shell as well,
+// and a blank page is not an improvement on a header that says "…" for a
+// moment. What matters is that the request is in flight before anything reads
+// the answer, and that nothing draws a signed-in or signed-out state until it
+// arrives -- "not known yet" is a third state, and every component that cares
+// has to render it as one rather than treating it as signed out.
+//
+// The comment here used to claim this resolved before first paint. It did not,
+// and the page that trusted it drew its signed-out front door at signed-in
+// visitors.
 const session = app.get<import("./session").Session>("session");
 void session.load();
