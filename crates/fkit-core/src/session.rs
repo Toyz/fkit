@@ -150,6 +150,13 @@ pub struct SessionStats {
 /// Serve push and pull requests until the peer disconnects or says `Done`.
 ///
 /// Call after `read_hello` and `send_welcome`.
+/// How many times a push may go back for objects an earlier attempt lost.
+///
+/// A handful: each round fills the gaps the previous one revealed, and a
+/// history damaged more deeply than that wants looking at rather than
+/// retrying.
+const MAX_REPAIR_ROUNDS: usize = 8;
+
 pub fn serve_session<T: Transport + ?Sized, H: RepoHost + ?Sized>(
     t: &mut T,
     host: &H,
@@ -233,8 +240,52 @@ pub fn serve_session<T: Transport + ?Sized, H: RepoHost + ?Sized>(
 
                 // Receive the closure first: the ref cannot be allowed to point
                 // at objects we do not hold, so verification precedes the move.
-                let stats = fetch_closure(host.store(), t, &[tip])?;
-                verify_closure_into(host.store(), tip, &mut verified)?;
+                //
+                // Then repair whatever is still absent, rather than refusing.
+                //
+                // A transfer that is cut off partway leaves objects here whose
+                // children never arrived, and the next attempt trusts them:
+                // asking for the closure prunes at anything already present,
+                // so those gaps are skipped and the push fails on exactly the
+                // objects the interruption lost. It fails the same way every
+                // time, because nothing about retrying changes the decision --
+                // which turned one dropped connection into a repository that
+                // could only be fixed by deleting it.
+                //
+                // Naming the gaps and fetching them closes that. The loop is
+                // bounded because each round either fetches something or stops:
+                // a round that receives nothing new cannot make progress, and
+                // continuing would be a spin rather than a repair.
+                let mut stats = fetch_closure(host.store(), t, &[tip])?;
+                let mut rounds = 0;
+                loop {
+                    let missing = crate::proto::missing_in_closure(
+                        host.store(),
+                        tip,
+                        &mut verified,
+                    )?;
+                    if missing.is_empty() {
+                        break;
+                    }
+                    rounds += 1;
+                    if rounds > MAX_REPAIR_ROUNDS {
+                        anyhow::bail!(
+                            "incomplete after {rounds} attempts to fill the gaps; \
+                             {} object(s) still missing, the first being {}",
+                            missing.len(),
+                            missing[0].short()
+                        );
+                    }
+                    let before = stats.objects;
+                    stats.merge(&fetch_closure(host.store(), t, &missing)?);
+                    if stats.objects == before {
+                        anyhow::bail!(
+                            "incomplete: the peer cannot supply {}, which this \
+                             repository needs and does not have",
+                            missing[0].short()
+                        );
+                    }
+                }
                 totals.pushed.merge(&stats);
 
                 match host.advance_ref(&branch, tip, force)? {

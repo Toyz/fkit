@@ -466,17 +466,41 @@ pub fn verify_closure_into(
     seen: &mut HashSet<Hash>,
 ) -> Result<usize> {
     let before = seen.len();
+    let missing = missing_in_closure(store, root, seen)?;
+    if let Some(h) = missing.first() {
+        bail!("incomplete: object {} is missing", h.short());
+    }
+    Ok(seen.len() - before)
+}
+
+/// Walk the closure under `root` and report what is not here.
+///
+/// The same walk as [`verify_closure_into`], but it names everything absent
+/// instead of stopping at the first one, so a caller able to go and get them
+/// can do that in one round rather than one at a time.
+///
+/// A missing object stops the descent there: its children cannot be read to be
+/// asked about, and fetching it will reveal them.
+pub fn missing_in_closure(
+    store: &Store,
+    root: Hash,
+    seen: &mut HashSet<Hash>,
+) -> Result<Vec<Hash>> {
+    let mut missing = Vec::new();
     let mut stack = vec![root];
     while let Some(h) = stack.pop() {
         if !seen.insert(h) {
             continue;
         }
         if !store.has(h) {
-            bail!("incomplete: object {} is missing", h.short());
+            // Not proven after all -- forget it, so a later walk looks again.
+            seen.remove(&h);
+            missing.push(h);
+            continue;
         }
         stack.extend(store.get(h)?.links());
     }
-    Ok(seen.len() - before)
+    Ok(missing)
 }
 
 #[cfg(test)]
