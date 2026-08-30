@@ -274,6 +274,59 @@ impl Repo {
         Ok(out)
     }
 
+    // ---- the stash ----
+    //
+    // Work set aside so the working tree can go back to HEAD. A stash is an
+    // ordinary commit with the working tree as its content and HEAD as its
+    // parent, kept alive by a ref like anything else — this store has no
+    // notion of a dangling object worth keeping, and would rather not grow
+    // one.
+    //
+    // Deliberately outside `all_refs`, which is the namespace the wire
+    // protocol and the hub share. A stash is unfinished work on one machine;
+    // pushing it would publish it, and a hub receiving a ref it has no concept
+    // of is a worse problem than that.
+
+    fn stash_dir(&self) -> PathBuf {
+        self.meta().join("refs").join("stash")
+    }
+
+    /// The stash stack, newest first.
+    ///
+    /// Entries are numbered by when they were made and never renumbered, so a
+    /// hash written down stays valid after something below it is dropped. The
+    /// position shown to a person is the index in this list.
+    pub fn list_stashes(&self) -> Result<Vec<(u64, Hash)>> {
+        let dir = self.stash_dir();
+        let mut out = Vec::new();
+        let Ok(entries) = fs::read_dir(&dir) else { return Ok(out) };
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let Ok(n) = name.parse::<u64>() else { continue };
+            if let Some(h) = read_hash_file(&e.path())? {
+                out.push((n, h));
+            }
+        }
+        out.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
+        Ok(out)
+    }
+
+    /// Record a stash, returning the number it was given.
+    pub fn push_stash(&self, commit: Hash) -> Result<u64> {
+        let next = self.list_stashes()?.first().map(|(n, _)| n + 1).unwrap_or(0);
+        let dir = self.stash_dir();
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join(next.to_string()), format!("{commit}
+"))?;
+        Ok(next)
+    }
+
+    pub fn drop_stash(&self, n: u64) -> Result<()> {
+        fs::remove_file(self.stash_dir().join(n.to_string()))
+            .with_context(|| format!("no stash numbered {n}"))?;
+        Ok(())
+    }
+
     /// The commit HEAD currently resolves to, if any. `None` on a fresh repo
     /// whose branch has no commits yet.
     pub fn head_commit(&self) -> Result<Option<Hash>> {

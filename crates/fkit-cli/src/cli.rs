@@ -34,6 +34,11 @@ SNAPSHOTS
     commit -m <message>      snapshot the working tree
     log [-n <count>]         show commit history
     diff [<a>] [<b>]         show what changed (defaults: HEAD vs working tree)
+    stash [-m <message>]     set changes aside and go back to HEAD
+    stash list               what has been set aside
+    stash pop [<n>]          restore the newest, or <n>, and drop it
+    stash apply [<n>]        restore without dropping
+    stash drop [<n>]         discard one
 
 BRANCHES
     branch [<name>]          list branches, or create one at HEAD
@@ -175,6 +180,15 @@ pub enum Command {
         force: bool,
     },
 
+    /// Set uncommitted changes aside, or bring them back.
+    Stash {
+        #[command(subcommand)]
+        command: Option<StashCommand>,
+        /// What the changes are, for the list.
+        #[arg(short, long)]
+        message: Option<String>,
+    },
+
     /// Merge another branch into the current one.
     Merge {
         branch: String,
@@ -289,6 +303,19 @@ pub struct GcArgs {
     /// Ignore the age guard. Nothing else may be writing.
     #[arg(long)]
     pub prune_all: bool,
+}
+
+/// What can be done with set-aside work.
+#[derive(Subcommand, Debug)]
+pub enum StashCommand {
+    /// Show what has been set aside, newest first.
+    List,
+    /// Restore a stash and drop it.
+    Pop { which: Option<usize> },
+    /// Restore a stash, keeping it in the list.
+    Apply { which: Option<usize> },
+    /// Discard a stash without restoring it.
+    Drop { which: Option<usize> },
 }
 
 #[derive(Subcommand, Debug)]

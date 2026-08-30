@@ -109,6 +109,32 @@ target/
 EOF
 ```
 
+## Setting work aside
+
+`switch` and `merge` both refuse to run over uncommitted changes, because they
+rewrite tracked files and mixing that with your edits makes it impossible to
+tell afterwards which change came from where. When you are not ready to commit:
+
+```sh
+fkit stash -m "half a parser"   # set it aside, working tree back at HEAD
+fkit stash list
+fkit stash pop                  # bring it back and forget it
+fkit stash apply                # bring it back and keep it
+fkit stash drop
+```
+
+A stash is an ordinary commit holding the working tree, parented on the HEAD it
+was taken from. That parent is the useful part: bringing it back is a three-way
+merge against the exact tree it was written on, so anything that landed
+meanwhile is kept rather than reverted, and a genuine overlap gets the same
+conflict markers `merge` produces.
+
+A stash that comes back with conflicts is not dropped. Otherwise the only clean
+copy of the work would be the file full of markers you are standing in.
+
+Stashes are local. They are not pushed, and `fkit gc` treats them as roots, so
+housekeeping cannot collect the one thing nothing else points at.
+
 ## Branches
 
 ```sh

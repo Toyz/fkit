@@ -55,7 +55,7 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    use cli::{Cli, Command as C, SubmoduleCommand as S};
+    use cli::{Cli, Command as C, StashCommand as SC, SubmoduleCommand as S};
     use clap::Parser;
 
     let Some(command) = Cli::parse().command else {
@@ -75,6 +75,13 @@ fn run() -> Result<()> {
         C::Branch { delete, name } => cmd_branch(delete, name),
         C::Tag { delete, force, name, commit } => cmd_tag(delete, force, name, commit),
         C::Switch { name, force } => cmd_switch(&name, force),
+        C::Stash { command, message } => match command {
+            None => cmd_stash(message),
+            Some(SC::List) => cmd_stash_list(),
+            Some(SC::Pop { which }) => cmd_stash_restore(which, true),
+            Some(SC::Apply { which }) => cmd_stash_restore(which, false),
+            Some(SC::Drop { which }) => cmd_stash_drop(which),
+        },
         C::Merge { branch, message } => cmd_merge(&branch, message),
         C::Checkout { commit, force } => cmd_checkout(&commit, force),
         C::Show { hash } => cmd_show(&hash),
@@ -661,6 +668,151 @@ fn cmd_switch(name: &str, force: bool) -> Result<()> {
     repo.set_head(&Head::Branch(name.clone()))?;
     println!("switched to branch {name} ({})", target.short());
     report_plan(&plan);
+    Ok(())
+}
+
+// ---- the stash -----------------------------------------------------------
+//
+// A stash is an ordinary commit holding the working tree, parented on the HEAD
+// it was taken from, kept alive by a ref outside the pushable namespace. That
+// parent is what makes restoring it a three-way merge rather than a guess: it
+// is the exact base both sides diverged from, so the same machinery `merge`
+// uses applies unchanged — including the conflict markers, because there is
+// one way to resolve a conflict in this tool.
+
+fn cmd_stash(message: Option<String>) -> Result<()> {
+    let repo = here()?;
+    require_author(&repo)?;
+
+    let head = repo
+        .head_commit()?
+        .context("nothing to stash: this repository has no commits yet")?;
+    let snap = repo.snapshot_writing()?;
+    if Some(snap.hash) == repo.head_tree()? {
+        bail!("nothing to stash: the working tree matches HEAD");
+    }
+
+    let branch = match repo.head()? {
+        Head::Branch(b) => b,
+        Head::Detached(h) => format!("detached at {}", h.short()),
+    };
+    let message = message.unwrap_or_else(|| format!("work in progress on {branch}"));
+
+    let commit = fkit_core::Commit {
+        tree: snap.hash,
+        parents: vec![head],
+        author: repo.author(),
+        timestamp: fkit_core::repo::now_unix(),
+        message: message.clone(),
+    };
+    let (id, _) = repo.store.put(&fkit_core::Object::Commit(commit))?;
+
+    // Recorded before the working tree is touched: if anything below fails,
+    // the work is already safe under a ref rather than only on disk.
+    let n = repo.push_stash(id)?;
+
+    let plan = checkout_tree(&repo, Some(snap.hash), tree_of(&repo, head)?, true)?;
+    println!("stashed {} as stash@{n}: {message}", id.short());
+    println!("  {} written, {} removed — the working tree is back at HEAD", plan.written, plan.removed);
+    Ok(())
+}
+
+fn cmd_stash_list() -> Result<()> {
+    let repo = here()?;
+    let stashes = repo.list_stashes()?;
+    if stashes.is_empty() {
+        println!("nothing stashed");
+        return Ok(());
+    }
+    for (i, (n, h)) in stashes.iter().enumerate() {
+        let msg = match repo.store.get(*h) {
+            Ok(fkit_core::Object::Commit(c)) => c.message,
+            _ => "(unreadable)".into(),
+        };
+        println!("  [{i}] stash@{n}  {}  {msg}", h.short());
+    }
+    Ok(())
+}
+
+/// Look up a stash by the position shown in `stash list`.
+fn pick_stash(repo: &Repo, which: Option<usize>) -> Result<(u64, Hash)> {
+    let stashes = repo.list_stashes()?;
+    if stashes.is_empty() {
+        bail!("nothing stashed");
+    }
+    let i = which.unwrap_or(0);
+    stashes
+        .get(i)
+        .copied()
+        .with_context(|| format!("no stash at [{i}] — there are {}", stashes.len()))
+}
+
+fn cmd_stash_restore(which: Option<usize>, drop_after: bool) -> Result<()> {
+    use fkit_core::merge::{merge_trees, ConflictKind};
+    let repo = here()?;
+    let (n, id) = pick_stash(&repo, which)?;
+
+    let fkit_core::Object::Commit(stash) = repo.store.get(id)? else {
+        bail!("stash@{n} is not a commit");
+    };
+    let base = *stash
+        .parents
+        .first()
+        .context("stash@{n} has no parent, so there is no base to merge from")?;
+
+    let head = repo.head_commit()?.context("no commits to restore onto")?;
+    let snap = repo.snapshot()?;
+    if Some(snap.hash) != repo.head_tree()? {
+        bail!("you have uncommitted changes — commit or stash them before restoring another stash");
+    }
+
+    // Three-way, with the stash's own parent as the base: exactly the tree the
+    // work was written against, so anything that has landed since is preserved
+    // rather than reverted.
+    let outcome = merge_trees(
+        &repo.store,
+        Some(tree_of(&repo, base)?),
+        tree_of(&repo, head)?,
+        stash.tree,
+    )?;
+
+    let plan = checkout_tree(&repo, repo.head_tree()?, outcome.tree, true)?;
+    println!("restored stash@{n} ({})", id.short());
+    println!("  {} written, {} removed", plan.written, plan.removed);
+
+    if !outcome.clean() {
+        println!("
+{} conflict(s):", outcome.conflicts.len());
+        for c in &outcome.conflicts {
+            let what = match c.kind {
+                ConflictKind::Content { regions } => format!("{regions} overlapping region(s)"),
+                ConflictKind::Binary => "binary file".into(),
+                ConflictKind::DeleteModify => "deleted on one side, modified on the other".into(),
+                ConflictKind::TypeChange => "changed to a different kind of entry".into(),
+            };
+            println!("  {} — {what}", c.path);
+        }
+        // Kept deliberately. Dropping a stash whose restoration conflicted
+        // would leave the only clean copy of the work in a file full of
+        // markers, with nothing to go back to.
+        println!("
+Resolve them and commit. stash@{n} is kept until it applies cleanly.");
+        return Ok(());
+    }
+
+    if drop_after {
+        repo.drop_stash(n)?;
+        println!("  stash@{n} dropped");
+    }
+    Ok(())
+}
+
+fn cmd_stash_drop(which: Option<usize>) -> Result<()> {
+    let repo = here()?;
+    let (n, id) = pick_stash(&repo, which)?;
+    repo.drop_stash(n)?;
+    println!("dropped stash@{n} ({})", id.short());
+    println!("  the commit stays in the store until `fkit gc` runs");
     Ok(())
 }
 
@@ -1778,6 +1930,10 @@ fn cmd_gc(dry_run: bool, prune_all: bool) -> Result<()> {
     if let Some(h) = repo.merge_head()? {
         roots.push(h);
     }
+    // A stash is set-aside work that nothing else points at. It is exactly the
+    // thing this walk would otherwise decide is garbage, and the one thing a
+    // person would be most upset to lose to a housekeeping command.
+    roots.extend(repo.list_stashes()?.into_iter().map(|(_, h)| h));
 
     if roots.is_empty() {
         println!("no branches — nothing is reachable, so nothing is collected");
