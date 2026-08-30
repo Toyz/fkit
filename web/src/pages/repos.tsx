@@ -32,19 +32,45 @@ const sheet = css`
     font-family: var(--sans); font-size: 12.5px; line-height: 1.6;
     color: var(--muted); margin: 0; max-width: 68ch;
   }
-  /* The command is the point of the row, so it is the thing set in type you
-     could copy, and the buttons sit at the far end of it. */
-  .hail .try {
-    display: flex; align-items: center; flex-wrap: wrap; gap: 10px;
-    margin-top: 16px;
+  /* Two columns: what this is on the left, held to the measure the prose
+     reads at, and the one command worth running on the right.
+     
+     It used to be a flex row with a spacer in it, which pinned the buttons to
+     the far edge -- at any real window width that put the lede in one corner
+     and the buttons in the other with a thousand pixels of nothing between
+     them, and the two halves stopped reading as one block. Dropping them left
+     a third of the width carrying everything and two thirds carrying nothing,
+     which is not better, only emptier. So the right side is given the thing a
+     stranger actually came for. */
+  .hail .cols {
+    display: grid; align-items: start; justify-content: start;
+    /* The second column is as wide as the command in it and no wider. Letting
+       it take the rest of the row made an 800px box around forty characters,
+       which reads as a box that failed to load rather than as a command. */
+    grid-template-columns: minmax(0, 68ch) minmax(0, max-content);
+    gap: 22px 56px;
   }
+  /* One column below the width where two would squeeze the prose. */
+  @media (max-width: 900px) {
+    .hail .cols { grid-template-columns: minmax(0, 1fr); }
+    .hail .start { max-width: 68ch; }
+  }
+
+  /* A block rather than a chip: it is the call to action, and something the
+     eye has to be able to find without hunting for it. */
   .hail code {
+    /* As wide as the command, in either layout. A block that fills its column
+       puts a lot of empty box around forty characters. */
+    display: block; width: fit-content; max-width: 100%;
     font-family: var(--mono); font-size: 11.5px; color: var(--faint);
     background: var(--raised); border: 1px solid var(--border);
-    border-radius: var(--radius); padding: 5px 10px;
-    overflow-x: auto; max-width: 100%;
+    border-radius: var(--radius); padding: 9px 11px;
+    overflow-x: auto; white-space: nowrap;
   }
-  .hail .fill { flex: 1; }
+  .hail .note {
+    font-family: var(--sans); font-size: 11.5px; line-height: 1.5;
+    color: var(--faint); margin: 8px 0 0;
+  }
 
   .more { display: flex; justify-content: center; margin-top: 14px; }
 
@@ -181,10 +207,32 @@ export class PageRepos extends LoomElement {
    * resolves for a 404 or a 500, so a hand-written `.then(r => r.json())` puts
    * an error body in `data` and reports success. This throws instead.
    */
-  /** This server, spelled the way the CLI wants it. */
-  private origin(): string {
+  /**
+   * A clone command someone can actually run.
+   *
+   * It used to end in the words "owner/repo", which is a line that does
+   * nothing when you paste it -- the same fault the footer was carrying until
+   * it was taken out of there. This server knows a real repository to name:
+   * its own source when it can find it, otherwise the first one on the list.
+   * The placeholder is only reached on a server with nothing public on it, and
+   * there is genuinely nothing to clone there.
+   */
+  private cloneCommand(): string {
     const scheme = location.protocol === "https:" ? "wss" : "ws";
-    return `${scheme}://${location.host}`;
+    return `${scheme}://${location.host}/${this.cloneTarget()}`;
+  }
+
+  private cloneTarget(): string {
+    return (
+      this.session.meta.value?.self_repo || this.items?.[0]?.full_name || "owner/repo"
+    );
+  }
+
+  /** What that command would actually fetch, said plainly. */
+  private cloneNote(): string {
+    if (this.session.meta.value?.self_repo) return "The source this server runs on.";
+    if (this.items?.[0]) return "The most recently updated repository here.";
+    return "Replace the last part with a repository on this server.";
   }
 
   update() {
@@ -211,30 +259,30 @@ export class PageRepos extends LoomElement {
             it, because a self-hosted forge has nothing to sell. */}
         {this.user === null ? (
           <div class="hail">
-            <h1>
-              <span class="mark">fkit</span>
-              <span class="tag">content-addressed version control</span>
-            </h1>
-            <p class="lede">
-              Every chunk, file, tree and commit is named by the BLAKE3 digest of
-              what it holds. A hash means one exact state of one exact tree, and
-              content that is identical is stored once — across branches, across
-              forks, across every repository on this server that has it.
-            </p>
-            <div class="try">
-              <code>fkit clone {this.origin()}/owner/repo</code>
-              <span class="fill"></span>
-              <a class="btn" href="/login" onClick={linkHandler("/login")}>sign in</a>
-              {/* Offered only where it leads somewhere. The header has always
-                  checked this; the front page did not, so a server with
-                  registration closed put its most prominent button on the one
-                  page a stranger is most likely to land on, and the only thing
-                  behind it was a refusal. */}
-              {this.session.meta.value?.open_registration !== false ? (
-                <a class="btn primary" href="/register" onClick={linkHandler("/register")}>
-                  register
-                </a>
-              ) : null}
+            <div class="cols">
+              <div>
+                <h1>
+                  <span class="mark">fkit</span>
+                  <span class="tag">content-addressed version control</span>
+                </h1>
+                <p class="lede">
+                  Every chunk, file, tree and commit is named by the BLAKE3
+                  digest of what it holds. A hash means one exact state of one
+                  exact tree, and content that is identical is stored once —
+                  across branches, across forks, across every repository on this
+                  server that has it.
+                </p>
+              </div>
+              {/* No sign in or register here. The header carries both, on every
+                  page, and it gates registration on whether this server has it
+                  open. Repeating them put the same word twice on one screen,
+                  and on a server with registration closed it left a single
+                  button stranded at the far edge of a row it no longer shared
+                  with anything. */}
+              <div class="start">
+                <code>fkit clone {this.cloneCommand()}</code>
+                <p class="note">{this.cloneNote()}</p>
+              </div>
             </div>
           </div>
         ) : null}
