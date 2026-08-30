@@ -2089,6 +2089,7 @@ fn cmd_fast_import(branch: Option<&str>, every: u64) -> Result<()> {
     // point -- which is how `--all` behaves, so this is not a corner case.
     let mut landed = Vec::new();
     let mut tags = 0usize;
+    let mut remotes = 0usize;
     for (name, tip) in &report.refs {
         if let Some(b) = name.strip_prefix("refs/heads/").filter(|b| !b.is_empty()) {
             repo.write_ref(b, *tip)?;
@@ -2096,12 +2097,24 @@ fn cmd_fast_import(branch: Option<&str>, every: u64) -> Result<()> {
         } else if let Some(t) = name.strip_prefix("refs/tags/").filter(|t| !t.is_empty()) {
             repo.write_tag(t, *tip, true)?;
             tags += 1;
-        } else {
+        } else if name.starts_with("refs/remotes/") {
+            // Somebody else's copy of a branch. Importing it as a branch of
+            // our own would invent local branches nobody made, and letting it
+            // fall through to the default would have each one overwrite that
+            // in turn -- leaving it wherever the last remote happened to point.
+            remotes += 1;
+        } else if name.len() == 40 && name.chars().all(|c| c.is_ascii_hexdigit()) {
             // `fast-export` names the ref after the commit when it is handed a
-            // revision rather than a ref. There is one such history, so it
-            // becomes the branch that was asked for.
+            // revision rather than a ref. That is the one case with no name of
+            // its own, so it becomes the branch that was asked for.
             repo.write_ref(&want, *tip)?;
             landed.push(want.clone());
+        } else {
+            // Some other ref namespace. Keep it under its last component
+            // rather than dropping history on the floor.
+            let short = name.rsplit('/').next().unwrap_or(name).to_string();
+            repo.write_ref(&short, *tip)?;
+            landed.push(short);
         }
     }
     landed.sort();
@@ -2118,6 +2131,9 @@ fn cmd_fast_import(branch: Option<&str>, every: u64) -> Result<()> {
     println!("  branches: {}", landed.join(", "));
     if tags > 0 {
         println!("  tags: {tags}");
+    }
+    if remotes > 0 {
+        println!("  {remotes} remote-tracking ref(s) ignored");
     }
     if report.skipped_submodules > 0 {
         // Said plainly rather than buried: the imported tree genuinely differs
