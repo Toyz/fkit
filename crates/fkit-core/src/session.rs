@@ -33,6 +33,28 @@ pub enum RefUpdate {
 /// Everything the shared session loop needs from a particular server.
 pub trait RepoHost {
     fn store(&self) -> &Store;
+
+    // ---- stashes ----
+    //
+    // Parked work belongs to an account, so a server without accounts has
+    // nobody to park it for. These default to refusing rather than being
+    // required, which keeps the minimal daemon exactly as simple as it was.
+
+    fn put_stash(&self, _tip: Hash, _message: &str) -> Result<()> {
+        anyhow::bail!("this server does not keep stashes")
+    }
+    fn list_stashes(&self) -> Result<Vec<(Hash, String)>> {
+        Ok(Vec::new())
+    }
+    /// Whether this stash is the caller's to read. False for anything else,
+    /// including somebody else's.
+    fn owns_stash(&self, _commit: Hash) -> Result<bool> {
+        Ok(false)
+    }
+    fn drop_stash(&self, _commit: Hash) -> Result<()> {
+        anyhow::bail!("this server does not keep stashes")
+    }
+
     fn refs(&self) -> Result<Vec<(String, Hash)>>;
     fn read_ref(&self, branch: &str) -> Result<Option<Hash>>;
 
@@ -140,6 +162,56 @@ pub fn serve_session<T: Transport + ?Sized, H: RepoHost + ?Sized>(
         };
 
         match msg {
+            // ---- stashes ----
+            //
+            // Parked work. It is kept and it is not a ref, so it needs verbs of
+            // its own; a host without accounts has nobody to park it for and
+            // refuses through the trait's default.
+            Msg::PushStash { tip, message } => {
+                if !host.can_write() {
+                    send_error(t, "you do not have write access to this repository")?;
+                    continue;
+                }
+                // Objects first: what is recorded must already be here, the
+                // same order a ref push uses and for the same reason.
+                let stats = fetch_closure(host.store(), t, &[tip])?;
+                totals.pushed.merge(&stats);
+                match host.put_stash(tip, &message) {
+                    Ok(()) => crate::proto::send(t, &Msg::Ok {
+                        message: format!("stashed {} ({} objects)", tip.short(), stats.objects),
+                    })?,
+                    Err(e) => send_error(t, e.to_string())?,
+                }
+            }
+
+            Msg::ListStashes => match host.list_stashes() {
+                Ok(entries) => crate::proto::send(t, &Msg::StashList { entries })?,
+                Err(e) => send_error(t, e.to_string())?,
+            },
+
+            Msg::PullStash { commit } => {
+                // Ownership is the host's to judge; it answers false for
+                // anything that is not this account's.
+                match host.owns_stash(commit) {
+                    Ok(true) => {
+                        let stats = serve_wants(host.store(), t)?;
+                        totals.pulled.merge(&stats);
+                        crate::proto::send(t, &Msg::Ok {
+                            message: format!("sent {} objects", stats.objects),
+                        })?;
+                    }
+                    Ok(false) => send_error(t, "no such stash")?,
+                    Err(e) => send_error(t, e.to_string())?,
+                }
+            }
+
+            Msg::DropStash { commit } => match host.drop_stash(commit) {
+                Ok(()) => crate::proto::send(t, &Msg::Ok {
+                    message: format!("dropped {}", commit.short()),
+                })?,
+                Err(e) => send_error(t, e.to_string())?,
+            },
+
             Msg::PushRef { branch, tip, force } => {
                 if !host.can_write() {
                     send_error(t, "you do not have write access to this repository")?;

@@ -79,6 +79,24 @@ pub enum Msg {
 
     /// "I am about to give you this branch tip."
     PushRef { branch: String, tip: Hash, force: bool },
+
+    // ---- stashes ----
+    //
+    // Work parked on the server so it can be picked up on another machine.
+    // Every other push attaches a ref, because until now everything a server
+    // was asked to keep belonged to the history some branch or tag pointed at.
+    // A stash is kept and is deliberately not in the ref namespace, so it needs
+    // its own verbs: the objects arrive, and what keeps them alive is recorded
+    // beside them rather than as a name anyone else can see.
+
+    /// Send the closure of `tip` and park it under this account.
+    PushStash { tip: Hash, message: String },
+    /// What this account has parked here.
+    ListStashes,
+    StashList { entries: Vec<(Hash, String)> },
+    /// Ask for one back. The server serves the closure as a pull does.
+    PullStash { commit: Hash },
+    DropStash { commit: Hash },
     /// "Tell me about this branch."
     PullRef { branch: String },
     RefIs { branch: String, tip: Option<Hash> },
@@ -135,6 +153,15 @@ impl Msg {
             Msg::PushRef { branch, tip, force } => {
                 w.u8(0x10); w.str(branch); w.hash(*tip); w.u8(*force as u8)
             }
+            Msg::PushStash { tip, message } => { w.u8(0x13); w.hash(*tip); w.str(message) }
+            Msg::ListStashes => w.u8(0x14),
+            Msg::StashList { entries } => {
+                w.u8(0x15);
+                w.u32(entries.len() as u32);
+                for (h, m) in entries { w.hash(*h); w.str(m) }
+            }
+            Msg::PullStash { commit } => { w.u8(0x16); w.hash(*commit) }
+            Msg::DropStash { commit } => { w.u8(0x17); w.hash(*commit) }
             Msg::PullRef { branch } => { w.u8(0x11); w.str(branch) }
             Msg::RefIs { branch, tip } => {
                 w.u8(0x12); w.str(branch);
@@ -169,6 +196,18 @@ impl Msg {
             }
             0x10 => Msg::PushRef { branch: r.str()?, tip: r.hash()?, force: r.u8()? != 0 },
             0x11 => Msg::PullRef { branch: r.str()? },
+            0x13 => Msg::PushStash { tip: r.hash()?, message: r.str()? },
+            0x14 => Msg::ListStashes,
+            0x15 => {
+                let n = r.u32()? as usize;
+                let mut entries = Vec::with_capacity(n.min(1024));
+                for _ in 0..n {
+                    entries.push((r.hash()?, r.str()?));
+                }
+                Msg::StashList { entries }
+            }
+            0x16 => Msg::PullStash { commit: r.hash()? },
+            0x17 => Msg::DropStash { commit: r.hash()? },
             0x12 => {
                 let branch = r.str()?;
                 let tip = if r.u8()? == 1 { Some(r.hash()?) } else { None };
@@ -359,6 +398,11 @@ mod tests {
             Msg::Hello { repo: "myrepo".into(), token: "s3cret".into() },
             Msg::Welcome { refs: vec![("main".into(), Hash([1; 32]))] },
             Msg::PushRef { branch: "main".into(), tip: Hash([2; 32]), force: true },
+            Msg::PushStash { tip: Hash([7; 32]), message: "wip".into() },
+            Msg::ListStashes,
+            Msg::StashList { entries: vec![(Hash([8; 32]), "half a parser".into())] },
+            Msg::PullStash { commit: Hash([9; 32]) },
+            Msg::DropStash { commit: Hash([10; 32]) },
             Msg::PullRef { branch: "dev".into() },
             Msg::RefIs { branch: "dev".into(), tip: None },
             Msg::RefIs { branch: "dev".into(), tip: Some(Hash([3; 32])) },
