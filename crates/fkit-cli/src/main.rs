@@ -455,7 +455,8 @@ impl Progress {
         let line = match p {
             fkit_core::ingest::Progress::Scanning { .. } => "  scanning…".to_string(),
             fkit_core::ingest::Progress::Hashing { done, total, bytes, .. } => {
-                let pct = if total == 0 { 100 } else { done * 100 / total };
+                // Nothing to hash is a finished job, not a division by zero.
+                let pct = (done * 100).checked_div(total).unwrap_or(100);
                 format!("  hashing {done}/{total} files ({pct}%), {}", human(bytes))
             }
             fkit_core::ingest::Progress::Building => "  building trees…".to_string(),
