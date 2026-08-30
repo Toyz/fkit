@@ -575,6 +575,19 @@ pub fn ingest_dir_after(
     Ok(Ingested { hash, size, stats })
 }
 
+/// Build nested trees from a flat map of full paths.
+///
+/// What `ingest_dir` does once it has hashed everything, exposed because
+/// building history from a stream has the same map and none of the directory
+/// walking -- it knows what changed, so there is nothing to discover.
+pub fn build_paths(
+    sink: &Sink,
+    files: &BTreeMap<String, TreeEntry>,
+    prior: &Prior,
+) -> Result<(Hash, u64)> {
+    build_nested(sink, files, &[], "", prior)
+}
+
 /// Assemble nested trees from flat paths, creating empty directories where the
 /// skeleton recorded one but no file lives under it.
 fn build_nested(

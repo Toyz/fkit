@@ -14,6 +14,7 @@ pub mod chunker;
 pub mod config;
 pub mod diff;
 pub mod fsck;
+pub mod fastimport;
 pub mod gc;
 pub mod hash;
 pub mod index;

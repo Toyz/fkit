@@ -101,6 +101,7 @@ fn run() -> Result<()> {
         C::Pack => cmd_pack(),
         C::Gc(a) => cmd_gc(a.dry_run, a.prune_all),
         C::VerifyTree { dir } => cmd_verify_tree(dir.as_deref()),
+        C::FastImport(a) => cmd_fast_import(a.branch.as_deref(), a.progress),
         C::Fsck => cmd_fsck(),
         C::Stats => cmd_stats(),
 
@@ -2041,6 +2042,98 @@ fn cmd_pack() -> Result<()> {
         println!("  verified: every object still hashes to its own name");
     } else {
         bail!("pack left the store damaged — the loose copies are gone, restore from a remote");
+    }
+    Ok(())
+}
+
+/// Build history from a fast-import stream on standard input.
+///
+/// The stream is git's own, so this is the whole of a migration:
+///
+/// ```text
+/// fkit init mine && cd mine
+/// git -C ../theirs fast-export --all | fkit fast-import
+/// ```
+///
+/// Nothing is checked out. Objects are written and the branches the stream
+/// named are left pointing at what it built, so the working tree is whatever
+/// it was until you ask for something else.
+fn cmd_fast_import(branch: Option<&str>, every: u64) -> Result<()> {
+    let repo = Repo::open(std::path::Path::new("."))?;
+    let stdin = std::io::stdin();
+
+    // A large buffer because the stream is one long sequential read and the
+    // default is small enough that the syscalls show up in the profile.
+    let input = std::io::BufReader::with_capacity(1 << 20, stdin.lock());
+
+    let started = std::time::Instant::now();
+    let sink = fkit_core::store::Sink::writing(&repo.store);
+    let report = fkit_core::fastimport::FastImport::new(&sink, &repo.store)
+        .with_progress(every, |n, blobs| {
+            eprintln!("  {n} commit(s), {blobs} blob(s)");
+        })
+        .run(input)?;
+
+    if report.commits == 0 {
+        println!("nothing to import");
+        return Ok(());
+    }
+
+    // Which of the imported refs this repository should end up on. A stream
+    // usually carries several branches; without being told, prefer the one
+    // this repository already calls its default.
+    let want = branch.map(str::to_string).unwrap_or_else(|| "main".to_string());
+    let mut landed = Vec::new();
+    for (name, tip) in &report.refs {
+        // `refs/heads/main` is spelled `main` here. Anything else -- a tag, or
+        // the raw commit id that `fast-export` uses when handed a detached
+        // revision rather than a ref -- is not a branch name anybody wants, so
+        // it becomes the branch that was asked for.
+        let short = match name.strip_prefix("refs/heads/") {
+            Some(b) if !b.is_empty() => b.to_string(),
+            _ => want.clone(),
+        };
+        repo.write_ref(&short, *tip)?;
+        landed.push(short);
+    }
+    landed.sort();
+    landed.dedup();
+
+    let secs = started.elapsed().as_secs_f64().max(0.001);
+    println!(
+        "imported {} commit(s) and {} blob(s) in {:.1}s ({:.0} commits/sec)",
+        report.commits,
+        report.blobs,
+        secs,
+        report.commits as f64 / secs
+    );
+    println!("  branches: {}", landed.join(", "));
+
+    if landed.contains(&want) {
+        repo.set_head(&Head::Branch(want.clone()))?;
+        println!("  HEAD is on {want}");
+    } else if let Some(first) = landed.first() {
+        repo.set_head(&Head::Branch(first.clone()))?;
+        println!("  HEAD is on {first}");
+    }
+
+    // Folding here rather than leaving one segment per blob run: the import
+    // wrote a great many objects through one long-lived process, and this is
+    // the point at which it has finished and the store can settle.
+    let folded = repo.store.consolidate(64 * 1024 * 1024)?;
+    if folded > 1 {
+        println!("  tidied {folded} segments into one");
+    }
+    repo.store.seal_indexes()?;
+
+    let (on_disk, raw) = repo.store.packed_bytes();
+    if raw > 0 {
+        println!(
+            "  {} on disk, {} of content ({:.1}x smaller)",
+            human(on_disk),
+            human(raw),
+            raw as f64 / on_disk.max(1) as f64
+        );
     }
     Ok(())
 }

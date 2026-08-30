@@ -77,6 +77,7 @@ INSPECTION
     pack                     fold loose objects into packed segments
     gc                       delete objects no branch can reach
     verify-tree <dir>        compare HEAD's tree against a directory, byte for byte
+    fast-import              build history from a stream on stdin
     fsck                     verify every object and report unreachable ones
     stats                    storage and deduplication statistics
 
@@ -291,6 +292,9 @@ pub enum Command {
         dir: Option<String>,
     },
 
+    /// Build history from a fast-import stream on standard input.
+    FastImport(FastImportArgs),
+
     /// Verify every object and report unreachable ones.
     Fsck,
 
@@ -299,6 +303,17 @@ pub enum Command {
 }
 
 #[derive(Args, Debug)]
+pub struct FastImportArgs {
+    /// The branch to leave pointing at what was imported. Defaults to the
+    /// repository's own default branch.
+    #[arg(long)]
+    pub branch: Option<String>,
+    /// Say how far along every this many commits.
+    #[arg(long, default_value_t = 5000)]
+    pub progress: u64,
+}
+
+#[derive(Debug, clap::Args)]
 pub struct GcArgs {
     /// Report what would go; change nothing.
     #[arg(short = 'n', long)]
