@@ -26,7 +26,7 @@
 //! depending on what a repository happens to contain, which is not a bound.
 
 use crate::hash::Hash;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -69,12 +69,58 @@ struct Entry {
 
 struct Inner<K> {
     map: HashMap<K, Entry>,
+    /// Keys in least-recently-used order, so a victim is the first one.
+    ///
+    /// Finding the victim by scanning for the smallest `used` is fine while a
+    /// cache evicts in bursts, and quadratic when it evicts continuously --
+    /// which is what a full cache under a large transfer does, once per stored
+    /// object. On a hub serving a second clone of a big history that scan was
+    /// most of the process's CPU, and it got worse the longer the process ran.
+    order: BTreeSet<(u64, K)>,
     bytes: usize,
     capacity: usize,
     ttl: Duration,
     clock: u64,
     hits: u64,
     misses: u64,
+}
+
+impl<K: Eq + std::hash::Hash + Ord + Clone> Inner<K> {
+    /// Record a use, keeping the order in step with it.
+    fn touch(&mut self, key: &K) {
+        self.clock += 1;
+        let now = self.clock;
+        if let Some(e) = self.map.get_mut(key) {
+            let was = e.used;
+            e.used = now;
+            self.order.remove(&(was, key.clone()));
+            self.order.insert((now, key.clone()));
+        }
+    }
+
+    fn admit(&mut self, key: K, entry: Entry) {
+        self.bytes += entry.bytes.len();
+        self.order.insert((entry.used, key.clone()));
+        self.map.insert(key, entry);
+    }
+
+    /// Remove one entry, wherever it is being removed from.
+    fn evict(&mut self, key: &K) -> Option<Entry> {
+        let e = self.map.remove(key)?;
+        self.order.remove(&(e.used, key.clone()));
+        self.bytes -= e.bytes.len();
+        Some(e)
+    }
+
+    /// Drop the oldest until what is held fits in what was allowed.
+    fn shrink(&mut self) {
+        while self.bytes > self.capacity {
+            let Some((_, key)) = self.order.pop_first() else { break };
+            if let Some(e) = self.map.remove(&key) {
+                self.bytes -= e.bytes.len();
+            }
+        }
+    }
 }
 
 /// Somewhere to keep object bytes that are worth not re-reading.
@@ -140,6 +186,7 @@ impl MemoryBlobs {
         MemoryBlobs {
             inner: Mutex::new(Inner {
                 map: HashMap::new(),
+                order: BTreeSet::new(),
                 bytes: 0,
                 capacity,
                 ttl,
@@ -162,17 +209,13 @@ impl BlobCache for MemoryBlobs {
             }
         };
         if expired {
-            if let Some(e) = in_.map.remove(key) {
-                in_.bytes -= e.bytes.len();
-            }
+            in_.evict(&key.to_string());
             in_.misses += 1;
             return None;
         }
-        in_.clock += 1;
-        let used = in_.clock;
+        in_.touch(&key.to_string());
         in_.hits += 1;
-        let e = in_.map.get_mut(key).expect("checked just above");
-        e.used = used;
+        let e = in_.map.get(key).expect("checked just above");
         Some(Arc::clone(&e.bytes))
     }
 
@@ -181,30 +224,16 @@ impl BlobCache for MemoryBlobs {
         if bytes.len() > in_.capacity / MAX_ENTRY_DIVISOR {
             return;
         }
-        if let Some(old) = in_.map.remove(key) {
-            in_.bytes -= old.bytes.len();
-        }
+        in_.evict(&key.to_string());
         in_.clock += 1;
         let used = in_.clock;
-        in_.bytes += bytes.len();
-        in_.map.insert(key.to_string(), Entry { bytes, used, stored: Instant::now(), ttl });
-
-        while in_.bytes > in_.capacity {
-            let Some((victim, _)) = in_.map.iter().min_by_key(|(_, e)| e.used) else {
-                break;
-            };
-            let victim = victim.clone();
-            if let Some(e) = in_.map.remove(&victim) {
-                in_.bytes -= e.bytes.len();
-            }
-        }
+        in_.admit(key.to_string(), Entry { bytes, used, stored: Instant::now(), ttl });
+        in_.shrink();
     }
 
     fn forget(&self, key: &str) {
         let mut in_ = self.inner.lock().unwrap();
-        if let Some(e) = in_.map.remove(key) {
-            in_.bytes -= e.bytes.len();
-        }
+        in_.evict(&key.to_string());
     }
 
     fn stats(&self) -> CacheStats {
@@ -315,6 +344,7 @@ impl MemoryCache {
         MemoryCache {
             inner: Mutex::new(Inner {
                 map: HashMap::new(),
+                order: BTreeSet::new(),
                 bytes: 0,
                 capacity,
                 ttl,
@@ -330,8 +360,6 @@ impl MemoryCache {
 impl ObjectCache for MemoryCache {
     fn get(&self, h: Hash) -> Option<Arc<Vec<u8>>> {
         let mut in_ = self.inner.lock().unwrap();
-        in_.clock += 1;
-        let now = in_.clock;
         let ttl = in_.ttl;
 
         // Age is checked before taking a mutable borrow, so the expired case
@@ -347,16 +375,13 @@ impl ObjectCache for MemoryCache {
         // Expired entries are dropped where they are found rather than by a
         // sweep: the reader is already holding the lock and knows the key.
         if expired {
-            if let Some(e) = in_.map.remove(&h) {
-                in_.bytes -= e.bytes.len();
-            }
+            in_.evict(&h);
             in_.misses += 1;
             return None;
         }
 
-        let e = in_.map.get_mut(&h).expect("checked just above");
-        e.used = now;
-        let bytes = Arc::clone(&e.bytes);
+        in_.touch(&h);
+        let bytes = Arc::clone(&in_.map.get(&h).expect("checked just above").bytes);
         in_.hits += 1;
         Some(bytes)
     }
@@ -372,35 +397,20 @@ impl ObjectCache for MemoryCache {
 
         in_.clock += 1;
         let used = in_.clock;
-        let size = bytes.len();
-        in_.bytes += size;
         let ttl = in_.ttl;
-        in_.map.insert(h, Entry { bytes, used, stored: Instant::now(), ttl });
-
-        // Evict least-recently-used until it fits. Scanning for the minimum is
-        // O(n) per eviction, which is fine at this size and avoids carrying an
-        // intrusive list for a cache that evicts in bursts rather than
-        // continuously.
-        while in_.bytes > in_.capacity {
-            let Some((&victim, _)) = in_.map.iter().min_by_key(|(_, e)| e.used) else {
-                break;
-            };
-            if let Some(e) = in_.map.remove(&victim) {
-                in_.bytes -= e.bytes.len();
-            }
-        }
+        in_.admit(h, Entry { bytes, used, stored: Instant::now(), ttl });
+        in_.shrink();
     }
 
     fn forget(&self, h: Hash) {
         let mut in_ = self.inner.lock().unwrap();
-        if let Some(e) = in_.map.remove(&h) {
-            in_.bytes -= e.bytes.len();
-        }
+        in_.evict(&h);
     }
 
     fn clear(&self) {
         let mut in_ = self.inner.lock().unwrap();
         in_.map.clear();
+        in_.order.clear();
         in_.bytes = 0;
     }
 
@@ -866,5 +876,41 @@ mod tier_tests {
         t.put(h(1), bytes(10));
         assert!(t.get(h(1)).is_some(), "the near tier still answers");
         assert!(t.get(h(2)).is_none());
+    }
+
+    /// Storing into a full cache costs the same however much it holds.
+    ///
+    /// Eviction used to find its victim by scanning every entry for the
+    /// smallest `used`. That is cheap while a cache evicts in bursts and
+    /// quadratic when it evicts on every store, which is what a full cache
+    /// under a large transfer does. A hub serving a second clone of a big
+    /// history spent most of its CPU in that scan, and more of it the longer
+    /// the process had been up.
+    #[test]
+    fn storing_into_a_full_cache_does_not_slow_down_as_it_fills() {
+        // Room for twenty thousand entries, then ten times that many stores,
+        // every one of which has to evict.
+        // Its own key function: the shared one takes a byte, and this needs
+        // two hundred thousand distinct names.
+        let key = |n: u32| {
+            let mut b = [0u8; 32];
+            b[..4].copy_from_slice(&n.to_le_bytes());
+            Hash(b)
+        };
+        let held = 20_000;
+        let c = MemoryCache::new(held * 64, Duration::ZERO);
+        let started = std::time::Instant::now();
+        for i in 0..(held as u32 * 10) {
+            c.put(key(i), bytes(64));
+        }
+        let took = started.elapsed();
+
+        assert_eq!(c.stats().entries, held, "it should be holding its capacity");
+        assert!(
+            // The scan takes five seconds here; the pop takes fifty
+            // milliseconds. Two is clear of both.
+            took < Duration::from_secs(2),
+            "two hundred thousand stores took {took:?}, which is the scan coming back"
+        );
     }
 }

@@ -87,6 +87,10 @@ pub const BATCH: usize = 4096;
 /// enough that the round trips `BATCH` was raised to save stay saved.
 pub const REPLY_BUDGET: usize = 8 * 1024 * 1024;
 
+/// The most one reply may hold before it is treated as a peer that will not
+/// stop talking. A whole batch of large objects, with room to spare.
+const REPLY_LIMIT: usize = 512 * 1024 * 1024;
+
 /// How many times a transfer may go back for objects an earlier one lost.
 ///
 /// A handful. Each round fills the gaps the previous one revealed, and a
@@ -366,6 +370,12 @@ pub mod timing {
     pub static LINKS: AtomicU64 = AtomicU64::new(0);
     pub static WALK: AtomicU64 = AtomicU64::new(0);
     pub static PRUNES: AtomicU64 = AtomicU64::new(0);
+    /// Queue depth left behind after a batch is taken, summed over batches.
+    pub static LEFTOVER: AtomicU64 = AtomicU64::new(0);
+    pub static BATCHES: AtomicU64 = AtomicU64::new(0);
+    /// Server side.
+    pub static SRV_READ: AtomicU64 = AtomicU64::new(0);
+    pub static SRV_SEND: AtomicU64 = AtomicU64::new(0);
 
     pub fn on() -> bool {
         std::env::var_os("FKIT_TIMING").is_some()
@@ -378,11 +388,31 @@ pub mod timing {
     pub fn report() -> String {
         let ms = |c: &AtomicU64| c.load(Ordering::Relaxed) as f64 / 1e6;
         format!(
-            "recv {:.0}ms  has {:.0}ms  put {:.0}ms  links {:.0}ms  gapwalk {:.0}ms  prunes {}",
+            "recv {:.0}ms  has {:.0}ms  put {:.0}ms  links {:.0}ms  gapwalk {:.0}ms  \
+             prunes {}  leftover {}/{} batches  srv_read {:.0}ms  srv_send {:.0}ms",
             ms(&RECV), ms(&HAS), ms(&PUT), ms(&LINKS), ms(&WALK),
-            PRUNES.load(Ordering::Relaxed)
+            PRUNES.load(Ordering::Relaxed),
+            LEFTOVER.load(Ordering::Relaxed),
+            BATCHES.load(Ordering::Relaxed),
+            ms(&SRV_READ), ms(&SRV_SEND)
         )
     }
+}
+
+/// One object as it came off the wire, before the store has seen it.
+enum Incoming {
+    Whole(Hash, Vec<u8>),
+    Patched(Hash, u32, Vec<u8>),
+}
+
+/// The next request's worth of hashes, and what that leaves behind.
+fn take_batch(queue: &mut VecDeque<Hash>) -> Vec<Hash> {
+    let batch: Vec<Hash> = (0..BATCH).filter_map(|_| queue.pop_front()).collect();
+    if !batch.is_empty() {
+        timing::LEFTOVER.fetch_add(queue.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        timing::BATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    batch
 }
 
 pub fn fetch_closure_watched<T: Transport + ?Sized>(
@@ -430,38 +460,111 @@ pub fn fetch_closure_watched<T: Transport + ?Sized>(
     // up long before it got there.
     let mut rounds = 0;
     'walk: loop {
-        while !queue.is_empty() {
+        // Ask for the next batch as soon as this one's reply is fully in
+        // hand, and unpack it afterwards, so the peer is working on the next
+        // request while this side is still storing the last one.
+        //
+        // The moment matters. A request sent while the peer is part-way
+        // through writing a reply can deadlock: the peer is blocked writing
+        // because this side is not reading, and this side is blocked writing
+        // because the peer is not reading. Sending it only once the reply is
+        // complete rules that out -- a peer that has just finished a reply has
+        // gone back to reading, by construction.
+        //
+        // There is reliably something to ask for. Taking a batch leaves about
+        // a third of the queue behind on a history of this size, because the
+        // frontier is wider than one request.
+        let mut batch = take_batch(&mut queue);
+        if !batch.is_empty() {
+            send(ws, &Msg::Want { hashes: batch.clone() })?;
+            stats.round_trips += 1;
+        }
+
+        while !batch.is_empty() {
             if requested.len() > MAX_OBJECTS_PER_SYNC {
                 bail!("sync exceeded {MAX_OBJECTS_PER_SYNC} objects — refusing to continue");
             }
 
-            let batch: Vec<Hash> = (0..BATCH).filter_map(|_| queue.pop_front()).collect();
-            send(ws, &Msg::Want { hashes: batch.clone() })?;
-            stats.round_trips += 1;
+            // The whole reply, read before the store is touched: one `Want` is
+            // answered by as many messages as the peer needs to stay under its
+            // size budget, ending with an empty one. Objects it holds as a
+            // patch arrive as patches, after the literals they are diffed
+            // against, and that order is preserved here because applying a
+            // patch needs its base already in place.
+            let mut reply: Vec<Incoming> = Vec::new();
+            let mut held = 0usize;
+            loop {
+                let _t = std::time::Instant::now();
+                let message = recv(ws)?;
+                timing::add(&timing::RECV, _t);
+                match message {
+                    Msg::Objects { objects } if objects.is_empty() => break,
+                    Msg::Objects { objects } => {
+                        for (claimed, framed) in objects {
+                            // Checked here rather than at the far end of the
+                            // reply. Holding a peer's bytes before judging them
+                            // is one thing; carrying on reading from a peer
+                            // that has already been caught inventing them is
+                            // another, and it is also how a lie that arrived
+                            // just before the peer hung up got reported as the
+                            // hanging up rather than as the lie.
+                            let actual = Hash(*blake3::hash(&framed).as_bytes());
+                            if actual != claimed {
+                                bail!(
+                                    "hash mismatch: content hashes to {} but was offered as {}",
+                                    actual.short(),
+                                    claimed.short()
+                                );
+                            }
+                            held += framed.len();
+                            reply.push(Incoming::Whole(claimed, framed));
+                        }
+                    }
+                    Msg::Patches { items } => {
+                        for (claimed, raw, payload) in items {
+                            held += payload.len();
+                            reply.push(Incoming::Patched(claimed, raw, payload));
+                        }
+                    }
+                    other => {
+                        bail!("expected an Objects or Patches message, got {}", other.name())
+                    }
+                }
+                // A reply is one batch's worth of objects and the literals
+                // their patches are diffed against. Something far past that is
+                // a peer that has decided not to stop, and waiting for its
+                // terminator would mean holding all of it.
+                if held > REPLY_LIMIT {
+                    bail!("the peer sent more than {REPLY_LIMIT} bytes in answer to one request");
+                }
+            }
 
+            // The peer is reading again, so this cannot block against a peer
+            // that is blocked writing.
+            //
+            // Whether it worked is not asked yet. This request is speculative
+            // and the reply already in hand is not: a peer that has just sent
+            // something wrong and hung up should be reported for the wrong
+            // thing it sent, not for the write that failed afterwards.
+            let next = take_batch(&mut queue);
+            let asked = if next.is_empty() {
+                Ok(())
+            } else {
+                stats.round_trips += 1;
+                send(ws, &Msg::Want { hashes: next.clone() })
+            };
+
+            // Only now unpack, which is what fills the queue for the round
+            // after this one. Nothing is trusted on the way in: both `put_raw`
+            // and `put_patch` recompute the hash and refuse anything that does
+            // not come out as the name it was offered under, so a forged
+            // object cannot be stored and a forged patch cannot be applied.
             let wanted: HashSet<Hash> = batch.iter().copied().collect();
             let mut delivered = HashSet::new();
-
-            // One `Want` is answered by as many messages as the peer needs to
-        // stay under its size budget, ending with an empty one. Objects it
-        // holds as a patch arrive as patches, after the literals they are
-        // diffed against.
-        loop {
-            // Whatever arrived, stored and expanded, ready to have its links
-            // read. Nothing is trusted on the way in: both `put_raw` and
-            // `put_patch` recompute the hash and refuse anything that does not
-            // come out as the name it was offered under, so a forged object
-            // cannot be stored and a forged patch cannot be applied.
-            let _t = std::time::Instant::now();
-            let incoming = recv(ws)?;
-            timing::add(&timing::RECV, _t);
-            let arrived: Vec<(Hash, Vec<u8>)> = match incoming {
-                Msg::Objects { objects } => {
-                    if objects.is_empty() {
-                        break;
-                    }
-                    let mut out = Vec::with_capacity(objects.len());
-                    for (claimed, framed) in objects {
+            let mut arrived: Vec<(Hash, Vec<u8>)> = Vec::with_capacity(reply.len());
+            for item in reply {
+                match item {
+                    Incoming::Whole(claimed, framed) => {
                         if store.has(claimed) {
                             delivered.insert(claimed);
                             requested.insert(claimed);
@@ -472,13 +575,9 @@ pub fn fetch_closure_watched<T: Transport + ?Sized>(
                         timing::add(&timing::PUT, _t);
                         stats.objects += 1;
                         stats.bytes += framed.len() as u64;
-                        out.push((id, framed));
+                        arrived.push((id, framed));
                     }
-                    out
-                }
-                Msg::Patches { items } => {
-                    let mut out = Vec::with_capacity(items.len());
-                    for (claimed, raw, payload) in items {
+                    Incoming::Patched(claimed, raw, payload) => {
                         if store.has(claimed) {
                             delivered.insert(claimed);
                             requested.insert(claimed);
@@ -489,27 +588,22 @@ pub fn fetch_closure_watched<T: Transport + ?Sized>(
                         // and undoing it here is how a 1.4 GiB history became
                         // 2.8 GiB on the far side.
                         let _t = std::time::Instant::now();
-                        let framed = store
-                            .put_patch(claimed, raw, &payload)
-                            .with_context(|| {
+                        let framed =
+                            store.put_patch(claimed, raw, &payload).with_context(|| {
                                 format!("applying the patch the peer sent for {}", claimed.short())
                             })?;
                         timing::add(&timing::PUT, _t);
                         stats.objects += 1;
                         stats.bytes += payload.len() as u64;
-                        out.push((claimed, framed));
+                        arrived.push((claimed, framed));
                     }
-                    out
                 }
-                other => {
-                    bail!("expected an Objects or Patches message, got {}", other.name())
-                }
-            };
+            }
 
-            // Everything in this message counts as ours before any of its
-            // links are read. Marking them one at a time meant a link from the
-            // first object to the fifth found the fifth already stored but not
-            // yet accounted for, and read as a gap that had been pruned at.
+            // Everything that arrived counts as ours before any of its links
+            // are read. Marking them one at a time meant a link from the first
+            // object to the fifth found the fifth already stored but not yet
+            // accounted for, and read as a gap that had been pruned at.
             for (id, _) in &arrived {
                 delivered.insert(*id);
                 requested.insert(*id);
@@ -542,18 +636,28 @@ pub fn fetch_closure_watched<T: Transport + ?Sized>(
                 timing::add(&timing::HAS, _t);
             }
             progress(&stats);
-        }
 
-        if let Some(missing) = wanted.iter().find(|h| !delivered.contains(h)) {
+            if let Some(missing) = wanted.iter().find(|h| !delivered.contains(h)) {
                 bail!(
                     "peer could not supply object {} — its repository is incomplete",
                     missing.short()
                 );
             }
+
+            // What arrived has been judged; now the write may be complained
+            // about.
+            asked?;
+
+            batch = next;
+            // Unpacking may have revealed more work while nothing is in
+            // flight, which happens whenever the queue ran dry above.
+            if batch.is_empty() && !queue.is_empty() {
+                batch = take_batch(&mut queue);
+                send(ws, &Msg::Want { hashes: batch.clone() })?;
+                stats.round_trips += 1;
+            }
         }
 
-        // The queue is empty; that is not the same as being complete.
-        // Look for children of things we hold that never arrived.
         if !pruned {
             break 'walk;
         }
