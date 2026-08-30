@@ -39,6 +39,17 @@ RUN mkdir -p crates/fkit-core/src crates/fkit-cli/src crates/fkit-server/src cra
  && touch crates/fkit-core/src/lib.rs crates/fkit-server/src/lib.rs \
  && cargo build --release --workspace --features fkit-hub/redis-cache 2>/dev/null || true
 
+# Which commit this is, handed in as a build argument.
+#
+# The build context deliberately carries no repository (see .dockerignore), so
+# there is nothing here to ask. Empty is fine: the server then declines to name
+# its build rather than guessing at one.
+#
+# Declared after the dependency layers, so changing it does not throw away the
+# compile cache for everything this project depends on.
+ARG FKIT_COMMIT=""
+ENV FKIT_COMMIT=$FKIT_COMMIT
+
 # Now the real sources.
 COPY crates/ crates/
 # Bust the stub fingerprints so cargo rebuilds these crates with real code.

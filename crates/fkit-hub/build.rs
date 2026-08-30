@@ -6,13 +6,17 @@
 //! a hash -- it is the whole premise of the thing that a digest names one
 //! exact state.
 //!
-//! Three sources, in order, because the answer has to survive being built
-//! somewhere without a checkout:
+//! Two sources, in order, because the answer has to survive being built
+//! somewhere with no repository in reach:
 //!
-//!   1. `FKIT_COMMIT`, for image builds, where the workflow knows the commit
-//!      and the build context often has no `.git` at all.
-//!   2. `git rev-parse`, for anybody building from a clone.
-//!   3. Nothing, and the footer simply omits it rather than inventing one.
+//!   1. `FKIT_COMMIT`, which is how anything published gets it. The image
+//!      build carries no repository in its context at all, by design, so the
+//!      workflow hands the commit in as an argument.
+//!   2. Asking the checkout, as a convenience for somebody building from a
+//!      clone, so a local build still names itself without being told to.
+//!
+//! Failing both, nothing. The server then declines to name its build rather
+//! than inventing an answer for it.
 
 use std::process::Command;
 

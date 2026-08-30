@@ -72,7 +72,16 @@ jobs:
       # in hub.toml, and it cannot be made at all if the client is not in the
       # binary. Compiling it in costs a few pure-Rust crates and no C
       # dependency, so the published image can do either.
-      - run: |
+      - env:
+          # The commit this build is of, handed in rather than read from the
+          # checkout. The server uses it to find itself in its own mirror,
+          # where every replayed commit carries a trailer naming the revision
+          # it came from, and so to print which build it is running. Passed
+          # explicitly because the image build has no repository in its context
+          # at all, and a feature that quietly stops working when nobody is
+          # watching is worse than one that was never there.
+          FKIT_COMMIT: ${{ github.sha }}
+        run: |
           cargo build --release --workspace \
             --features fkit-hub/redis-cache \
             --target ${{ env.TARGET }}
