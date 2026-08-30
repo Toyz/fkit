@@ -11,9 +11,7 @@
 //! which keeps `fkit-core` free of any async runtime dependency.
 
 use crate::hash::Hash;
-use crate::proto::{
-    fetch_closure, serve_wants, verify_closure_into, Msg, TransferStats, Transport,
-};
+use crate::proto::{fetch_closure, serve_wants, Msg, TransferStats, Transport};
 use crate::store::Store;
 use anyhow::{bail, Result};
 
