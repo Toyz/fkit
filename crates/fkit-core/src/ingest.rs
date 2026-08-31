@@ -520,6 +520,15 @@ pub enum Progress<'a> {
 /// thread only, so an implementation does not have to be thread-safe.
 pub type Observer<'o> = &'o mut dyn FnMut(Progress<'_>);
 
+/// Decrements a count of running workers when one leaves, by any route.
+struct Leaving<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for Leaving<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Ingest a directory, knowing the tree it is a revision of.
 ///
 /// Everything the previous tree offers is a hint about which chunk each new
@@ -557,6 +566,12 @@ pub fn ingest_dir_watched(
     let next = std::sync::atomic::AtomicUsize::new(0);
     let done = std::sync::atomic::AtomicUsize::new(0);
     let bytes = std::sync::atomic::AtomicU64::new(0);
+    // Workers still going. The reporting loop waits on this as well as on the
+    // count, because a worker that stops early -- an unreadable file, a panic
+    // -- never reaches the count, and waiting for one that is never coming is
+    // a hang. It hung only when somebody had asked for progress, which is to
+    // say interactively, which is to say whenever a person runs `commit`.
+    let live = std::sync::atomic::AtomicUsize::new(threads);
     let jobs = &sk.jobs;
     let total = jobs.len();
 
@@ -569,7 +584,11 @@ pub fn ingest_dir_watched(
                     let next = &next;
                     let done = &done;
                     let bytes = &bytes;
+                    let live = &live;
                     scope.spawn(move || {
+                        // Counts this worker out however it leaves, including
+                        // by `?` and by panicking.
+                        let _leaving = Leaving(live);
                         let mut mine = Vec::new();
                         loop {
                             let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -588,8 +607,11 @@ pub fn ingest_dir_watched(
             // beats a channel here: the counters are already there, and a
             // progress line nobody reads should not slow the work down.
             if let Some(w) = watch.as_deref_mut() {
-                use std::sync::atomic::Ordering::Relaxed;
-                while done.load(Relaxed) < total {
+                use std::sync::atomic::Ordering::{Acquire, Relaxed};
+                // Acquire against the workers' release on the way out, so once
+                // this sees none of them running it also sees everything they
+                // counted.
+                while live.load(Acquire) > 0 && done.load(Relaxed) < total {
                     w(Progress::Hashing {
                         done: done.load(Relaxed),
                         total,
@@ -598,8 +620,11 @@ pub fn ingest_dir_watched(
                     });
                     std::thread::sleep(std::time::Duration::from_millis(80));
                 }
+                // What was actually finished, not what was hoped for: on the
+                // way out of a failed ingest this is short of the total, and
+                // saying otherwise would be the one thing worse than silence.
                 w(Progress::Hashing {
-                    done: total,
+                    done: done.load(Relaxed),
                     total,
                     bytes: bytes.load(Relaxed),
                     path: "",

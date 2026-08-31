@@ -398,3 +398,54 @@ fn ingest_reports_progress_that_ends_at_the_total() {
     assert_eq!(total, 60, "every file should be counted once");
     assert!(bytes > 0, "bytes hashed should be reported");
 }
+
+/// An ingest that fails says so, rather than waiting forever.
+///
+/// The progress loop waits on a count of finished jobs. A worker that fails
+/// returns without incrementing it, so the count can never reach the total and
+/// the wait never ends -- and it only ends up waiting when somebody asked for
+/// progress, which is to say interactively, which is to say every time a
+/// person runs `commit`.
+#[test]
+fn a_failed_ingest_says_so_instead_of_hanging() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let tmp = Tmp::new("ingestfail");
+        let repo = Repo::init(&tmp.0).unwrap();
+        repo.config_set("author.name", "t").unwrap();
+        repo.config_set("author.email", "t@e").unwrap();
+
+        // Enough files that the work is spread over several workers, and one
+        // of them cannot be read.
+        for i in 0..40 {
+            write(&tmp.0, &format!("f{i}.txt"), &"x".repeat(400));
+        }
+        let blocked = tmp.0.join("blocked.txt");
+        fs::write(&blocked, "nope").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
+        }
+
+        // Root reads a file whatever its mode says, so there would be nothing
+        // to fail on.
+        if fs::read(&blocked).is_ok() {
+            let _ = tx.send(None);
+            return;
+        }
+
+        let out = repo.commit_watched("x", &Default::default(), Some(&mut |_| {}));
+        let _ = tx.send(Some(out.is_err()));
+    });
+
+    match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+        Ok(Some(true)) => {}
+        Ok(Some(false)) => panic!("an unreadable file should have failed the commit"),
+        Ok(None) => eprintln!("  skipped: this process can read a mode-000 file"),
+        Err(_) => panic!(
+            "commit_watched never returned: the progress loop is waiting for a count \
+             that a failed worker never reaches"
+        ),
+    }
+}

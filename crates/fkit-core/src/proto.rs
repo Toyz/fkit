@@ -494,9 +494,9 @@ pub fn fetch_closure_watched<T: Transport + ?Sized>(
             let mut reply: Vec<Incoming> = Vec::new();
             let mut held = 0usize;
             loop {
-                let _t = std::time::Instant::now();
+                let began = std::time::Instant::now();
                 let message = recv(ws)?;
-                timing::add(&timing::RECV, _t);
+                timing::add(&timing::RECV, began);
                 match message {
                     Msg::Objects { objects } if objects.is_empty() => break,
                     Msg::Objects { objects } => {
@@ -570,9 +570,9 @@ pub fn fetch_closure_watched<T: Transport + ?Sized>(
                             requested.insert(claimed);
                             continue;
                         }
-                        let _t = std::time::Instant::now();
+                        let began = std::time::Instant::now();
                         let (id, _) = store.put_raw(claimed, &framed)?;
-                        timing::add(&timing::PUT, _t);
+                        timing::add(&timing::PUT, began);
                         stats.objects += 1;
                         stats.bytes += framed.len() as u64;
                         arrived.push((id, framed));
@@ -587,12 +587,12 @@ pub fn fetch_closure_watched<T: Transport + ?Sized>(
                         // the peer already did the work of finding the base,
                         // and undoing it here is how a 1.4 GiB history became
                         // 2.8 GiB on the far side.
-                        let _t = std::time::Instant::now();
+                        let began = std::time::Instant::now();
                         let framed =
                             store.put_patch(claimed, raw, &payload).with_context(|| {
                                 format!("applying the patch the peer sent for {}", claimed.short())
                             })?;
-                        timing::add(&timing::PUT, _t);
+                        timing::add(&timing::PUT, began);
                         stats.objects += 1;
                         stats.bytes += payload.len() as u64;
                         arrived.push((claimed, framed));
@@ -615,12 +615,12 @@ pub fn fetch_closure_watched<T: Transport + ?Sized>(
                 // it, and then reopening its segment to read, decompress and
                 // re-verify what was already in memory -- once per object,
                 // which over a large history is most of the time a push takes.
-                let _t = std::time::Instant::now();
+                let began = std::time::Instant::now();
                 let links = Store::decode_framed(&framed)
                     .with_context(|| format!("object {} will not decode", id.short()))?
                     .links();
-                timing::add(&timing::LINKS, _t);
-                let _t = std::time::Instant::now();
+                timing::add(&timing::LINKS, began);
+                let began = std::time::Instant::now();
                 for link in links {
                     if store.has(link) {
                         // Already here, and not because this connection put it
@@ -633,7 +633,7 @@ pub fn fetch_closure_watched<T: Transport + ?Sized>(
                         queue.push_back(link);
                     }
                 }
-                timing::add(&timing::HAS, _t);
+                timing::add(&timing::HAS, began);
             }
             progress(&stats);
 
@@ -662,13 +662,13 @@ pub fn fetch_closure_watched<T: Transport + ?Sized>(
             break 'walk;
         }
 
-        let _t = std::time::Instant::now();
+        let began = std::time::Instant::now();
         let mut seen = HashSet::new();
         let mut holes = Vec::new();
         for &r in roots {
             holes.extend(missing_in_closure(store, r, &mut seen)?);
         }
-        timing::add(&timing::WALK, _t);
+        timing::add(&timing::WALK, began);
         if holes.is_empty() {
             break 'walk;
         }
