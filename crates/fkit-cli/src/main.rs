@@ -266,7 +266,10 @@ fn cmd_status() -> Result<()> {
         Head::Detached(h) => println!("HEAD detached at {}", h.short()),
     }
 
+    warn_unusable(repo.ignore().problems());
     let snap = repo.snapshot()?;
+    warn_unusable(&snap.unusable);
+    warn_raced(&snap.raced);
     let changes = diff_trees(&repo.view_with(&snap), repo.head_tree()?, Some(snap.hash))?;
 
     if changes.is_empty() {
@@ -358,9 +361,18 @@ fn cmd_commit(
     if who.author.is_none() {
         require_author(&repo)?;
     }
+    // The root's ignore files are checked before the work, so the warning is
+    // seen even if the commit then fails or takes ten minutes. Files further
+    // down are only found by walking, and are reported after it.
+    warn_unusable(repo.ignore().problems());
     let mut progress = Progress::new();
-    let res = repo.commit_watched(&message, &who, Some(&mut |p| progress.show(p)))?;
+    let res = repo.commit_watched(&message, &who, Some(&mut |p| progress.show(p)));
+    // Before the `?`, so an error starts on a clean line rather than on top
+    // of whatever the progress display last drew.
     progress.done();
+    let res = res?;
+    warn_unusable(&res.unusable);
+    let skipped = warn_raced(&res.raced);
     let branch = match repo.head()? {
         Head::Branch(b) => b,
         Head::Detached(_) => "(detached)".into(),
@@ -411,7 +423,48 @@ fn cmd_commit(
             String::new()
         },
     );
+    if skipped > 0 {
+        println!("  {skipped} path(s) skipped: gone before they could be read");
+    }
     Ok(())
+}
+
+/// Say which ignore rules are not in effect.
+///
+/// A line that cannot be made into a rule matches nothing, and the person who
+/// wrote it believes otherwise -- so it is said every time, by the two
+/// commands that act on the rules, until the line is fixed.
+fn warn_unusable(problems: &[fkit_core::ingest::Problem]) {
+    for p in problems {
+        eprintln!("fkit: warning: {p}");
+    }
+}
+
+/// Name the paths that moved while the tree was being read, and return how
+/// many were left out.
+///
+/// Capped like the change list, and for the same reason: a build directory
+/// deleted mid-commit is ten thousand lines nobody reads. The count is exact.
+fn warn_raced(raced: &[fkit_core::ingest::Raced]) -> usize {
+    use fkit_core::ingest::Race;
+    const LIST_LIMIT: usize = 12;
+
+    for r in raced.iter().take(LIST_LIMIT) {
+        match r.what {
+            Race::Vanished => {
+                eprintln!("fkit: warning: skipped {}: it was gone before it could be read", r.path)
+            }
+            Race::Changed => eprintln!(
+                "fkit: warning: {} was being written while it was read; \
+                 stored as it was seen",
+                r.path
+            ),
+        }
+    }
+    if raced.len() > LIST_LIMIT {
+        eprintln!("fkit: warning: … and {} more", raced.len() - LIST_LIMIT);
+    }
+    raced.iter().filter(|r| r.what == Race::Vanished).count()
 }
 
 /// A one-line progress display for work that would otherwise be silent.

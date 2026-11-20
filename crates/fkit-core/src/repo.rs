@@ -393,6 +393,8 @@ impl Repo {
             hash: ing.hash,
             size: ing.size,
             stats: ing.stats,
+            raced: ing.raced,
+            unusable: ing.unusable,
             objects: sink.into_retained(),
         })
     }
@@ -521,7 +523,10 @@ impl Repo {
         }
         self.clear_merge_head();
 
-        Ok(CommitResult { commit: id, tree: snap.hash, stats: snap.stats })
+        Ok(CommitResult { commit: id, tree: snap.hash, stats: snap.stats,
+            raced: snap.raced,
+            unusable: snap.unusable,
+        })
     }
 
     /// Walk first-parent history from `start`, newest first.
@@ -696,6 +701,12 @@ pub struct Snapshot {
     pub hash: Hash,
     pub size: u64,
     pub stats: crate::store::WriteStats,
+    /// Paths that moved while the tree was being read; see
+    /// [`Raced`](crate::ingest::Raced).
+    pub raced: Vec<crate::ingest::Raced>,
+    /// Ignore-file lines below the root that are not in effect; see
+    /// [`Ingested::unusable`](crate::ingest::Ingested::unusable).
+    pub unusable: Vec<crate::ingest::Problem>,
     /// Trees and file nodes that were computed but never written to disk.
     pub objects: std::collections::HashMap<Hash, Object>,
 }
@@ -714,6 +725,11 @@ pub struct CommitResult {
     pub commit: Hash,
     pub tree: Hash,
     pub stats: crate::store::WriteStats,
+    /// Paths that moved while the tree was being read. The commit stands
+    /// without them; a caller with a terminal should say so.
+    pub raced: Vec<crate::ingest::Raced>,
+    /// Ignore-file lines below the root that are not in effect.
+    pub unusable: Vec<crate::ingest::Problem>,
 }
 
 pub fn now_unix() -> i64 {

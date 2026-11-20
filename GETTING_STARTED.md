@@ -109,6 +109,35 @@ target/
 EOF
 ```
 
+The file can be called `.fkitignore` or `.fkthat`; if both exist, both apply.
+The pattern language is `.gitignore`'s:
+
+| Rule | Leaves out |
+|---|---|
+| `target` | anything named `target`, at any depth |
+| `build/` | directories named `build`, at any depth |
+| `*.log`, `vgcore.*`, `f?.txt` | `*` is any run of characters in one name, `?` is exactly one |
+| `*.[oa]`, `[!a-c]*`, `[[:digit:]]*` | one character from a set, or with `!` one not in it |
+| `/patch/` | only the `patch/` beside the ignore file, not `server/patch/` |
+| `server/target/` | that one path, counted from the ignore file's directory |
+| `**/gen/`, `src/**/gen` | `**` stands for any number of directories, including none |
+| `patch/**` | everything inside `patch/`, but not the directory itself |
+| `!keep.tmp` | nothing: it takes back what an earlier rule left out |
+| `\#name`, `\!name`, `name\ ` | a backslash makes the next character ordinary |
+
+An ignore file can sit in any directory, and its rules apply from there down.
+The last rule that matches a path decides, and a deeper file is read after a
+shallower one. An ignored directory is never read, so nothing inside it can be
+taken back with `!`.
+
+Two things are fkit's own. `./patch/` means the same as `/patch/`, where git
+would never match it. And a line that cannot mean anything (an unclosed `[`, a
+trailing `\`, a doubled `//`) is reported by `fkit status` and `fkit commit`
+each time, rather than sitting there matching nothing.
+
+Unlike git there is no index, so ignoring a path that an earlier commit
+included removes it from the next commit.
+
 ## Setting work aside
 
 `switch` and `merge` both refuse to run over uncommitted changes, because they

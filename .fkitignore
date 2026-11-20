@@ -1,9 +1,9 @@
 # Paths fkit does not track when this repository is hosted in fkit itself.
 #
-# Patterns match a single path *component*, not a path: `node_modules/` ignores
-# that directory wherever it appears, and `web/node_modules/` would match
-# nothing at all. See `Ignore` in fkit-core/src/ingest.rs for the whole grammar
-# — exact names, `*.suffix`, and `name/` for directories only.
+# The pattern language is .gitignore's: a bare name matches at any depth, a
+# rule with a `/` in it (`/patch/`, `web/dist/`) is a path from this file's
+# directory, and `*`, `?`, `[...]`, `**` and `!` mean what they mean there.
+# See `Ignore` in crates/fkit-core/src/ingest.rs for the whole grammar.
 
 # git's own state. fkit tracks this tree, not git's bookkeeping about it —
 # and .git churns on every git operation, so a snapshot would never settle.

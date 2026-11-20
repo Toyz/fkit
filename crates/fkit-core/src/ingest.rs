@@ -38,6 +38,50 @@ pub struct Ingested {
     pub hash: Hash,
     pub size: u64,
     pub stats: WriteStats,
+    /// Paths the working tree changed underneath the ingest. Always empty for
+    /// a single file; see [`Raced`].
+    pub raced: Vec<Raced>,
+    /// Lines in ignore files found below the root that could not be turned
+    /// into rules. The root's own are in [`Ignore::problems`], which the
+    /// caller had before the walk began.
+    pub unusable: Vec<Problem>,
+}
+
+/// A path that did not hold still while the tree was being read.
+///
+/// A working tree is not a quiet place: builds, editors and test runs create
+/// and delete files the whole time a snapshot is being taken. Listing the
+/// tree and reading it are two moments, and a file can be gone by the second.
+/// That is not an error -- there is nothing wrong with the repository, the
+/// store, or the file that is no longer there -- so it does not fail the
+/// snapshot. It is reported instead, because a commit that quietly left
+/// something out is its own kind of lie.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Raced {
+    /// Relative to the snapshot root.
+    pub path: String,
+    pub what: Race,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Race {
+    /// Listed, then gone before it could be read. Left out of the snapshot,
+    /// which is the truth: it is not there.
+    Vanished,
+    /// Still being written when it was read, twice. What the second read saw
+    /// is stored, and may be a file caught halfway through a write.
+    Changed,
+}
+
+/// Whether an error means "this path is not there any more".
+///
+/// `NotADirectory` is the same event seen from further down: a parent
+/// directory was removed and something else took its name.
+fn gone(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
 }
 
 /// Chunk a file and build its Merkle tree bottom-up.
@@ -243,7 +287,7 @@ pub fn ingest_reader_after<R: std::io::Read>(
                 children: level_refs,
             })?;
             stats.merge(st);
-            return Ok(Ingested { hash: h, size: total, stats });
+            return Ok(Ingested { hash: h, size: total, stats, raced: Vec::new(), unusable: Vec::new() });
         }
 
         let mut next = Vec::with_capacity(level_refs.len() / FANOUT + 1);
@@ -397,6 +441,10 @@ struct Skeleton {
     /// Mounted submodule paths found during the walk. Recorded rather than
     /// descended into: their content is already named by the pin.
     subs: Vec<String>,
+    /// Paths that were gone again before the walk could look at them.
+    raced: Vec<Raced>,
+    /// Ignore-file lines met on the way down that are not in effect.
+    unusable: Vec<Problem>,
 }
 
 struct Job {
@@ -412,7 +460,13 @@ enum JobKind {
 }
 
 fn enumerate(root: &Path, ignore: &Ignore, mounts: &Mounts) -> Result<Skeleton> {
-    let mut sk = Skeleton { jobs: Vec::new(), dirs: Vec::new(), subs: Vec::new() };
+    let mut sk = Skeleton {
+        jobs: Vec::new(),
+        dirs: Vec::new(),
+        subs: Vec::new(),
+        raced: Vec::new(),
+        unusable: Vec::new(),
+    };
     walk(root, "", ignore, mounts, &mut sk)?;
     // Largest first: with a few very large files among many small ones, feeding
     // the big ones out first stops one thread finishing last on a 1 GB image
@@ -431,16 +485,65 @@ fn walk(
     mounts: &Mounts,
     out: &mut Skeleton,
 ) -> Result<()> {
-    let read = fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))?;
-    for entry in read {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        let ft = entry.file_type()?;
-        if ignore.matches(&name, ft.is_dir()) {
-            continue;
+    let vanished = |path: &str| Raced { path: path.to_string(), what: Race::Vanished };
+
+    let read = match fs::read_dir(dir) {
+        Ok(read) => read,
+        // A directory its parent listed a moment ago. The root is not excused:
+        // with no root there is nothing to snapshot, and that is an error.
+        Err(e) if !prefix.is_empty() && gone(&e) => {
+            out.raced.push(vanished(prefix));
+            return Ok(());
         }
+        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+    };
+    // Recorded only once it has been opened, so a directory that vanished is
+    // not written into the snapshot as an empty one.
+    if !prefix.is_empty() {
+        out.dirs.push(prefix.to_string());
+    }
+
+    // The whole listing first, because whether this directory has an ignore
+    // file of its own has to be known before the first entry is judged.
+    let entries = read
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("reading {}", dir.display()))?;
+
+    // The root's files were read by `Ignore::load`. Anywhere else, a
+    // directory with an ignore file gets its own rules on top of its
+    // parent's, for itself and everything under it.
+    let has_own = ignore.nested
+        && !prefix.is_empty()
+        && entries.iter().any(|e| IGNORE_FILES.iter().any(|f| e.file_name() == *f));
+    let own;
+    let ignore = if has_own {
+        let (deeper, problems) = ignore.descend(dir, prefix);
+        out.unusable.extend(problems);
+        own = deeper;
+        &own
+    } else {
+        ignore
+    };
+
+    for entry in entries {
+        let name = entry.file_name().to_string_lossy().to_string();
         let rel = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
         let abs = entry.path();
+
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(e) if gone(&e) => {
+                // Not worth a warning if it was never going to be included.
+                if !ignore.matches(&rel, false) {
+                    out.raced.push(vanished(&rel));
+                }
+                continue;
+            }
+            Err(e) => return Err(e).with_context(|| format!("reading {}", abs.display())),
+        };
+        if ignore.matches(&rel, ft.is_dir()) {
+            continue;
+        }
 
         if ft.is_symlink() {
             out.jobs.push(Job { rel, abs, kind: JobKind::Symlink });
@@ -453,38 +556,128 @@ fn walk(
                 out.subs.push(rel);
                 continue;
             }
-            out.dirs.push(rel.clone());
             walk(&abs, &rel, ignore, mounts, out)?;
         } else {
-            let exec = is_executable(&entry.metadata()?);
+            let exec = match entry.metadata() {
+                Ok(m) => is_executable(&m),
+                Err(e) if gone(&e) => {
+                    out.raced.push(vanished(&rel));
+                    continue;
+                }
+                Err(e) => return Err(e).with_context(|| format!("reading {}", abs.display())),
+            };
             out.jobs.push(Job { rel, abs, kind: JobKind::File { exec } });
         }
     }
     Ok(())
 }
 
+/// What one job came to.
+struct Ran {
+    /// `None` when the path was gone by the time it was this job's turn.
+    entry: Option<TreeEntry>,
+    stats: WriteStats,
+    raced: Option<Race>,
+}
+
 /// Ingest one job's content. Runs on a worker thread.
-fn run_job(sink: &Sink, job: &Job, prior: &Prior) -> Result<(String, TreeEntry, WriteStats)> {
-    let (hash, size, stats, kind) = match job.kind {
+///
+/// The path was listed by [`walk`] some time ago -- seconds, on a large tree
+/// -- and may not be there now. That is reported in [`Ran`], not as an error:
+/// one file deleted by a build must not cost the other hundred thousand.
+/// Errors are kept for what is actually wrong, like a file that exists and
+/// cannot be read.
+fn run_job(sink: &Sink, job: &Job, prior: &Prior) -> Result<Ran> {
+    let name = job.rel.rsplit('/').next().unwrap_or(&job.rel).to_string();
+    let vanished =
+        || Ran { entry: None, stats: WriteStats::default(), raced: Some(Race::Vanished) };
+
+    match job.kind {
         JobKind::Symlink => {
             // Store the link *target* as content. A symlink then costs one small
             // chunk rather than a copy of whatever it points at.
-            let target = fs::read_link(&job.abs)?;
+            let target = match fs::read_link(&job.abs) {
+                Ok(t) => t,
+                // InvalidInput: something is there, and it is not a link any
+                // more. The link this job was for is gone all the same.
+                Err(e) if gone(&e) || e.kind() == std::io::ErrorKind::InvalidInput => {
+                    return Ok(vanished());
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| format!("reading {}", job.abs.display()));
+                }
+            };
             let ing = ingest_bytes(sink, target.to_string_lossy().as_bytes())?;
-            (ing.hash, ing.size, ing.stats, EntryKind::Symlink)
+            let entry =
+                TreeEntry { name, kind: EntryKind::Symlink, hash: ing.hash, size: ing.size };
+            Ok(Ran { entry: Some(entry), stats: ing.stats, raced: None })
         }
         JobKind::File { exec } => {
             // What this path was made of in the commit being built on, so
             // each chunk can be offered its own predecessor.
             let was = prior.chunks_for(&job.rel);
-            let f = fs::File::open(&job.abs)
-                .with_context(|| format!("reading {}", job.abs.display()))?;
-            let ing = ingest_reader_after(sink, std::io::BufReader::new(f), &was)?;
-            (ing.hash, ing.size, ing.stats, EntryKind::File { exec })
+            let Some((ing, settled)) = read_settled(sink, &job.abs, &was)? else {
+                return Ok(vanished());
+            };
+            let entry = TreeEntry {
+                name,
+                kind: EntryKind::File { exec },
+                hash: ing.hash,
+                size: ing.size,
+            };
+            Ok(Ran {
+                entry: Some(entry),
+                stats: ing.stats,
+                raced: (!settled).then_some(Race::Changed),
+            })
         }
-    };
-    let name = job.rel.rsplit('/').next().unwrap_or(&job.rel).to_string();
-    Ok((job.rel.clone(), TreeEntry { name, kind, hash, size }, stats))
+    }
+}
+
+/// Read a file that something else may be writing.
+///
+/// Returns `None` if it is gone, and otherwise what was read along with
+/// whether the file held still for it. Size and modification time are compared
+/// across the read; if either moved the file is read once more, on the theory
+/// that most writes are over in less time than that takes. A second miss is
+/// kept and flagged rather than chased: a log being appended to never settles,
+/// and a snapshot that waits for it never finishes.
+///
+/// The comparison can be fooled by a write that keeps the size and lands
+/// inside the clock's resolution. Nothing here depends on it being right --
+/// the stored bytes are exactly the bytes that were read, either way.
+fn read_settled(sink: &Sink, path: &Path, was: &[Hash]) -> Result<Option<(Ingested, bool)>> {
+    let reading = || format!("reading {}", path.display());
+    let stamp = |m: &fs::Metadata| (m.len(), m.modified().ok());
+
+    let mut stats = WriteStats::default();
+    let mut retried = false;
+    loop {
+        let f = match fs::File::open(path) {
+            Ok(f) => f,
+            Err(e) if gone(&e) => return Ok(None),
+            Err(e) => return Err(e).with_context(reading),
+        };
+        let before = f.metadata().with_context(reading)?;
+        // Replaced by a directory since the walk. The file is gone; whatever
+        // the directory holds belongs to the next snapshot.
+        if before.is_dir() {
+            return Ok(None);
+        }
+
+        let mut ing =
+            ingest_reader_after(sink, std::io::BufReader::new(&f), was).with_context(reading)?;
+        let after = f.metadata().with_context(reading)?;
+        let settled = stamp(&before) == stamp(&after) && ing.size == after.len();
+
+        // Both reads wrote to the store, so both are counted.
+        stats.merge(ing.stats);
+        if settled || retried {
+            ing.stats = stats;
+            return Ok(Some((ing, settled)));
+        }
+        retried = true;
+    }
 }
 
 /// Snapshot a directory into a `Tree`, reading files on every available core.
@@ -557,7 +750,21 @@ pub fn ingest_dir_watched(
         w(Progress::Scanning { files: 0 });
     }
     let sk = enumerate(dir, ignore, mounts)?;
+    ingest_enumerated(sink, dir, sk, mounts, prior, watch)
+}
 
+/// The second half of an ingest: read what the walk listed.
+///
+/// Separate from the walk because the gap between the two is where a working
+/// tree moves, and a test has to be able to stand in that gap.
+fn ingest_enumerated(
+    sink: &Sink,
+    dir: &Path,
+    mut sk: Skeleton,
+    mounts: &Mounts,
+    prior: &Prior,
+    mut watch: Option<Observer<'_>>,
+) -> Result<Ingested> {
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
@@ -577,7 +784,7 @@ pub fn ingest_dir_watched(
 
     // Scoped threads: no 'static bound, so `sink` and `jobs` are borrowed
     // directly and there is nothing to clone or Arc.
-    let collected: Vec<Result<Vec<(String, TreeEntry, WriteStats)>>> =
+    let collected: Vec<Result<Vec<(&str, Ran)>>> =
         std::thread::scope(|scope| {
             let handles: Vec<_> = (0..threads)
                 .map(|_| {
@@ -593,10 +800,14 @@ pub fn ingest_dir_watched(
                         loop {
                             let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let Some(job) = jobs.get(i) else { break };
-                            let out = run_job(sink, job, prior)?;
+                            let ran = run_job(sink, job, prior)?;
+                            // A job that found nothing to read is still a job
+                            // finished, or the count would stop short of the
+                            // total and the progress line with it.
                             done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            bytes.fetch_add(out.1.size, std::sync::atomic::Ordering::Relaxed);
-                            mine.push(out);
+                            let size = ran.entry.as_ref().map_or(0, |e| e.size);
+                            bytes.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+                            mine.push((job.rel.as_str(), ran));
                         }
                         Ok(mine)
                     })
@@ -636,11 +847,27 @@ pub fn ingest_dir_watched(
 
     let mut files: BTreeMap<String, TreeEntry> = BTreeMap::new();
     let mut stats = WriteStats::default();
+    let mut raced = std::mem::take(&mut sk.raced);
     for batch in collected {
-        for (rel, entry, st) in batch? {
-            stats.merge(st);
-            files.insert(rel, entry);
+        for (rel, ran) in batch? {
+            stats.merge(ran.stats);
+            if let Some(what) = ran.raced {
+                raced.push(Raced { path: rel.to_string(), what });
+            }
+            if let Some(entry) = ran.entry {
+                files.insert(rel.to_string(), entry);
+            }
         }
+    }
+    // Sorted, so the same race reads the same way whichever worker met it.
+    raced.sort();
+
+    // A file that vanished usually went with its directory, which the walk
+    // recorded while it was still there. Left alone it would be written into
+    // the snapshot as an empty directory that does not exist. Only checked
+    // when something did vanish, so a quiet tree pays nothing for this.
+    if raced.iter().any(|r| r.what == Race::Vanished) {
+        sk.dirs.retain(|d| fs::symlink_metadata(dir.join(d)).is_ok_and(|m| m.is_dir()));
     }
 
     // Submodules join the flat path map as ordinary entries, so tree building
@@ -666,7 +893,8 @@ pub fn ingest_dir_watched(
         w(Progress::Building);
     }
     let (hash, size) = build_nested(sink, &files, &sk.dirs, "", prior)?;
-    Ok(Ingested { hash, size, stats })
+    let unusable = std::mem::take(&mut sk.unusable);
+    Ok(Ingested { hash, size, stats, raced, unusable })
 }
 
 /// Build nested trees from a flat map of full paths.
@@ -745,67 +973,536 @@ fn is_executable(_m: &fs::Metadata) -> bool {
     false
 }
 
-/// Dead-simple ignore rules, read from `.fkitignore` or `.fkthat`.
+/// Ignore rules, read from `.fkitignore` or `.fkthat`.
 ///
-/// Supported patterns (deliberately minimal — no full glob engine):
-///   * `target`    — matches any component with that exact name
-///   * `*.log`     — suffix match
-///   * `build/`    — matches directories only
+/// The pattern language is `.gitignore`'s, all of it, matched by hand:
+///
+///   * `target`         — anything with that name, at any depth
+///   * `*.log`, `vgcore.*`, `a?.txt` — `*` and `?` within one name
+///   * `*.[oa]`, `[!a-c]*`, `[[:digit:]]*` — character classes
+///   * `build/`         — a trailing `/` means directories only
+///   * `/patch/`        — a leading `/` pins the rule to the ignore file's
+///     own directory
+///   * `server/target/` — a rule with a `/` inside it is a path from there too
+///   * `**/target/`, `a/**/b`, `patch/**` — `**` stands for any depth
+///   * `!keep.tmp`      — takes back what an earlier rule excluded
+///   * `\#`, `\!`, `\*`, `name\ ` — a backslash makes the next character
+///     ordinary
 ///   * `# comment` and blank lines are skipped
+///
+/// An ignore file may sit in any directory, and its rules are read relative
+/// to the directory it is in. The last rule to match a path decides, and a
+/// deeper file is read after a shallower one, so it has the last word. A
+/// directory that is ignored is never walked, which means nothing inside it
+/// can be taken back — the same bargain git makes, and the reason a 20 GB
+/// build folder costs nothing to exclude.
+///
+/// The one thing here git does not do: `./patch/` is read as `/patch/`. In
+/// git that line can never match anything, and a rule that is present in the
+/// file and quietly not in effect is the worst outcome an ignore file can
+/// produce. For the same reason, the few lines that cannot mean anything — an
+/// unclosed `[`, a trailing `\`, a bare `/` — are not dropped in silence:
+/// they are listed in [`Ignore::problems`].
+#[derive(Clone)]
 pub struct Ignore {
-    names: Vec<String>,
-    suffixes: Vec<String>,
-    dirs: Vec<String>,
+    rules: Vec<Rule>,
+    problems: Vec<Problem>,
+    /// Whether the walk should look for ignore files below the root. Off for
+    /// [`Ignore::empty`], which has to go on meaning "ignore nothing".
+    nested: bool,
+}
+
+/// One line of an ignore file, parsed.
+#[derive(Clone)]
+struct Rule {
+    /// The directory the ignore file is in, relative to the root; `""` for
+    /// the root itself. The rule says nothing about paths outside it.
+    base: String,
+    /// How many components `base` has, to skip them without re-counting.
+    base_depth: usize,
+    /// `!rule`: a match puts the path back rather than taking it out.
+    negated: bool,
+    /// Only directories. Set by a trailing `/`.
+    dir_only: bool,
+    /// Matched against the whole path below `base`. When false there is
+    /// exactly one segment, a name, and it is matched against the last
+    /// component alone.
+    rooted: bool,
+    segments: Vec<Segment>,
+}
+
+#[derive(Clone)]
+enum Segment {
+    /// `**`: any number of directories. In front of or between names that
+    /// number may be none. At the end of a rule it means "everything inside",
+    /// which is not the directory itself, so there it is at least one.
+    AnyDepth { at_least_one: bool },
+    /// One path component.
+    Name(Glob),
+}
+
+/// A line that could not be turned into a rule, and so is not in effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Problem {
+    /// The ignore file, relative to the root: `.fkthat`, `server/.fkitignore`.
+    pub file: String,
+    /// 1-based. 0 when it is the file as a whole that could not be read.
+    pub line: usize,
+    pub text: String,
+    pub why: String,
+}
+
+impl std::fmt::Display for Problem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.line == 0 {
+            write!(f, "{} is not in effect — {}", self.file, self.why)
+        } else {
+            write!(
+                f,
+                "{}:{}: '{}' is not in effect — {}",
+                self.file, self.line, self.text, self.why
+            )
+        }
+    }
 }
 
 /// Both names for the same file, in the order they are read.
 ///
-/// If a repository has both, both apply. The alternative — first one wins —
+/// If a directory has both, both apply. The alternative — first one wins —
 /// means adding the second file silently does nothing, and a rule that is
 /// present in the tree and quietly not in effect is the worst outcome an
 /// ignore file can produce.
 pub const IGNORE_FILES: [&str; 2] = [".fkitignore", ".fkthat"];
 
 impl Ignore {
+    /// Ignore nothing, and read no ignore files.
     pub fn empty() -> Ignore {
-        Ignore { names: vec![], suffixes: vec![], dirs: vec![] }
+        Ignore { rules: vec![], problems: vec![], nested: false }
     }
 
+    /// The rules at the root of a repository. Ignore files further down are
+    /// picked up by the walk as it reaches them.
     pub fn load(repo_root: &Path) -> Ignore {
-        let mut ig = Ignore::empty();
-        // The repo's own metadata is never part of a snapshot.
-        ig.names.push(".fkit".into());
-
-        for file in IGNORE_FILES {
-            if let Ok(text) = fs::read_to_string(repo_root.join(file)) {
-                ig.extend_from(&text);
-            }
-        }
+        let mut ig = Ignore { rules: vec![], problems: vec![], nested: true };
+        ig.read_files(repo_root, "");
         ig
     }
 
-    /// Parse rules out of one ignore file's contents.
-    fn extend_from(&mut self, text: &str) {
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if let Some(rest) = line.strip_suffix('/') {
-                self.dirs.push(rest.to_string());
-            } else if let Some(rest) = line.strip_prefix("*.") {
-                self.suffixes.push(format!(".{rest}"));
-            } else {
-                self.names.push(line.to_string());
+    /// Lines that were read and could not be honoured. Empty is the normal
+    /// case; anything here is something the person who wrote the file believes
+    /// is being ignored and is not.
+    ///
+    /// Only what this value itself read: after [`Ignore::load`], the root's
+    /// files. Problems in files further down surface in
+    /// [`Ingested::unusable`], because nobody has opened those yet.
+    pub fn problems(&self) -> &[Problem] {
+        &self.problems
+    }
+
+    /// These rules plus the ones in `dir`'s own ignore files, for walking
+    /// `dir` and everything under it. `prefix` is `dir` relative to the root.
+    ///
+    /// Returns the new problems separately so the parent's are not reported
+    /// once per directory.
+    fn descend(&self, dir: &Path, prefix: &str) -> (Ignore, Vec<Problem>) {
+        let mut ig = Ignore { rules: self.rules.clone(), problems: vec![], nested: true };
+        ig.read_files(dir, prefix);
+        let problems = std::mem::take(&mut ig.problems);
+        (ig, problems)
+    }
+
+    /// Read whichever of [`IGNORE_FILES`] `dir` has.
+    fn read_files(&mut self, dir: &Path, base: &str) {
+        for file in IGNORE_FILES {
+            let shown = if base.is_empty() { file.to_string() } else { format!("{base}/{file}") };
+            match fs::read_to_string(dir.join(file)) {
+                Ok(text) => self.extend_from(base, &shown, &text),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                // There, and unreadable: every rule in it is one somebody
+                // believes is in effect.
+                Err(e) => self.problems.push(Problem {
+                    file: shown,
+                    line: 0,
+                    text: String::new(),
+                    why: format!("it cannot be read: {e}"),
+                }),
             }
         }
     }
 
-    pub fn matches(&self, name: &str, is_dir: bool) -> bool {
-        self.names.iter().any(|n| n == name)
-            || (is_dir && self.dirs.iter().any(|d| d == name))
-            || self.suffixes.iter().any(|s| name.ends_with(s.as_str()))
+    /// Parse rules out of one ignore file's contents.
+    fn extend_from(&mut self, base: &str, file: &str, text: &str) {
+        for (i, line) in text.lines().enumerate() {
+            match Rule::parse(base, line) {
+                Ok(Some(rule)) => self.rules.push(rule),
+                Ok(None) => {}
+                Err(why) => self.problems.push(Problem {
+                    file: file.to_string(),
+                    line: i + 1,
+                    text: line.to_string(),
+                    why,
+                }),
+            }
+        }
     }
+
+    /// Whether `path` — relative to the repository root, `/`-separated — is
+    /// left out of a snapshot.
+    ///
+    /// This answers for the path it is given and nothing above it. The walk
+    /// asks about every directory on the way down and does not enter one that
+    /// is ignored, so `server/target/` never has to be recognised from
+    /// `server/target/o`.
+    pub fn matches(&self, path: &str, is_dir: bool) -> bool {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        // The repository's own metadata is never part of a snapshot, and no
+        // rule gets to say otherwise.
+        if name == ".fkit" {
+            return true;
+        }
+        // Split only if a rule needs the whole path; most rules are a bare
+        // name, and most repositories have no other kind.
+        let mut parts: Option<Vec<&str>> = None;
+        for rule in self.rules.iter().rev() {
+            if rule.dir_only && !is_dir {
+                continue;
+            }
+            if !rule.base.is_empty()
+                && !path.strip_prefix(rule.base.as_str()).is_some_and(|r| r.starts_with('/'))
+            {
+                continue;
+            }
+            let hit = if rule.rooted {
+                let parts = parts.get_or_insert_with(|| path.split('/').collect());
+                segments_match(&rule.segments, &parts[rule.base_depth..])
+            } else {
+                match &rule.segments[0] {
+                    Segment::Name(glob) => glob.matches(name),
+                    // Not constructed: a lone `**` is parsed as `*`.
+                    Segment::AnyDepth { .. } => true,
+                }
+            };
+            if hit {
+                return !rule.negated;
+            }
+        }
+        false
+    }
+}
+
+impl Rule {
+    /// `Ok(None)` for a blank line or a comment.
+    fn parse(base: &str, line: &str) -> std::result::Result<Option<Rule>, String> {
+        // Trailing spaces do not count, unless a backslash says one does.
+        // Leading ones do: ` x` is a file whose name starts with a space.
+        let mut text = line;
+        while let Some(shorter) = text.strip_suffix(' ') {
+            let slashes = shorter.len() - shorter.trim_end_matches('\\').len();
+            if slashes % 2 == 1 {
+                break;
+            }
+            text = shorter;
+        }
+        if text.is_empty() || text.starts_with('#') {
+            return Ok(None);
+        }
+        let (negated, mut rest) = match text.strip_prefix('!') {
+            Some(r) => (true, r),
+            None => (false, text),
+        };
+
+        // `/x` means "x, right here". So does `./x`, which git would never
+        // match; see the note on `Ignore`.
+        let mut rooted = false;
+        while let Some(r) = rest.strip_prefix("./") {
+            rest = r;
+            rooted = true;
+        }
+        if let Some(r) = rest.strip_prefix('/') {
+            rest = r;
+            rooted = true;
+        }
+        let dir_only = rest.ends_with('/');
+        let rest = rest.strip_suffix('/').unwrap_or(rest);
+        if rest.is_empty() {
+            return Err("it names nothing".into());
+        }
+        // A `/` anywhere but the end makes the rule a path from the ignore
+        // file's directory. One name on its own floats: it matches wherever
+        // that name turns up below. Any `/` counts, as it does for git, even
+        // one inside a `[...]` where it separates nothing.
+        let rooted = rooted || rest.contains('/');
+
+        let components = tokenize(rest)?;
+        let last = components.len() - 1;
+        let mut segments: Vec<Segment> = Vec::new();
+        for (i, part) in components.into_iter().enumerate() {
+            // One leading and one trailing `/` mean something. Any other
+            // doubled `/` asks for a path component with no name, and no path
+            // has one. Git keeps such a line and never matches it.
+            if part.tokens.is_empty() {
+                return Err("a doubled / can never match; no path has an empty name in it".into());
+            }
+            // Two stars or more, alone between slashes. Git reads `***/` the
+            // same as `**/`, so this does too.
+            let stars = part.tokens.iter().all(|t| matches!(t, Token::Star));
+            if stars && part.tokens.len() >= 2 {
+                segments.push(Segment::AnyDepth { at_least_one: i == last || part.escaped_slash });
+            } else {
+                segments.push(Segment::Name(Glob::new(part.tokens)));
+            }
+        }
+
+        // A bare `**` is every name, which is what `*` already says.
+        if !rooted {
+            segments = vec![match segments.remove(0) {
+                Segment::AnyDepth { .. } => Segment::Name(Glob::new(vec![Token::Star])),
+                name => name,
+            }];
+        }
+
+        let base_depth = if base.is_empty() { 0 } else { base.split('/').count() };
+        Ok(Some(Rule {
+            base: base.to_string(),
+            base_depth,
+            negated,
+            dir_only,
+            rooted,
+            segments,
+        }))
+    }
+}
+
+/// One `/`-separated piece of a pattern, as tokens.
+struct Component {
+    tokens: Vec<Token>,
+    /// The `/` that ended this piece was written `\/`. Still a separator --
+    /// there is no other kind of `/` in a path -- but git does not let a `**`
+    /// in front of one stand for no directories at all, so it is remembered.
+    escaped_slash: bool,
+}
+
+/// Read a whole pattern: split it at its `/`s and each piece into tokens.
+///
+/// One pass rather than a split and then a parse, because where the pieces
+/// end depends on what is in them: the `/` in `[a/b]` is a member of a set and
+/// the one in `a\\/b` follows an escaped backslash, and only reading the
+/// pattern left to right tells either from a separator.
+fn tokenize(pattern: &str) -> std::result::Result<Vec<Component>, String> {
+    let fresh = || Component { tokens: Vec::new(), escaped_slash: false };
+    let mut parts = vec![fresh()];
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        let here = parts.last_mut().expect("starts with one part");
+        match c {
+            '/' => parts.push(fresh()),
+            '\\' => match chars.next() {
+                Some('/') => {
+                    here.escaped_slash = true;
+                    parts.push(fresh());
+                }
+                Some(next) => here.tokens.push(Token::Char(next)),
+                None => return Err("it ends in a backslash with nothing to escape".into()),
+            },
+            '?' => here.tokens.push(Token::One),
+            '*' => here.tokens.push(Token::Star),
+            '[' => here.tokens.push(parse_class(&mut chars)?),
+            c => here.tokens.push(Token::Char(c)),
+        }
+    }
+    Ok(parts)
+}
+
+/// Match a rule's segments against a path's components, all of both.
+fn segments_match(segments: &[Segment], parts: &[&str]) -> bool {
+    match segments.split_first() {
+        None => parts.is_empty(),
+        Some((Segment::AnyDepth { at_least_one }, rest)) => {
+            // Try swallowing nothing (where that is allowed), then one
+            // directory, then two...
+            (usize::from(*at_least_one)..=parts.len())
+                .any(|skip| segments_match(rest, &parts[skip..]))
+        }
+        Some((Segment::Name(glob), rest)) => match parts.split_first() {
+            Some((first, more)) => glob.matches(first) && segments_match(rest, more),
+            None => false,
+        },
+    }
+}
+
+/// A pattern for one path component: `*.log`, `f?.txt`, `*.[oa]`.
+///
+/// Parsed once, when the ignore file is read, so matching a hundred thousand
+/// names does not mean reading the pattern a hundred thousand times.
+#[derive(Clone)]
+struct Glob {
+    tokens: Vec<Token>,
+    /// Set when the pattern has no wildcards at all, which is most of them:
+    /// then matching is one string comparison.
+    literal: Option<String>,
+}
+
+#[derive(Clone)]
+enum Token {
+    Char(char),
+    /// `?`: exactly one character.
+    One,
+    /// `*`: any run of characters, including none.
+    Star,
+    /// `[...]`: one character from a set, or with `negated` one not in it.
+    Class { negated: bool, items: Vec<ClassItem> },
+}
+
+#[derive(Clone)]
+enum ClassItem {
+    /// `a-z`. A single character is the range from itself to itself.
+    Range(char, char),
+    /// `[:alpha:]` and friends.
+    Named(fn(char) -> bool),
+}
+
+impl Token {
+    /// Whether this token matches the single character `c`. Never asked of
+    /// `Star`, which is not about one character.
+    fn takes(&self, c: char) -> bool {
+        match self {
+            Token::Char(x) => *x == c,
+            Token::One => true,
+            Token::Star => false,
+            Token::Class { negated, items } => {
+                let inside = items.iter().any(|item| match item {
+                    ClassItem::Range(lo, hi) => *lo <= c && c <= *hi,
+                    ClassItem::Named(is) => is(c),
+                });
+                inside != *negated
+            }
+        }
+    }
+}
+
+impl Glob {
+    fn new(mut tokens: Vec<Token>) -> Glob {
+        // `**` inside a name is just `*`.
+        tokens.dedup_by(|a, b| matches!((a, b), (Token::Star, Token::Star)));
+        let literal = tokens
+            .iter()
+            .map(|t| match t {
+                Token::Char(c) => Some(*c),
+                _ => None,
+            })
+            .collect::<Option<String>>();
+        Glob { tokens, literal }
+    }
+
+    /// The classic two-pointer walk: on a mismatch, go back to the last `*`
+    /// and let it swallow one more character. No recursion to blow up on
+    /// `a*a*a*a*b`. Positions in the name are byte offsets, stepped a whole
+    /// character at a time, so nothing is copied out to match.
+    fn matches(&self, name: &str) -> bool {
+        if let Some(literal) = &self.literal {
+            return literal == name;
+        }
+        let t = &self.tokens;
+        let (mut ti, mut ni) = (0, 0);
+        // Where the last `*` was, and where in the name it had reached.
+        let mut star: Option<(usize, usize)> = None;
+
+        while let Some(c) = name[ni..].chars().next() {
+            if ti < t.len() && matches!(t[ti], Token::Star) {
+                star = Some((ti, ni));
+                ti += 1;
+            } else if ti < t.len() && t[ti].takes(c) {
+                ti += 1;
+                ni += c.len_utf8();
+            } else if let Some((st, sn)) = star {
+                let swallowed = name[sn..].chars().next().map_or(1, char::len_utf8);
+                ti = st + 1;
+                ni = sn + swallowed;
+                star = Some((st, ni));
+            } else {
+                return false;
+            }
+        }
+        t[ti..].iter().all(|tok| matches!(tok, Token::Star))
+    }
+}
+
+/// Parse a character class, the opening `[` already consumed.
+///
+/// The awkward corners are the ones every glob has: `!` or `^` first negates,
+/// a `]` first is a member rather than the end, a `-` last is a member rather
+/// than a range, and a backslash makes anything ordinary.
+fn parse_class(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> std::result::Result<Token, String> {
+    let unclosed = || "a [ is never closed".to_string();
+
+    let negated = matches!(chars.peek(), Some('!' | '^'));
+    if negated {
+        chars.next();
+    }
+    let mut items = Vec::new();
+    let mut first = true;
+    loop {
+        let c = chars.next().ok_or_else(unclosed)?;
+        let lo = match c {
+            ']' if !first => break,
+            '[' if chars.peek() == Some(&':') => {
+                chars.next();
+                let mut name = String::new();
+                loop {
+                    match chars.next().ok_or_else(unclosed)? {
+                        ':' if chars.peek() == Some(&']') => {
+                            chars.next();
+                            break;
+                        }
+                        ch => name.push(ch),
+                    }
+                }
+                let is = named_class(&name)
+                    .ok_or_else(|| format!("[:{name}:] is not a character class"))?;
+                items.push(ClassItem::Named(is));
+                first = false;
+                continue;
+            }
+            '\\' => chars.next().ok_or_else(unclosed)?,
+            c => c,
+        };
+        first = false;
+
+        // `a-z` is a range; `a-]` is an `a` and then a `-`.
+        let mut ahead = chars.clone();
+        if ahead.next() == Some('-') && !matches!(ahead.peek(), Some(']') | None) {
+            chars.next();
+            let mut hi = chars.next().ok_or_else(unclosed)?;
+            if hi == '\\' {
+                hi = chars.next().ok_or_else(unclosed)?;
+            }
+            items.push(ClassItem::Range(lo, hi));
+        } else {
+            items.push(ClassItem::Range(lo, lo));
+        }
+    }
+    Ok(Token::Class { negated, items })
+}
+
+/// The POSIX classes, by the name between `[:` and `:]`.
+fn named_class(name: &str) -> Option<fn(char) -> bool> {
+    Some(match name {
+        "alnum" => |c| c.is_alphanumeric(),
+        "alpha" => |c| c.is_alphabetic(),
+        "blank" => |c| c == ' ' || c == '\t',
+        "cntrl" => |c| c.is_control(),
+        "digit" => |c| c.is_ascii_digit(),
+        "graph" => |c| !c.is_whitespace() && !c.is_control(),
+        "lower" => |c| c.is_lowercase(),
+        "print" => |c| !c.is_control(),
+        "punct" => |c| c.is_ascii_punctuation(),
+        "space" => |c| c.is_whitespace(),
+        "upper" => |c| c.is_uppercase(),
+        "xdigit" => |c| c.is_ascii_hexdigit(),
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -850,6 +1547,407 @@ mod tests {
         assert!(ig.matches("target", true), "the rule from .fkitignore");
         assert!(ig.matches("run.log", false), "the rule from .fkthat");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Rules straight from text, as if they had been read from `.fkthat`.
+    fn rules(text: &str) -> Ignore {
+        let mut ig = Ignore::empty();
+        ig.extend_from("", ".fkthat", text);
+        assert_eq!(ig.problems(), &[], "every line here should parse");
+        ig
+    }
+
+    #[test]
+    fn a_bare_name_matches_at_any_depth() {
+        let ig = rules("target\nprefix/\n*.key\n");
+        assert!(ig.matches("target", true));
+        assert!(ig.matches("server/target", true));
+        assert!(ig.matches("a/b/target", false), "a bare name is files too");
+        assert!(ig.matches("prefix", true));
+        assert!(ig.matches("sub/prefix", true));
+        assert!(!ig.matches("sub/prefix", false), "a trailing / is directories only");
+        assert!(ig.matches("deep/down/id.key", false));
+        assert!(!ig.matches("deep/down/id.keys", false));
+    }
+
+    /// The case the rules were rewritten for: a root `patch/` full of build
+    /// output, and source folders elsewhere that happen to share the name.
+    #[test]
+    fn a_leading_slash_pins_a_rule_to_the_root() {
+        for line in ["/patch/", "./patch/"] {
+            let ig = rules(line);
+            assert!(ig.matches("patch", true), "{line}: the root folder goes");
+            assert!(!ig.matches("server/patch", true), "{line}: the source folder stays");
+            assert!(!ig.matches("data/patch", true), "{line}: and the other one");
+            assert!(!ig.matches("patch", false), "{line}: a file called patch is not a folder");
+        }
+        let ig = rules("/notes.txt");
+        assert!(ig.matches("notes.txt", false));
+        assert!(!ig.matches("docs/notes.txt", false));
+    }
+
+    /// `patch/**` is everything inside the folder and not the folder, which
+    /// is the difference between it and `patch/`: something directly inside
+    /// can still be taken back.
+    #[test]
+    fn a_trailing_double_star_is_everything_inside() {
+        let ig = rules("patch/**\n!patch/README\n");
+        assert!(!ig.matches("patch", true), "the folder itself is not inside itself");
+        assert!(ig.matches("patch/p1", false));
+        assert!(ig.matches("patch/2024", true));
+        assert!(ig.matches("patch/2024/a/b", false));
+        assert!(!ig.matches("patch/README", false), "taken back");
+        assert!(!ig.matches("server/patch/src", true), "still only the root one");
+    }
+
+    #[test]
+    fn a_rule_with_a_slash_inside_is_a_path_from_the_root() {
+        let ig = rules("server/target/\ndocs/*.pdf\n");
+        assert!(ig.matches("server/target", true));
+        assert!(!ig.matches("target", true), "only the one that was named");
+        assert!(!ig.matches("client/server/target", true), "and only from the root");
+        assert!(ig.matches("docs/a.pdf", false));
+        assert!(!ig.matches("docs/old/a.pdf", false), "* does not cross a /");
+        assert!(!ig.matches("a.pdf", false));
+    }
+
+    #[test]
+    fn double_star_stands_for_any_depth() {
+        let ig = rules("**/target/\nsrc/**/gen\n");
+        assert!(ig.matches("target", true), "any depth includes none");
+        assert!(ig.matches("server/target", true));
+        assert!(ig.matches("a/b/c/target", true));
+        assert!(!ig.matches("a/target", false), "still directories only");
+        assert!(ig.matches("src/gen", false));
+        assert!(ig.matches("src/a/b/gen", false));
+        assert!(!ig.matches("lib/a/gen", false));
+        assert!(rules("***/gen").matches("a/b/gen", false), "more stars are no different");
+    }
+
+    #[test]
+    fn stars_and_question_marks_match_within_a_name() {
+        let ig = rules("vgcore.*\nf?.txt\n*~\ncore*dump*\n");
+        assert!(ig.matches("vgcore.123", false));
+        assert!(ig.matches("deep/vgcore.9", false));
+        assert!(!ig.matches("vgcore", false), "the dot is part of the rule");
+        assert!(ig.matches("f1.txt", false));
+        assert!(!ig.matches("f10.txt", false), "? is exactly one character");
+        assert!(!ig.matches("f.txt", false));
+        assert!(ig.matches("notes.md~", false));
+        assert!(ig.matches("core.dump.1", false));
+        assert!(ig.matches("coredump", false), "* may match nothing");
+        assert!(!ig.matches("score.dump", false), "the whole name, not part of it");
+
+        // Backtracking: the first `a` a star could stop at is not always the
+        // right one.
+        let glob = |pattern: &str, name: &str| {
+            let mut parts = tokenize(pattern).unwrap();
+            assert_eq!(parts.len(), 1, "one name, no slashes");
+            Glob::new(parts.remove(0).tokens).matches(name)
+        };
+        assert!(glob("*a*b", "xaxaxb"));
+        assert!(!glob("*a*b", "xaxaxbx"));
+        assert!(glob("***", ""));
+        assert!(glob("é?", "éü"), "characters, not bytes");
+        assert!(glob("*ü", "éüü"), "and a star steps over whole characters");
+    }
+
+    #[test]
+    fn a_bang_takes_back_what_an_earlier_rule_excluded() {
+        let ig = rules("*.tmp\n!keep.tmp\n");
+        assert!(ig.matches("a.tmp", false));
+        assert!(!ig.matches("keep.tmp", false));
+        assert!(!ig.matches("sub/keep.tmp", false));
+
+        // The last rule to match decides, so the other order means the other
+        // thing.
+        let ig = rules("!keep.tmp\n*.tmp\n");
+        assert!(ig.matches("keep.tmp", false));
+    }
+
+    #[test]
+    fn the_repository_itself_is_never_snapshotted() {
+        assert!(Ignore::empty().matches(".fkit", true));
+        assert!(Ignore::empty().matches("vendored/.fkit", true));
+        assert!(rules("!.fkit\n").matches(".fkit", true), "and no rule can say otherwise");
+    }
+
+    #[test]
+    fn character_classes_match_one_character_from_a_set() {
+        let ig = rules("*.[oa]\nlog[0-9]\n[!a-c]x\n[]-]y\n[[:digit:][:upper:]]z\n[a\\]]w\n");
+        assert!(ig.matches("main.o", false));
+        assert!(ig.matches("lib/libz.a", false));
+        assert!(!ig.matches("main.c", false));
+        assert!(!ig.matches("main.oa", false), "one character, not one or more");
+        assert!(ig.matches("log7", false));
+        assert!(!ig.matches("logx", false));
+        assert!(ig.matches("dx", false));
+        assert!(!ig.matches("bx", false), "! at the front turns the set inside out");
+        assert!(ig.matches("]y", false), "a ] first is a member, not the end");
+        assert!(ig.matches("-y", false), "a - last is a member, not a range");
+        assert!(ig.matches("7z", false));
+        assert!(ig.matches("Qz", false));
+        assert!(!ig.matches("qz", false));
+        assert!(ig.matches("]w", false), "an escaped ] is a member too");
+        assert!(rules("[^a-c]x").matches("dx", false), "^ negates as well as !");
+    }
+
+    #[test]
+    fn a_backslash_makes_the_next_character_ordinary() {
+        let ig = rules("\\#notes\n\\!important\nstar\\*\nwhat\\?\ntrailing\\ \nplain   \n");
+        assert!(ig.matches("#notes", false), "not a comment");
+        assert!(ig.matches("!important", false), "not a negation");
+        assert!(ig.matches("star*", false));
+        assert!(!ig.matches("starry", false), "the * is a character now");
+        assert!(ig.matches("what?", false));
+        assert!(!ig.matches("whatx", false));
+        assert!(ig.matches("trailing ", false), "an escaped trailing space is kept");
+        assert!(!ig.matches("trailing", false));
+        assert!(ig.matches("plain", false), "unescaped trailing spaces are not");
+        assert!(rules(" lead").matches(" lead", false), "leading spaces are part of the name");
+
+        // An escaped / is still a /, and an escaped \ before one is not an
+        // escape of it.
+        let ig = rules("docs\\/*.pdf\n");
+        assert!(ig.matches("docs/a.pdf", false));
+        assert!(!ig.matches("a.pdf", false));
+        assert!(rules("a\\\\/b").matches("a\\/b", false));
+
+        // Corners found by running the same rules through git itself. A / in
+        // a class separates nothing, but still pins the rule to its folder.
+        let ig = rules("[x/]y\n");
+        assert!(ig.matches("xy", false));
+        assert!(!ig.matches("sub/xy", false));
+        // And `**` before an escaped / cannot stand for no directories.
+        let ig = rules("**\\/gen\n");
+        assert!(ig.matches("a/gen", false));
+        assert!(!ig.matches("gen", false));
+        assert!(rules("**/gen").matches("gen", false), "where a plain / lets it");
+    }
+
+    /// The few lines that cannot mean anything are said out loud. The
+    /// alternative is what this used to do: keep them as a name no file has.
+    #[test]
+    fn a_line_that_cannot_be_a_rule_is_reported_not_kept() {
+        let mut ig = Ignore::empty();
+        ig.extend_from(
+            "",
+            ".fkthat",
+            "# objects\n*.[oa\n\ntarget/\nback\\\n/\n!\n[[:nope:]]\na//b\n",
+        );
+
+        let seen: Vec<(usize, &str)> =
+            ig.problems().iter().map(|p| (p.line, p.text.as_str())).collect();
+        assert_eq!(
+            seen,
+            [(2, "*.[oa"), (5, "back\\"), (6, "/"), (7, "!"), (8, "[[:nope:]]"), (9, "a//b")],
+        );
+        assert_eq!(
+            ig.problems()[0].to_string(),
+            ".fkthat:2: '*.[oa' is not in effect — a [ is never closed",
+        );
+
+        // The good line beside them still works, and the bad ones match
+        // nothing rather than something surprising.
+        assert!(ig.matches("target", true));
+        assert!(!ig.matches("main.o", false));
+        assert!(!ig.matches("*.[oa", false));
+    }
+
+    /// Every file path in a tree, for comparing against what was on disk.
+    fn paths_in(store: &Store, tree: Hash, prefix: &str, out: &mut Vec<String>) {
+        for e in read_entries(store, tree).unwrap() {
+            let path =
+                if prefix.is_empty() { e.name.clone() } else { format!("{prefix}/{}", e.name) };
+            if e.kind == EntryKind::Dir {
+                out.push(format!("{path}/"));
+                paths_in(store, e.hash, &path, out);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+
+    fn put(root: &Path, rel: &str, body: &str) {
+        let p = root.join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, body).unwrap();
+    }
+
+    /// The rules as the walk applies them: an ignored directory is not
+    /// entered, so a path rule only has to match the directory itself.
+    #[test]
+    fn the_walk_applies_rules_to_paths_not_just_names() {
+        let (store, dir) = tmp_store("ignwalk");
+        let work = dir.join("work");
+        put(&work, "patch/p1", "a");
+        put(&work, "server/patch/src/lib.rs", "b");
+        put(&work, "server/target/o", "c");
+        put(&work, "sub/prefix/y", "e");
+        put(&work, "vgcore.123", "f");
+
+        let snapshot = |text: &str| {
+            let ig = rules(text);
+            let ing = ingest_dir(&Sink::writing(&store), &work, &ig, &Default::default()).unwrap();
+            let mut out = Vec::new();
+            paths_in(&store, ing.hash, "", &mut out);
+            out
+        };
+
+        let all = snapshot("");
+        assert!(all.contains(&"patch/p1".to_string()));
+
+        // Everything inside goes, the folder stays -- and since a snapshot
+        // records empty folders, it is there, empty.
+        let inside = snapshot("patch/**\n");
+        assert!(inside.contains(&"patch/".to_string()));
+        assert!(!inside.contains(&"patch/p1".to_string()));
+
+        let got = snapshot("/patch/\nserver/target/\nvgcore.*\n");
+        assert_eq!(
+            got,
+            ["server/", "server/patch/", "server/patch/src/", "server/patch/src/lib.rs",
+             "sub/", "sub/prefix/", "sub/prefix/y"],
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// An ignore file further down speaks for its own directory: its rules are
+    /// read from where it sits, it cannot reach its siblings, and where it
+    /// disagrees with the root it has the last word.
+    #[test]
+    fn an_ignore_file_in_a_subdirectory_applies_from_there_down() {
+        let dir = std::env::temp_dir().join(format!("fkit-ign-nested-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let store = Store::open(dir.join("store")).unwrap();
+        let work = dir.join("work");
+        put(&work, ".fkitignore", "*.log\n");
+        put(&work, "a.log", "");
+        put(&work, "out/x", "");
+        put(&work, "server/.fkthat", "/out/\n!keep.log\n*.gen\nbad[\n");
+        put(&work, "server/out/x", "");
+        put(&work, "server/keep.log", "");
+        put(&work, "server/other.log", "");
+        put(&work, "server/deep/out/x", "");
+        put(&work, "server/deep/keep.log", "");
+        put(&work, "server/deep/a.gen", "");
+        put(&work, "client/a.gen", "");
+
+        let ig = Ignore::load(&work);
+        assert_eq!(ig.problems(), &[], "the root file is fine");
+        let ing = ingest_dir(&Sink::writing(&store), &work, &ig, &Mounts::new()).unwrap();
+        let mut got = Vec::new();
+        paths_in(&store, ing.hash, "", &mut got);
+        got.retain(|p| !p.ends_with('/'));
+        assert_eq!(
+            got,
+            [
+                ".fkitignore",
+                "client/a.gen",           // server's *.gen is not client's business
+                "out/x",                  // nor is its /out/
+                "server/.fkthat",
+                "server/deep/keep.log",   // !keep.log overrides the root's *.log
+                "server/deep/out/x",      // /out/ is pinned to server/, not below
+                "server/keep.log",
+            ],
+        );
+
+        // And the line in it that could not be a rule is named, with the
+        // path of the file it is in.
+        let said: Vec<String> = ing.unusable.iter().map(|p| p.to_string()).collect();
+        assert_eq!(said, ["server/.fkthat:4: 'bad[' is not in effect — a [ is never closed"]);
+
+        // `Ignore::empty` goes on meaning what it says.
+        let all = ingest_dir(&Sink::writing(&store), &work, &Ignore::empty(), &Mounts::new())
+            .unwrap();
+        let mut got = Vec::new();
+        paths_in(&store, all.hash, "", &mut got);
+        assert!(got.contains(&"server/out/x".to_string()));
+        assert!(got.contains(&"a.log".to_string()));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A file listed by the walk and gone by the time it is read is left out
+    /// and reported. It used to fail the whole snapshot, which in a working
+    /// tree with a build running meant commits failing at random.
+    #[test]
+    fn a_file_that_vanishes_after_the_walk_is_left_out_not_fatal() {
+        let (store, dir) = tmp_store("vanish");
+        let work = dir.join("work");
+        for i in 0..40 {
+            put(&work, &format!("f{i}.txt"), &format!("file {i}"));
+        }
+        put(&work, "build/tmp/a.o", "a");
+        put(&work, "build/tmp/b.o", "b");
+        put(&work, "build/keep.txt", "k");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("f1.txt", work.join("link")).unwrap();
+
+        let sink = Sink::writing(&store);
+        let (ig, mounts) = (Ignore::empty(), Mounts::new());
+        let sk = enumerate(&work, &ig, &mounts).unwrap();
+
+        // The gap between listing and reading, where a build does its work.
+        fs::remove_file(work.join("f3.txt")).unwrap();
+        fs::remove_file(work.join("f17.txt")).unwrap();
+        fs::remove_dir_all(work.join("build/tmp")).unwrap();
+        #[cfg(unix)]
+        fs::remove_file(work.join("link")).unwrap();
+
+        let ing = ingest_enumerated(&sink, &work, sk, &mounts, &Prior::none(), None)
+            .expect("vanished files must not fail the snapshot");
+
+        let mut want = vec!["build/tmp/a.o", "build/tmp/b.o", "f17.txt", "f3.txt"];
+        if cfg!(unix) {
+            want.push("link");
+        }
+        let got: Vec<&str> = ing.raced.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(got, want);
+        assert!(ing.raced.iter().all(|r| r.what == Race::Vanished));
+
+        // And what was stored is exactly the tree as it now stands: no entry
+        // for the files, and no empty `build/tmp` for a directory that is gone.
+        let fresh = ingest_dir(&sink, &work, &ig, &mounts).unwrap();
+        assert!(fresh.raced.is_empty(), "a quiet tree reports nothing");
+        assert_eq!(ing.hash, fresh.hash);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Forgiving a missing path stops at the root: there the directory being
+    /// gone is not a race, it is the wrong directory.
+    #[test]
+    fn a_missing_root_is_still_an_error() {
+        let (store, dir) = tmp_store("noroot");
+        let out = ingest_dir(
+            &Sink::dry(&store),
+            &dir.join("never-created"),
+            &Ignore::empty(),
+            &Mounts::new(),
+        );
+        assert!(out.is_err(), "no root is nothing to snapshot, not an empty snapshot");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A file replaced by a directory of the same name is gone as a file.
+    #[test]
+    fn a_file_that_became_a_directory_is_skipped() {
+        let (store, dir) = tmp_store("becamedir");
+        let work = dir.join("work");
+        put(&work, "a.txt", "a");
+        put(&work, "thing", "was a file");
+
+        let sink = Sink::writing(&store);
+        let (ig, mounts) = (Ignore::empty(), Mounts::new());
+        let sk = enumerate(&work, &ig, &mounts).unwrap();
+        fs::remove_file(work.join("thing")).unwrap();
+        fs::create_dir(work.join("thing")).unwrap();
+
+        let ing = ingest_enumerated(&sink, &work, sk, &mounts, &Prior::none(), None).unwrap();
+        assert_eq!(ing.raced, [Raced { path: "thing".into(), what: Race::Vanished }]);
+        let mut paths = Vec::new();
+        paths_in(&store, ing.hash, "", &mut paths);
+        assert_eq!(paths, ["a.txt"]);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
