@@ -137,11 +137,21 @@ pub struct Blob {
     pub size: u64,
     pub truncated: bool,
     pub binary: bool,
-    /// The image type, when the bytes actually are one. `None` for everything
-    /// else — including SVG, which is a document, not a picture.
+    /// The image type, when the bytes actually are one and the raw endpoint
+    /// is able to serve them. `None` for everything else.
     pub image: Option<&'static str>,
     pub hash: Hash,
 }
+
+/// The one image type that is also a document. See [`image_mime`].
+pub const SVG: &str = "image/svg+xml";
+
+/// How much of a file is read to decide what it is.
+///
+/// Every pixel format announces itself in its first dozen bytes. SVG is the
+/// reason this is not a dozen: its root element comes after an XML
+/// declaration, a doctype, and very often a licence in a comment.
+pub const SNIFF_BYTES: usize = 4096;
 
 /// Identify an image from its leading bytes.
 ///
@@ -150,9 +160,11 @@ pub struct Blob {
 /// served as an image — and with `nosniff` set, a Content-Type that disagrees
 /// with the bytes is exactly the mismatch that gets a real image blocked.
 ///
-/// SVG is deliberately absent. It is an XML document that can carry script and
-/// external references, so it stays `text/plain`: you can read the source,
-/// which for an SVG is arguably the more useful view anyway.
+/// SVG is recognised here but is not like the others: it is an XML document
+/// that can carry script, and only behaves as a picture when a browser loads
+/// it *as* one. Knowing a file is an SVG is therefore not the same as being
+/// willing to hand it over typed as one — that decision belongs to whoever is
+/// serving it, and the raw endpoint makes it per request.
 pub fn image_mime(bytes: &[u8]) -> Option<&'static str> {
     const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
     if bytes.starts_with(PNG) {
@@ -164,18 +176,137 @@ pub fn image_mime(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
         return Some("image/gif");
     }
-    if bytes.starts_with(b"BM") {
+    // "BM" alone is two letters of ordinary text — a file of notes about BMWs
+    // would count. The header's four reserved bytes are zero in a real bitmap
+    // and are never zero in prose, so they are what actually identifies one.
+    if bytes.len() >= 14 && bytes.starts_with(b"BM") && bytes[6..10] == [0, 0, 0, 0] {
         return Some("image/bmp");
     }
     // RIFF containers name their form at offset 8: WEBP is one of several.
     if bytes.len() > 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
         return Some("image/webp");
     }
-    // ISO-BMFF: an `ftyp` box whose brand says AVIF.
-    if bytes.len() > 12 && &bytes[4..8] == b"ftyp" && &bytes[8..12] == b"avif" {
+    // ISO-BMFF: an `ftyp` box whose brand says AVIF (`avis` is the animated one).
+    if bytes.len() > 12
+        && &bytes[4..8] == b"ftyp"
+        && (&bytes[8..12] == b"avif" || &bytes[8..12] == b"avis")
+    {
         return Some("image/avif");
     }
+    // ICO has no magic word, only a shape: reserved zero, type one, and a
+    // count of images that is not zero. A favicon is the one image nearly
+    // every web project has.
+    if bytes.len() >= 6 && bytes[..4] == [0, 0, 1, 0] && (bytes[4] != 0 || bytes[5] != 0) {
+        return Some("image/x-icon");
+    }
+    if is_svg(bytes) {
+        return Some(SVG);
+    }
     None
+}
+
+/// Is the first element of this document `<svg>`?
+///
+/// Skips what may legitimately come before a root element — a byte-order
+/// mark, whitespace, the XML declaration, comments, a doctype — and then asks
+/// what the first tag is. Finding the letters "<svg" *somewhere* is not the
+/// test: an HTML page with an inline icon contains them too.
+///
+/// Being wrong in the generous direction costs nothing. Whatever this accepts
+/// is only ever typed as SVG for a request that will draw it as an image,
+/// where a browser runs no script whatever the markup says.
+fn is_svg(bytes: &[u8]) -> bool {
+    let head = &bytes[..bytes.len().min(SNIFF_BYTES)];
+    // The window may end in the middle of a character; what matters is that
+    // everything up to there is text.
+    let text = match std::str::from_utf8(head) {
+        Ok(t) => t,
+        Err(e) => match std::str::from_utf8(&head[..e.valid_up_to()]) {
+            Ok(t) if e.error_len().is_none() => t,
+            _ => return false,
+        },
+    };
+
+    let mut rest = text.trim_start_matches('\u{feff}').trim_start();
+    loop {
+        let skipped = if rest.starts_with("<?") {
+            rest.find("?>").map(|i| i + 2)
+        } else if rest.starts_with("<!--") {
+            rest.find("-->").map(|i| i + 3)
+        } else if rest.starts_with("<!") {
+            // A doctype may carry an internal subset in square brackets, with
+            // its own angle brackets inside; the declaration ends at the first
+            // `>` after that subset closes.
+            match (rest.find('['), rest.find('>')) {
+                (Some(open), Some(close)) if open < close => rest[open..]
+                    .find(']')
+                    .and_then(|i| rest[open + i..].find('>').map(|j| open + i + j + 1)),
+                (_, close) => close.map(|i| i + 1),
+            }
+        } else {
+            break;
+        };
+        match skipped {
+            Some(n) => rest = rest[n..].trim_start(),
+            // Unterminated inside the window: whatever this is, its root
+            // element is too far in to vouch for.
+            None => return false,
+        }
+    }
+
+    match rest.strip_prefix("<svg") {
+        Some(after) => after
+            .chars()
+            .next()
+            .is_none_or(|c| c.is_whitespace() || c == '>' || c == '/'),
+        None => false,
+    }
+}
+
+/// The first `want` bytes of a file, without reading the rest of it.
+///
+/// A file is a Merkle tree of chunks, so its beginning is the leftmost leaf
+/// and reaching it costs one object per level — the same whether the file is
+/// a kilobyte or a gigabyte. That is what lets a forty-megabyte photograph be
+/// recognised as a photograph without forty megabytes passing through here.
+pub fn file_head(store: &Store, root: Hash, want: usize) -> Vec<u8> {
+    fn walk(store: &Store, id: Hash, want: usize, out: &mut Vec<u8>) {
+        if out.len() >= want {
+            return;
+        }
+        match store.get(id) {
+            Ok(Object::Chunk(data)) => {
+                let room = want - out.len();
+                out.extend_from_slice(&data[..data.len().min(room)]);
+            }
+            Ok(Object::File { children, .. }) => {
+                for (child, _) in children {
+                    if out.len() >= want {
+                        break;
+                    }
+                    walk(store, child, want, out);
+                }
+            }
+            // Not a file, or not here. Either way there is no head to report,
+            // and the caller's answer to "is this an image" is simply no.
+            _ => {}
+        }
+    }
+    let mut out = Vec::with_capacity(want.min(SNIFF_BYTES));
+    walk(store, root, want, &mut out);
+    out
+}
+
+/// What kind of image a stored file is, if it is one that can be shown.
+///
+/// "Can be shown" includes being small enough for the raw endpoint to serve:
+/// telling a client something is a PNG and then refusing to send it would put
+/// a broken image on the page where an honest "too large" belongs.
+pub fn image_of(store: &Store, id: Hash, size: u64) -> Option<&'static str> {
+    if size > MAX_RAW_BYTES {
+        return None;
+    }
+    image_mime(&file_head(store, id, SNIFF_BYTES))
 }
 
 /// Read a file node straight from the store, by hash.
@@ -190,12 +321,15 @@ pub fn read_object(store: &Store, id: Hash) -> AppResult<Blob> {
     let mut bytes = Vec::new();
     read_file(store, id, &mut bytes).map_err(AppError::Internal)?;
     let size = bytes.len() as u64;
+    // Asked before the bytes are dropped: an image is displayed from the raw
+    // endpoint rather than from this response, so being too large to send
+    // inline says nothing about whether it can be shown.
+    let image = if size > MAX_RAW_BYTES { None } else { image_mime(&bytes) };
     let truncated = size > MAX_INLINE_BLOB;
     if truncated {
         bytes.clear();
     }
     let binary = bytes.iter().take(8192).any(|b| *b == 0);
-    let image = image_mime(&bytes);
     Ok(Blob { size, hash: id, bytes, truncated, binary, image })
 }
 
@@ -220,7 +354,14 @@ pub fn read_blob(store: &Store, tree: Hash, path: &str) -> AppResult<Blob> {
     // The heuristic every diff tool uses: a NUL byte early in the file means
     // binary. Cheap, and wrong only for exotic text encodings.
     let binary = bytes.iter().take(8192).any(|b| *b == 0);
-    let image = image_mime(&bytes);
+    // A file too large to send inline was not read, so there is nothing here
+    // to sniff — and a photograph is exactly the kind of file that is. Its
+    // first chunk says what it is without the rest.
+    let image = if truncated {
+        image_of(store, entry.hash, entry.size)
+    } else {
+        image_mime(&bytes)
+    };
 
     Ok(Blob { size: entry.size, hash: entry.hash, bytes, truncated, binary, image })
 }
@@ -409,6 +550,15 @@ pub struct FileDiff {
     /// that content does, and is plainly absent once it does not.
     pub old_hash: Option<String>,
     pub new_hash: Option<String>,
+    /// The image type of each side, where that side is an image.
+    ///
+    /// A line diff of a picture is "binary file" and nothing more, which
+    /// answers a question nobody asked. With these the client can put the two
+    /// versions next to each other, fetched by the hashes above — so what is
+    /// compared is exactly the two contents this diff is between, whatever
+    /// any branch has done since.
+    pub old_image: Option<&'static str>,
+    pub new_image: Option<&'static str>,
 }
 
 fn read_blob_by_hash(store: &Store, h: Hash) -> Vec<u8> {
@@ -472,6 +622,11 @@ fn diff_file_list(
                 too_large: true, only_line_endings: false, hunks: vec![], old_size, new_size,
                 old_hash: before.map(|e| e.hash.to_hex()),
                 new_hash: after.map(|e| e.hash.to_hex()),
+                // Too large to diff as lines is the normal size for a
+                // screenshot, so this is the branch most images take. Only
+                // the head of each side is read.
+                old_image: before.and_then(|e| image_of(store, e.hash, e.size)),
+                new_image: after.and_then(|e| image_of(store, e.hash, e.size)),
             });
             continue;
         }
@@ -493,6 +648,8 @@ fn diff_file_list(
             new_size,
             old_hash: before.map(|e| e.hash.to_hex()),
             new_hash: after.map(|e| e.hash.to_hex()),
+            old_image: before.and_then(|_| image_mime(&a)),
+            new_image: after.and_then(|_| image_mime(&b)),
             hunks: d
                 .hunks
                 .into_iter()
@@ -818,6 +975,37 @@ pub fn raw_blob(store: &Store, tree: Hash, path: &str) -> AppResult<(Vec<u8>, u6
     Ok((bytes, entry.size))
 }
 
+/// Raw bytes of a file named by its own hash rather than by a path.
+///
+/// What a diff needs: its two sides are contents, and the old one may not be
+/// at any path in any ref that still exists. The hash has to name a *file* —
+/// a commit or a directory is an object too, and neither is something to hand
+/// out as a download.
+pub fn raw_object(store: &Store, id: Hash) -> AppResult<Vec<u8>> {
+    if !store.has(id) {
+        return Err(AppError::not_found("no such object"));
+    }
+    let node = store.get(id).map_err(AppError::Internal)?;
+    if !matches!(node, Object::Chunk(_) | Object::File { .. }) {
+        return Err(AppError::bad(format!(
+            "{} is a {}, not a file",
+            id.short(),
+            node.kind().name()
+        )));
+    }
+    // A file node records how many bytes are beneath it, so the cap is
+    // applied before anything is read rather than after.
+    let size = node.content_size();
+    if size > MAX_RAW_BYTES {
+        return Err(AppError::bad(format!(
+            "file is {size} bytes; the raw endpoint serves at most {MAX_RAW_BYTES}"
+        )));
+    }
+    let mut bytes = Vec::with_capacity(size as usize);
+    read_file(store, id, &mut bytes).map_err(AppError::Internal)?;
+    Ok(bytes)
+}
+
 /// The submodule suggestions recorded in a tree.
 ///
 /// Read out of the objects rather than off a disk: a hub has no working copy.
@@ -860,7 +1048,7 @@ pub fn find_readme(store: &Store, tree: Hash) -> Option<(String, String)> {
 
 #[cfg(test)]
 mod image_tests {
-    use super::image_mime;
+    use super::{image_mime, SVG};
 
     #[test]
     fn images_are_identified_from_their_bytes() {
@@ -872,12 +1060,41 @@ mod image_tests {
     }
 
     #[test]
-    fn an_svg_is_not_served_as_an_image() {
-        // It is XML that can carry script and fetch external resources. Served
-        // as image/svg+xml from this origin it would run with the viewer's
-        // session; as text/plain it is just readable source.
-        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg"><script>1</script></svg>"#;
-        assert_eq!(image_mime(svg), None);
+    fn an_svg_is_recognised_by_its_root_element() {
+        assert_eq!(image_mime(b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>"), Some(SVG));
+        assert_eq!(image_mime(b"<svg>"), Some(SVG));
+        // Everything that may come before a root element, all at once.
+        let dressed = "\u{feff}<?xml version=\"1.0\"?>\n<!-- a licence -->\n\
+            <!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \"x.dtd\" [ <!ENTITY a \"b\"> ]>\n\
+            <svg width=\"1\">";
+        assert_eq!(image_mime(dressed.as_bytes()), Some(SVG));
+    }
+
+    #[test]
+    fn mentioning_svg_does_not_make_a_document_one() {
+        // The first element decides, not the presence of the letters.
+        assert_eq!(image_mime(b"<html><body><svg></svg></body></html>"), None);
+        assert_eq!(image_mime(b"<!-- <svg> --><p>hello</p>"), None);
+        assert_eq!(image_mime(b"<svgish>"), None);
+        assert_eq!(image_mime(b"how to draw an <svg>"), None);
+        // A prolog that never ends inside the window vouches for nothing.
+        assert_eq!(image_mime(b"<!-- <svg>"), None);
+    }
+
+    #[test]
+    fn two_letters_are_not_a_bitmap() {
+        assert_eq!(image_mime(b"BMW made the 2002 from 1968 to 1976."), None);
+        let mut bmp = b"BM".to_vec();
+        bmp.extend_from_slice(&[0x46, 0, 0, 0, 0, 0, 0, 0, 0x36, 0, 0, 0, 0x28, 0]);
+        assert_eq!(image_mime(&bmp), Some("image/bmp"));
+    }
+
+    #[test]
+    fn an_icon_is_identified_by_its_header() {
+        assert_eq!(image_mime(&[0, 0, 1, 0, 1, 0, 16, 16]), Some("image/x-icon"));
+        // Reserved, type, and then no images at all: four zero-ish bytes are
+        // the start of a great many files that are not icons.
+        assert_eq!(image_mime(&[0, 0, 1, 0, 0, 0, 0, 0]), None);
     }
 
     #[test]

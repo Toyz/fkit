@@ -23,6 +23,7 @@ pub fn routes() -> Router<AppState> {
         .route("/repos/{owner}/{name}/tree/{ref}/{*path}", get(tree_path))
         .route("/repos/{owner}/{name}/blob/{ref}/{*path}", get(blob))
         .route("/repos/{owner}/{name}/object/{hash}", get(object))
+        .route("/repos/{owner}/{name}/object/{hash}/raw", get(object_raw))
         .route("/repos/{owner}/{name}/commits/{ref}", get(commits))
         .route("/repos/{owner}/{name}/commit/{hash}", get(commit_detail))
         .route("/repos/{owner}/{name}/archive/{spec}", get(archive))
@@ -357,7 +358,10 @@ struct BlobResponse {
     lines: usize,
     /// Set when the bytes are an image the browser can display, so the client
     /// can show the picture instead of "binary file". The raw endpoint serves
-    /// this same type, so the `<img>` actually loads under `nosniff`.
+    /// this same type to an `<img>`, so it actually loads under `nosniff`.
+    ///
+    /// Not exclusive with `content`: an SVG is both a picture and its source,
+    /// and arrives with the two of them.
     image: Option<&'static str>,
 }
 
@@ -518,49 +522,118 @@ async fn last_commits_path(
 
 /// Raw file bytes.
 ///
-/// Always served as `text/plain` (or an opaque octet-stream) with `nosniff` and
-/// a restrictive CSP, **never** with the file's apparent type. Repository
+/// Served as `text/plain` (or an opaque octet-stream) with `nosniff` and a
+/// restrictive CSP, **never** with the file's apparent type. Repository
 /// content is attacker-controlled: handing back a pushed `.html` as
 /// `text/html` on this origin would execute it with the viewer's session
 /// cookie. GitHub serves raw content from a separate domain for exactly this
 /// reason; we do not have one, so the headers have to carry the weight.
+///
+/// Images are the exception, and [`raw_response`] is where it is made.
 async fn raw(
     State(state): State<AppState>,
     viewer: Viewer,
     Path((owner, name, r, path)): Path<(String, String, String, String)>,
+    headers: axum::http::HeaderMap,
 ) -> AppResult<axum::response::Response> {
-    use axum::http::header;
-    use axum::response::IntoResponse;
-
     let (store, _, tree, path) =
         open_in_path(&state, &viewer, &owner, &name, &r, &path).await?;
     let (bytes, _size) = content::raw_blob(&store, tree, &path)?;
+    // A ref moves, so what this URL names can change under a cached copy.
+    Ok(raw_response(bytes, &headers, "max-age=300, private"))
+}
 
-    // An image may be typed honestly: the formats below are decoded as pixels
-    // and cannot execute anything. Everything else keeps the blanket
-    // text/plain-or-octet-stream treatment described above — including SVG,
-    // which is a scriptable document wearing an image's file extension.
-    let is_text = std::str::from_utf8(&bytes).is_ok()
+/// Raw file bytes, by the content's own hash.
+///
+/// The two sides of a diff are contents, not paths: the old side of a change
+/// may be at no path in any ref that still exists, and a comparison is between
+/// a merge base and a head that both keep moving. Asking by hash gets exactly
+/// the bytes the diff was computed from, and the same reasoning about what
+/// that discloses applies as for [`object`].
+///
+/// It also makes the answer permanent. A hash names one byte sequence, so the
+/// browser is told it never needs to ask again.
+async fn object_raw(
+    State(state): State<AppState>,
+    viewer: Viewer,
+    Path((owner, name, hash)): Path<(String, String, String)>,
+    headers: axum::http::HeaderMap,
+) -> AppResult<axum::response::Response> {
+    let (repo, _, _) = super::load_repo(&state, &viewer, &owner, &name).await?;
+    let store = state.store_for_network(repo.network_id).map_err(AppError::Internal)?;
+
+    let id = Hash::from_hex(hash.trim())
+        .ok_or_else(|| AppError::bad("that is not a hash"))?;
+    let bytes = content::raw_object(&store, id)?;
+    Ok(raw_response(bytes, &headers, "max-age=31536000, private, immutable"))
+}
+
+/// Is this request a browser fetching a picture to draw?
+///
+/// `Sec-Fetch-Dest` is set by the browser and cannot be set by a page's
+/// script — it is a forbidden header name — so `image` here means an `<img>`,
+/// a CSS background, or the like: a context in which whatever comes back is
+/// decoded to pixels and nothing in it runs.
+fn wants_image(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get("sec-fetch-dest")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("image"))
+}
+
+/// What a file's bytes may be typed as, given who is asking.
+///
+/// A pixel format may be typed honestly to anyone: it is decoded as pixels
+/// and cannot execute anything. Everything that is not an image keeps the
+/// blanket text-or-octet-stream treatment.
+///
+/// SVG is in between. It is a picture when drawn by an `<img>`, where a
+/// browser runs none of its script and loads none of its references, and a
+/// scriptable document when navigated to. So it is typed as SVG only for a
+/// request that says it is the first kind. Opened in a tab it arrives as
+/// plain text, exactly as before — which is also the more useful thing for
+/// "view raw" to show. A browser too old to send the header gets the source
+/// and no picture, which is the safe way round to be wrong.
+fn raw_content_type(bytes: &[u8], wants_image: bool) -> &'static str {
+    let is_text = std::str::from_utf8(bytes).is_ok()
         && !bytes.iter().take(8192).any(|b| *b == 0);
-    let ctype = match content::image_mime(&bytes) {
+    match content::image_mime(bytes) {
+        Some(content::SVG) if !wants_image => "text/plain; charset=utf-8",
         Some(mime) => mime,
         None if is_text => "text/plain; charset=utf-8",
         None => "application/octet-stream",
-    };
+    }
+}
 
-    Ok((
+fn raw_response(
+    bytes: Vec<u8>,
+    headers: &axum::http::HeaderMap,
+    cache: &'static str,
+) -> axum::response::Response {
+    use axum::http::header;
+    use axum::response::IntoResponse;
+
+    let ctype = raw_content_type(&bytes, wants_image(headers));
+    (
         [
             (header::CONTENT_TYPE, ctype),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            // The second lock on the same door. Even if an SVG typed as one
+            // were somehow opened as a document, `sandbox` gives it an origin
+            // of its own with scripting off, and `default-src 'none'` leaves
+            // it nothing to load.
             (
                 header::CONTENT_SECURITY_POLICY,
                 "default-src 'none'; sandbox; style-src 'unsafe-inline'",
             ),
-            (header::CACHE_CONTROL, "max-age=300, private"),
+            (header::CACHE_CONTROL, cache),
+            // The type depends on that header, so a cache must not answer an
+            // `<img>` with what it stored for a tab, or the reverse.
+            (header::VARY, "Sec-Fetch-Dest"),
         ],
         bytes,
     )
-        .into_response())
+        .into_response()
 }
 
 #[derive(Serialize)]
@@ -898,4 +971,34 @@ fn human(bytes: u64) -> String {
         u += 1;
     }
     if u == 0 { format!("{bytes} B") } else { format!("{v:.1} {}", UNITS[u]) }
+}
+
+#[cfg(test)]
+mod raw_type_tests {
+    use super::raw_content_type;
+
+    const SVG: &[u8] = b"<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert(1)</script></svg>";
+    const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0];
+
+    #[test]
+    fn an_svg_is_a_picture_only_to_something_drawing_one() {
+        assert_eq!(raw_content_type(SVG, true), "image/svg+xml");
+        // Opened in a tab, fetched by script, embedded as an object: text.
+        assert_eq!(raw_content_type(SVG, false), "text/plain; charset=utf-8");
+    }
+
+    #[test]
+    fn pixels_are_pixels_to_everyone() {
+        assert_eq!(raw_content_type(PNG, true), "image/png");
+        assert_eq!(raw_content_type(PNG, false), "image/png");
+    }
+
+    #[test]
+    fn asking_for_an_image_does_not_make_one() {
+        // The request header widens what an SVG may be served as. It must not
+        // widen anything else.
+        let html = b"<!doctype html><script>alert(1)</script>";
+        assert_eq!(raw_content_type(html, true), "text/plain; charset=utf-8");
+        assert_eq!(raw_content_type(&[0, 1, 2, 3], true), "application/octet-stream");
+    }
 }

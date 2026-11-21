@@ -57,6 +57,7 @@ import "../components/branch-picker";
 import "../components/clone-button";
 import "../components/fkit-select";
 import "../components/fkit-choice";
+import "../components/fkit-image-diff";
 import { treeOrder } from "../components/fkit-file-tree";
 import { adoptInto } from "../adopt";
 import { dirIcon, fileIcon } from "../file-icon";
@@ -847,6 +848,18 @@ const sheet = css`
     image-rendering: auto;
     border: 1px solid var(--border);
     background: var(--surface);
+  }
+
+  /* The one fact about a picture that its bytes do not put in the header. */
+  .imgcap {
+    padding: 5px 12px; border-top: 1px solid var(--border);
+    font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums;
+  }
+  /* A two-way switch riding a panel or diff header, which is shorter than the
+     rows the issue filter sits in. */
+  .panel-head .seg button, .df-head .seg button {
+    height: 20px; padding: 0 8px; font-size: 11px;
+    text-transform: none; letter-spacing: 0;
   }
 
   /* "12 tags" beside the ref picker — a count that is also the way in, which
@@ -1684,6 +1697,22 @@ const sheet = css`
   .md blockquote { margin: 0 0 1em; padding: .1em 1em; border-left: 2px solid var(--border-hi); color: var(--muted); }
   .md hr { border: 0; border-top: 1px solid var(--border); margin: 1.6em 0; }
   .md img { max-width: 100%; }
+  /* Sized in HTML, an image has a width or a height and expects the other to
+     follow. Once max-width has narrowed one, a fixed height attribute would
+     squash it — so the height only stands when no width was asked for. */
+  .md img[width] { height: auto; }
+  /* A row of badges is inline images on one line; the default baseline
+     alignment leaves each sitting on a descender gap of a different size. */
+  .md a > img, .md p > img { vertical-align: middle; }
+  .md :is(p, div, h1, h2, h3, h4, h5, h6)[align="center"] { text-align: center; }
+  .md :is(p, div, h1, h2, h3, h4, h5, h6)[align="right"] { text-align: right; }
+  .md details { margin: 0 0 .9em; }
+  .md summary { cursor: pointer; color: var(--text); }
+  .md details[open] > summary { margin-bottom: .6em; }
+  .md kbd {
+    font-family: var(--mono); font-size: .82em; padding: .05em .4em;
+    border: 1px solid var(--border-hi); border-bottom-width: 2px; border-radius: var(--radius);
+  }
   .md ul, .md ol { padding-left: 1.5em; margin: 0 0 .9em; }
   .md a { color: var(--accent); }
 
@@ -1829,6 +1858,8 @@ export class PageRepo extends LoomElement {
   /// A link into a file arrives before the file does; select once it is here.
   @watch("blobQuery")
   onBlob() {
+    // Measurements belong to the picture they were taken from.
+    this.blobDims = "";
     if (this.blobQuery.ok) this.applyLineHash();
   }
   /**
@@ -1979,6 +2010,18 @@ export class PageRepo extends LoomElement {
   /// not a diff anyone reads top to bottom, and rendering it costs the same
   /// whether or not they do.
   @reactive accessor wholeFile: Record<string, boolean> = {};
+  /**
+   * Files in a diff being shown as their source rather than as a picture.
+   *
+   * Only an SVG has both to offer. The picture is the default because it is
+   * what the file is *for*; the source is one click away because it is what
+   * was actually edited.
+   */
+  @reactive accessor asSource: Record<string, boolean> = {};
+  /** The same choice for the file view, which shows one file at a time. */
+  @reactive accessor blobSource = false;
+  /** "640 × 480" for the image in the file view, once it has loaded. */
+  @reactive accessor blobDims = "";
   /// How many of a change's files to render. A commit touching two hundred
   /// files is a page nobody reads top to bottom, and laying all of it out
   /// before anything is usable is the pop-in.
@@ -2841,11 +2884,16 @@ export class PageRepo extends LoomElement {
     const b = this.blob!;
     const at = this.loc!;
     const rawHref = api.rawUrl(at.owner, at.name, this.refName(), b.path);
+    // An SVG arrives as both a picture and its text, so there is a choice to
+    // offer. Nothing else does: pixels have no source worth reading, and
+    // source has no picture.
+    const both = !!b.image && b.content !== null;
+    const drawn = !!b.image && !(both && this.blobSource);
     const head = (
       <div class="panel-head">
         <span class="val">
-            {b.image
-              ? b.image.replace("image/", "").toUpperCase()
+            {drawn
+              ? b.image!.replace("image/", "").replace("+xml", "").replace("x-icon", "ico").toUpperCase()
               : b.binary
                 ? "binary"
                 : `${b.lines} ${b.lines === 1 ? "line" : "lines"}`} ·{" "}
@@ -2853,6 +2901,12 @@ export class PageRepo extends LoomElement {
           </span>
         <span class="row">
           <span class="faint val">{b.hash.slice(0, 12)}</span>
+          {both ? (
+            <span class="seg">
+              <button class={drawn ? "on" : ""} onClick={() => (this.blobSource = false)}>image</button>
+              <button class={drawn ? "" : "on"} onClick={() => (this.blobSource = true)}>source</button>
+            </span>
+          ) : null}
           {b.content !== null ? (
             <button class="bare val" onClick={() => void this.copyBlob(b.content ?? "")}>
               <loom-icon name={this.copied ? "check" : "copy"} size={12}></loom-icon>
@@ -2868,21 +2922,34 @@ export class PageRepo extends LoomElement {
       </div>
     );
 
-    if (b.truncated) {
-      return <div class="panel">{head}<div class="empty">file is too large to display</div></div>;
-    }
     // An image is served with its own content type by the raw endpoint — the
     // only formats that get one, because they decode to pixels and cannot run
-    // anything. An SVG deliberately arrives as text and renders as source.
-    if (b.image) {
+    // anything. That includes an SVG, but only here: the same URL opened in a
+    // tab is text, because a picture is all an <img> will ever make of it.
+    //
+    // Asked before "too large", deliberately. That limit is about sending a
+    // file inline as text, and a photograph is not sent inline at all.
+    if (drawn) {
       return (
         <div class="panel">
           {head}
           <div class="imgview">
-            <img src={rawHref} alt={b.path} loading="lazy" />
+            <img
+              src={rawHref}
+              alt={b.path}
+              onLoad={(e: Event) => {
+                const img = e.target as HTMLImageElement;
+                const w = img.naturalWidth, h = img.naturalHeight;
+                this.blobDims = w && h ? `${w} × ${h}` : "";
+              }}
+            />
           </div>
+          {this.blobDims ? <div class="imgcap">{this.blobDims}</div> : null}
         </div>
       );
+    }
+    if (b.truncated) {
+      return <div class="panel">{head}<div class="empty">file is too large to display</div></div>;
     }
     if (b.binary) {
       return <div class="panel">{head}<div class="empty">binary file not shown</div></div>;
@@ -3530,6 +3597,16 @@ export class PageRepo extends LoomElement {
     const ref = atRef ?? this.detail?.hash ?? this.refName();
     const href = `/${at.owner}/${at.name}/blob/${ref}/${f.path}`;
 
+    // A picture on either side is shown as pictures. Asked ahead of "too
+    // large" and "binary", which are both true of nearly every image and
+    // neither of which is a reason not to look at it.
+    //
+    // An SVG is the one case with a line diff as well, so it gets the choice;
+    // whether it has one is exactly whether there are hunks to show.
+    const isImage = !!(f.old_image || f.new_image);
+    const hasSource = isImage && f.hunks.length > 0;
+    const asImage = isImage && !(hasSource && this.asSource[f.path]);
+
     return (
       <div class="df" loom-key={f.path} data-file={f.path}>
         <div class="df-head">
@@ -3558,6 +3635,22 @@ export class PageRepo extends LoomElement {
             {f.added > 0 ? <span class="plus">+{f.added}</span> : null}
             {f.removed > 0 ? <span class="minus">{`−${f.removed}`}</span> : null}
           </span>
+          {hasSource ? (
+            <span class="seg">
+              <button
+                class={asImage ? "on" : ""}
+                onClick={() => (this.asSource = { ...this.asSource, [f.path]: false })}
+              >
+                image
+              </button>
+              <button
+                class={asImage ? "" : "on"}
+                onClick={() => (this.asSource = { ...this.asSource, [f.path]: true })}
+              >
+                source
+              </button>
+            </span>
+          ) : null}
 
           {/* Not gated on being able to comment: marking a file read is a
               note to yourself, kept in your own browser, and is as useful
@@ -3592,7 +3685,15 @@ export class PageRepo extends LoomElement {
           ) : null}
         </div>
 
-        {!isOpen ? null : f.too_large ? (
+        {!isOpen ? null : asImage ? (
+          <fkit-image-diff
+            oldSrc={f.old_image && f.old_hash ? api.objectRawUrl(at.owner, at.name, f.old_hash) : ""}
+            newSrc={f.new_image && f.new_hash ? api.objectRawUrl(at.owner, at.name, f.new_hash) : ""}
+            oldSize={f.old_size}
+            newSize={f.new_size}
+            name={f.path}
+          ></fkit-image-diff>
+        ) : f.too_large ? (
           <div class="df-note">file is too large to diff ({humanSize(Math.max(f.old_size, f.new_size))})</div>
         ) : f.binary ? (
           <div class="df-note">binary file</div>

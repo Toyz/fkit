@@ -185,7 +185,12 @@ export interface BlobResponse {
   truncated: boolean;
   content: string | null;
   lines: number;
-  /** Set when the bytes really are a displayable image. */
+  /**
+   * Set when the bytes really are a displayable image.
+   *
+   * Not exclusive with `content`: an SVG is a picture and its own source, and
+   * has both.
+   */
   image: string | null;
 }
 
@@ -238,6 +243,9 @@ export interface FileDiff {
   /** Each side's content hash; what a line comment anchors to. */
   old_hash: string | null;
   new_hash: string | null;
+  /** Each side's image type, where that side is a picture. */
+  old_image: string | null;
+  new_image: string | null;
 }
 
 export interface Patch {
@@ -955,6 +963,15 @@ export const api = {
    *  link the browser navigates to, and the server sets its own headers. */
   rawUrl: (owner: string, name: string, ref: string, path: string) =>
     `/api/repos/${owner}/${name}/raw/${encodeURIComponent(ref)}/${path}`,
+
+  /**
+   * URL for a file's bytes by its content hash, for an `<img>`.
+   *
+   * What a diff shows pictures from. Its two sides are contents rather than
+   * paths, and the hash is the one name for them that cannot go stale.
+   */
+  objectRawUrl: (owner: string, name: string, hash: string) =>
+    `/api/repos/${owner}/${name}/object/${hash}/raw`,
 
   patch: (owner: string, name: string, hash: string) =>
     request<Patch>(`/repos/${owner}/${name}/patch/${hash}`),
