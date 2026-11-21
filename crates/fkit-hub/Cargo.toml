@@ -50,3 +50,7 @@ reqwest = { version = "0.13.4", default-features = false, features = ["json", "h
 # renders identically on any machine instead of picking up whatever the host
 # happens to have installed.
 resvg = { version = "0.45", default-features = false, features = ["text"] }
+
+[dev-dependencies]
+# Paused time, so the keep-alive tests cover minutes of silence in no time.
+tokio = { version = "1.53.1", features = ["test-util"] }

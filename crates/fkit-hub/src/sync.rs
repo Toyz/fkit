@@ -19,6 +19,23 @@
 //!
 //! `blocking_send`/`blocking_recv` exist for exactly this, and a
 //! `spawn_blocking` thread is not a runtime worker, so blocking there is sound.
+//!
+//! # Keeping the line open
+//!
+//! The protocol has stretches where neither side has anything to say. The
+//! longest is the end of a push: the client has sent its last object and is
+//! waiting for a verdict, while this side walks the closure to prove it is
+//! complete, waits its turn for the ref, and records who pushed what. On a
+//! large repository that is minutes, and to everything between the two
+//! machines a connection that has carried nothing for a minute is a dead one.
+//! A reverse proxy or a load balancer closes it, and the client is told only
+//! that its peer went away — at a moment set by how long the walk happened to
+//! take, which is why it looked random.
+//!
+//! So the writer task sends a ping whenever it has had nothing else to send
+//! for [`KEEP_ALIVE`]. It has to be that task and not the protocol: the
+//! protocol is the thing that is busy, and some of what it is busy with — a
+//! row lock held by another push — is a wait it cannot break off to say so.
 
 use crate::models::RepoRow;
 use crate::perms::{resolve, Access};
@@ -31,10 +48,14 @@ use fkit_core::hash::Hash;
 use fkit_core::proto::{is_ancestor, TransferStats, Transport};
 use fkit_core::session::{read_hello, send_error, send_welcome, serve_session, RefUpdate, RepoHost};
 use fkit_core::store::Store;
-use futures::{SinkExt, StreamExt};
+use futures::{Sink, SinkExt, StreamExt};
+use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use uuid::Uuid;
+
+/// The same interval `fkitd` pings at, for the same reasons.
+use fkit_core::ws::KEEP_ALIVE;
 
 pub async fn handler(
     ws: WebSocketUpgrade,
@@ -455,18 +476,11 @@ impl RepoHost for PgHost {
 }
 
 async fn serve(socket: WebSocket, state: AppState, owner: String, name: String) {
-    let (mut sink, mut stream) = socket.split();
-    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(16);
+    let (sink, mut stream) = socket.split();
+    let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(16);
     let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(16);
 
-    let writer = tokio::spawn(async move {
-        while let Some(bytes) = out_rx.recv().await {
-            if sink.send(Message::Binary(bytes.into())).await.is_err() {
-                break;
-            }
-        }
-        let _ = sink.close().await;
-    });
+    let writer = tokio::spawn(pump_out(sink, out_rx, KEEP_ALIVE));
 
     let reader = tokio::spawn(async move {
         while let Some(Ok(msg)) = stream.next().await {
@@ -500,6 +514,50 @@ async fn serve(socket: WebSocket, state: AppState, owner: String, name: String) 
     }
     reader.abort();
     let _ = writer.await;
+}
+
+/// Write the protocol's messages to the socket, and ping when there are none.
+///
+/// The ping is the keep-alive, and the client's pong is the other half of it:
+/// a client blocked waiting for a reply is blocked *reading*, so it answers at
+/// once and traffic crosses in both directions. A client that is busy instead
+/// — answering a large request, or checking what it just pulled — answers when
+/// it next reads, and until then the pings alone are what is on the wire.
+///
+/// Only after a quiet `every`, measured from the last thing sent. While
+/// messages are flowing they are all the evidence of life anyone needs.
+///
+/// A ping that cannot be written is how a vanished client is noticed. Ending
+/// here drops the receiver, so the protocol's next send fails instead of
+/// filling a channel nobody is draining.
+async fn pump_out<S>(mut sink: S, mut out_rx: mpsc::Receiver<Vec<u8>>, every: Duration)
+where
+    S: Sink<Message> + Unpin,
+{
+    let mut quiet = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+    // A tick that came due while a large message was still being written is
+    // not a reason to send two pings afterwards.
+    quiet.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            // A message that is ready goes before a ping that is due.
+            biased;
+            next = out_rx.recv() => {
+                let Some(bytes) = next else { break };
+                if sink.send(Message::Binary(bytes.into())).await.is_err() {
+                    break;
+                }
+                quiet.reset();
+            }
+            _ = quiet.tick() => {
+                if sink.send(Message::Ping(Default::default())).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    let _ = sink.close().await;
 }
 
 fn run(t: &mut ChannelTransport, state: AppState, rt: Handle, owner: &str, name: &str) -> Result<()> {
@@ -580,4 +638,97 @@ async fn authorise(
         attributes,
         actor,
     })
+}
+
+#[cfg(test)]
+mod keep_alive_tests {
+    use super::*;
+    use futures::channel::mpsc as fmpsc;
+
+    const EVERY: Duration = Duration::from_secs(20);
+
+    /// What has reached the socket so far, as a string of P(ing) and B(inary).
+    fn drain(wire: &mut fmpsc::UnboundedReceiver<Message>) -> String {
+        let mut seen = String::new();
+        while let Ok(m) = wire.try_recv() {
+            seen.push(match m {
+                Message::Ping(_) => 'P',
+                Message::Binary(_) => 'B',
+                Message::Close(_) => 'C',
+                _ => '?',
+            });
+        }
+        seen
+    }
+
+    /// The end of a push: nothing to say for as long as the walk takes.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_server_pings() {
+        let (sink, mut wire) = fmpsc::unbounded::<Message>();
+        let (_tx, rx) = mpsc::channel::<Vec<u8>>(16);
+        tokio::spawn(pump_out(sink, rx, EVERY));
+
+        tokio::time::sleep(EVERY - Duration::from_secs(1)).await;
+        assert_eq!(drain(&mut wire), "", "nothing is due yet");
+
+        // Three minutes of a held row lock.
+        tokio::time::sleep(Duration::from_secs(171)).await;
+        assert_eq!(drain(&mut wire), "PPPPPPPPP", "one every twenty seconds, for as long as it takes");
+    }
+
+    /// A transfer in full flow is its own evidence of life.
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_server_does_not() {
+        let (sink, mut wire) = fmpsc::unbounded::<Message>();
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(16);
+        tokio::spawn(pump_out(sink, rx, EVERY));
+
+        // A message every fifteen seconds for two minutes: always something
+        // sent more recently than the interval.
+        for _ in 0..8 {
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            tx.send(vec![1]).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(drain(&mut wire), "BBBBBBBB");
+
+        // And the quiet is measured from the last of them, not from the start.
+        tokio::time::sleep(Duration::from_secs(19)).await;
+        assert_eq!(drain(&mut wire), "");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(drain(&mut wire), "P");
+    }
+
+    /// The session ending is the one thing that stops it.
+    #[tokio::test(start_paused = true)]
+    async fn the_end_of_the_session_closes_the_socket() {
+        let (sink, mut wire) = fmpsc::unbounded::<Message>();
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(16);
+        let pump = tokio::spawn(pump_out(sink, rx, EVERY));
+
+        tx.send(vec![1]).await.unwrap();
+        drop(tx);
+        pump.await.unwrap();
+        // The sender closing is the close: nothing after the last message,
+        // and in particular no ping from a task that should be gone.
+        assert_eq!(drain(&mut wire), "B");
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert!(
+            matches!(wire.try_recv(), Err(fmpsc::TryRecvError::Closed)),
+            "the sink was dropped"
+        );
+    }
+
+    /// A client that has gone is noticed by the ping that cannot reach it.
+    #[tokio::test(start_paused = true)]
+    async fn a_vanished_client_ends_the_pump() {
+        let (sink, wire) = fmpsc::unbounded::<Message>();
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(16);
+        let pump = tokio::spawn(pump_out(sink, rx, EVERY));
+
+        drop(wire);
+        tokio::time::sleep(EVERY + Duration::from_secs(1)).await;
+        pump.await.unwrap();
+        assert!(tx.is_closed(), "so the protocol's next send fails instead of queueing");
+    }
 }

@@ -74,6 +74,7 @@ Then close registration in **admin → instance** and invite people from
 |---|---|
 | pass WebSocket upgrades through | sync is WebSocket end to end; mangling `Upgrade` breaks push and clone while the web UI still looks fine |
 | set `X-Forwarded-For`, and `trust_proxy = true` | rate limits count per client address; without it the whole instance shares one bucket |
+| an idle timeout above 20 seconds | the hub pings a quiet sync connection every 20s, so the usual 60s default is fine; a proxy set lower than that closes a push while the server is still verifying it, and the client reports only `peer disconnected` |
 
 **Leave `trust_proxy` off if the hub is reachable directly.** The header is
 client-supplied, so believing it there lets anyone skip the limits entirely.

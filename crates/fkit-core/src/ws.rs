@@ -41,6 +41,14 @@ const MAGIC: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 /// Refuse absurd frames rather than trying to allocate them.
 pub const MAX_FRAME: u64 = 256 * 1024 * 1024;
 
+/// How long a server lets a connection sit quiet before pinging on it.
+///
+/// Under every idle timeout worth naming — nginx and most load balancers cut
+/// at sixty seconds, Cloudflare at a hundred — with room for a ping to be
+/// late. Not a setting: there is no deployment this is wrong for, and a knob
+/// would only be a way to turn the fix back off.
+pub const KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(20);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Opcode {
     Continuation,
@@ -123,6 +131,38 @@ pub struct WebSocket {
     masking: bool,
     mask_counter: u64,
     pub closed: bool,
+    /// Set once [`WebSocket::keep_alive`] has started a thread to ping.
+    alive: Option<KeepAlive>,
+}
+
+/// What a socket and the thread keeping it alive have in common.
+struct Pulse {
+    /// When a frame was last written — and, by being a mutex, the right to
+    /// write one. Two threads now put frames on one connection, and a frame
+    /// is not written in one piece: without this a ping could land in the
+    /// middle of a megabyte of objects, and the peer would read the rest of
+    /// that megabyte as frame headers.
+    last_write: std::sync::Mutex<std::time::Instant>,
+    stop: std::sync::atomic::AtomicBool,
+}
+
+/// The thread that pings, held by the socket it pings on.
+///
+/// Dropping it stops the thread and waits for it, so a closed socket leaves
+/// nothing behind writing to a descriptor that may by then be somebody else's.
+struct KeepAlive {
+    pulse: std::sync::Arc<Pulse>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for KeepAlive {
+    fn drop(&mut self) {
+        self.pulse.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(t) = self.thread.take() {
+            t.thread().unpark();
+            let _ = t.join();
+        }
+    }
 }
 
 impl WebSocket {
@@ -194,6 +234,7 @@ impl WebSocket {
                 masking: false,
                 mask_counter: 0,
                 closed: false,
+                alive: None,
             },
             path,
         ))
@@ -292,7 +333,75 @@ impl WebSocket {
             bail!("bad Sec-WebSocket-Accept — this is not a websocket server");
         }
 
-        Ok(WebSocket { stream, masking: true, mask_counter: 0, closed: false })
+        Ok(WebSocket { stream, masking: true, mask_counter: 0, closed: false, alive: None })
+    }
+
+    /// Ping the peer whenever this side has written nothing for `every`.
+    ///
+    /// For the side that goes quiet while it works. A server that has taken
+    /// the last object of a push spends as long as the history is large
+    /// proving the closure complete before it answers, and says nothing while
+    /// it does; a proxy or a NAT in between counts a minute of that as a dead
+    /// connection and closes it. The protocol is one blocking thread and
+    /// cannot stop walking to say it is still there, so a second thread says
+    /// it instead.
+    ///
+    /// The peer needs to do nothing new: answering a ping is part of
+    /// [`WebSocket::recv`] and always has been.
+    ///
+    /// Returns false, having done nothing, on a TLS connection. Its two
+    /// directions share one session and cannot be handed to two threads — and
+    /// the only side that dials TLS is the client, which is the side that
+    /// gets pinged rather than the side that needs to.
+    pub fn keep_alive(&mut self, every: std::time::Duration) -> Result<bool> {
+        use std::sync::atomic::Ordering;
+        use std::time::Instant;
+
+        if self.alive.is_some() {
+            return Ok(true);
+        }
+        let mut twin = match &self.stream {
+            Transport::Plain(tcp) => tcp.try_clone().context("cloning the socket for keep-alive")?,
+            #[cfg(feature = "tls")]
+            Transport::Tls(_) => return Ok(false),
+        };
+        // An empty ping. A client's must be masked like any other frame; with
+        // no payload to mask, the key is four bytes of ceremony.
+        let ping: &'static [u8] =
+            if self.masking { &[0x89, 0x80, 0, 0, 0, 0] } else { &[0x89, 0x00] };
+
+        let pulse = std::sync::Arc::new(Pulse {
+            last_write: std::sync::Mutex::new(Instant::now()),
+            stop: std::sync::atomic::AtomicBool::new(false),
+        });
+        let theirs = std::sync::Arc::clone(&pulse);
+        let thread = std::thread::Builder::new()
+            .name("fkit-keep-alive".into())
+            .spawn(move || {
+                while !theirs.stop.load(Ordering::Acquire) {
+                    // Held across the check *and* the write, so "nothing has
+                    // been written lately" is still true when the ping goes.
+                    let mut last = theirs.last_write.lock().unwrap_or_else(|e| e.into_inner());
+                    let quiet = last.elapsed();
+                    if quiet < every {
+                        drop(last);
+                        // Woken early by a drop, or exactly when a ping would
+                        // be due if nothing is written in the meantime.
+                        std::thread::park_timeout(every - quiet);
+                        continue;
+                    }
+                    // The peer has gone, or the socket has: either way there
+                    // is no one left to keep this open for.
+                    if twin.write_all(ping).and_then(|_| twin.flush()).is_err() {
+                        break;
+                    }
+                    *last = Instant::now();
+                }
+            })
+            .context("starting the keep-alive thread")?;
+
+        self.alive = Some(KeepAlive { pulse, thread: Some(thread) });
+        Ok(true)
     }
 
     /// Send one binary message.
@@ -315,6 +424,13 @@ impl WebSocket {
             header.push(mask_bit | 127);
             header.extend_from_slice(&(len as u64).to_be_bytes());
         }
+
+        // The one writer at a time, if there is a second one. Taken before
+        // the first byte and held past the last, and it records when that was.
+        let pulse = self.alive.as_ref().map(|a| std::sync::Arc::clone(&a.pulse));
+        let mut wrote = pulse
+            .as_ref()
+            .map(|p| p.last_write.lock().unwrap_or_else(|e| e.into_inner()));
 
         // Header and payload go out together.
         //
@@ -339,6 +455,9 @@ impl WebSocket {
             self.stream.write_all(&header)?;
         }
         self.stream.flush()?;
+        if let Some(at) = wrote.as_deref_mut() {
+            *at = std::time::Instant::now();
+        }
         Ok(())
     }
 
@@ -620,6 +739,95 @@ mod tests {
         assert_eq!(base64_encode(b"fo"), "Zm8=");
         assert_eq!(base64_encode(b"foo"), "Zm9v");
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    /// A listening socket and the address to dial it on.
+    fn listener() -> (std::net::TcpListener, String) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        (l, addr)
+    }
+
+    /// A server that falls silent pings, and stops when it has something to say.
+    ///
+    /// Read as raw bytes rather than through [`WebSocket::recv`], which answers
+    /// pings and hides them — the point here is to see exactly what is on the
+    /// wire while the server is "busy".
+    #[test]
+    fn a_quiet_server_pings_until_it_speaks() {
+        use std::time::Duration;
+        let (l, addr) = listener();
+
+        let server = std::thread::spawn(move || {
+            let (mut ws, _) = WebSocket::accept(l.accept().unwrap().0).unwrap();
+            assert!(ws.keep_alive(Duration::from_millis(40)).unwrap());
+            // The walk at the end of a push, in miniature.
+            std::thread::sleep(Duration::from_millis(330));
+            ws.send(b"ok").unwrap();
+            // And then the connection ends, with the thread still running.
+        });
+
+        let mut raw = TcpStream::connect(&addr).unwrap();
+        write!(
+            raw,
+            "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        )
+        .unwrap();
+        read_http_head(&mut raw).unwrap();
+
+        let mut wire = Vec::new();
+        raw.read_to_end(&mut wire).unwrap();
+        server.join().unwrap();
+
+        // Everything before the message is pings, and nothing else.
+        let message: &[u8] = &[0x82, 0x02, b'o', b'k'];
+        let at = wire.windows(4).position(|w| w == message).expect("the message arrived");
+        let before = &wire[..at];
+        assert!(before.chunks(2).all(|c| c == [0x89, 0x00]), "only pings: {before:02x?}");
+        let pings = before.len() / 2;
+        // 330ms of silence at one per 40ms is eight; a loaded machine may fit
+        // fewer, but a server that pinged twice is not one that would have
+        // been kept alive.
+        assert!((4..=8).contains(&pings), "{pings} pings in 330ms at one per 40ms");
+        // Dropping the socket stopped the thread: the connection closed, which
+        // it could not have while a second handle to it was still held.
+        assert_eq!(&wire[at..], message, "nothing after the message");
+    }
+
+    /// Two threads writing to one connection must not write into each other.
+    ///
+    /// An interval far shorter than a frame takes to write means a ping comes
+    /// due during nearly every one, so the pinging thread spends the transfer
+    /// waiting to write. If a single ping landed inside a frame, the reader
+    /// would take payload bytes for a frame header and fail on the next one.
+    #[test]
+    fn pings_never_land_inside_a_frame() {
+        let (l, addr) = listener();
+        const FRAMES: usize = 60;
+        const SIZE: usize = 300 * 1024;
+
+        let server = std::thread::spawn(move || {
+            let (mut ws, _) = WebSocket::accept(l.accept().unwrap().0).unwrap();
+            ws.keep_alive(std::time::Duration::from_micros(50)).unwrap();
+            for n in 0..FRAMES {
+                ws.send(&vec![n as u8; SIZE]).unwrap();
+            }
+            ws.close();
+            // Read the pongs out before letting go. A socket closed with
+            // unread bytes sends a reset rather than a close, and a reset
+            // throws away whatever the other end had not read yet.
+            while let Ok(Some(_)) = ws.recv() {}
+        });
+
+        let mut client = WebSocket::connect(&format!("ws://{addr}/")).unwrap();
+        for n in 0..FRAMES {
+            let got = client.recv().unwrap().expect("a frame, not a close");
+            assert_eq!(got.len(), SIZE, "frame {n} is whole");
+            assert!(got.iter().all(|b| *b == n as u8), "frame {n} is its own bytes");
+        }
+        assert!(client.recv().unwrap().is_none());
+        server.join().unwrap();
     }
 
     /// The published RFC 6455 section 1.3 example.

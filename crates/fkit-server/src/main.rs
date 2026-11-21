@@ -114,6 +114,11 @@ fn handle(stream: TcpStream, cfg: &Config) -> Result<()> {
     stream.set_nodelay(true)?;
     let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
     let (mut ws, path) = WebSocket::accept(stream)?;
+    // This thread is about to spend the session either waiting on the client
+    // or working for it, and while it works it writes nothing — for as long
+    // as the history is large, at the end of a push. Anything between here
+    // and the client that times out idle connections would close this one.
+    ws.keep_alive(fkit_core::ws::KEEP_ALIVE)?;
 
     let (hello_repo, token) = read_hello(&mut ws)?;
 
