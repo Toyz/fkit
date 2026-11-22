@@ -867,6 +867,23 @@ const sheet = css`
     background: var(--surface);
   }
 
+  /* Waiting on somewhere else. The page on screen is the last one, kept whole
+     until the next is ready; past a moment that deserves saying, and a hairline
+     across the top says it without moving anything. */
+  :host([busy])::before {
+    content: ""; position: fixed; top: 0; left: 0; z-index: 50;
+    height: 2px; width: 40%;
+    background: var(--accent);
+    animation: arriving 1.1s ease-in-out infinite;
+  }
+  @keyframes arriving {
+    from { transform: translateX(-100%); }
+    to   { transform: translateX(250%); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    :host([busy])::before { animation: none; width: 100%; opacity: .6; }
+  }
+
   /* The one fact about a picture that its bytes do not put in the header. */
   .imgcap {
     padding: 5px 12px; border-top: 1px solid var(--border);
@@ -1892,7 +1909,11 @@ export class PageRepo extends LoomElement {
   accessor treeQuery!: ApiState<TreeResponse>;
 
   private get entries(): Entry[] | null {
-    return this.treeQuery.data?.entries ?? null;
+    // A listing that failed has nothing to show. What the query still holds
+    // is the last directory that *did* load, and it must not stand in for a
+    // path that is not there.
+    if (this.treeQuery.error) return null;
+    return this.here(this.treeQuery)?.entries ?? null;
   }
   @query<BlobResponse>({
     url: (el: PageRepo) => `/api/repos/${el.loc!.owner}/${el.loc!.name}/blob/${refAndPath(el)}`,
@@ -1903,7 +1924,8 @@ export class PageRepo extends LoomElement {
   accessor blobQuery!: ApiState<BlobResponse>;
 
   private get blob(): BlobResponse | null {
-    return this.blobQuery.data ?? null;
+    if (this.blobQuery.error) return null;
+    return this.here(this.blobQuery) ?? null;
   }
 
   /// A link into a file arrives before the file does; select once it is here.
@@ -1948,7 +1970,7 @@ export class PageRepo extends LoomElement {
   }
 
   private get commits(): Commit[] | null {
-    const first = this.commitsQuery.data;
+    const first = this.here(this.commitsQuery);
     if (!first) return null;
     if (!this.tail.length || this.tailKey !== this.historyKey()) return first;
     return [...first, ...this.tail];
@@ -2001,7 +2023,7 @@ export class PageRepo extends LoomElement {
   accessor detailQuery!: ApiState<CommitDetail>;
 
   private get detail(): CommitDetail | null {
-    return this.detailQuery.data ?? null;
+    return this.here(this.detailQuery) ?? null;
   }
   /**
    * Its own query, so a repository without a README is an empty result rather
@@ -2015,7 +2037,8 @@ export class PageRepo extends LoomElement {
   accessor readmeQuery!: ApiState<{ name: string; content: string }>;
 
   private get readme(): { name: string; content: string } | null {
-    return this.readmeQuery.data ?? null;
+    if (this.readmeQuery.error) return null;
+    return this.here(this.readmeQuery) ?? null;
   }
   /** Filled in after the tree renders, so the listing is never blocked on it. */
   /**
@@ -2033,6 +2056,11 @@ export class PageRepo extends LoomElement {
   accessor lastCommitsQuery!: ApiState<Record<string, LastCommit>>;
 
   private get lastCommits(): Record<string, LastCommit> | null {
+    // Not while the answer for this directory is still on its way. What the
+    // query holds until then is the *last* directory's, and two directories
+    // share names -- `src`, `README.md` -- so it would be shown, against the
+    // wrong files, and then corrected.
+    if (this.lastCommitsQuery.fetching) return null;
     return this.lastCommitsQuery.data ?? null;
   }
   @reactive accessor copied = false;
@@ -2301,6 +2329,149 @@ export class PageRepo extends LoomElement {
    * re-runs — which is the manual `reload()` sequencing, done by the decorator.
    */
   @reactive accessor loc = parse();
+
+  /* ---- arriving somewhere, all at once ----
+   *
+   * Every query above keeps what it last loaded until its next answer comes
+   * back, which is right when the same thing is being refreshed and wrong
+   * when the page has moved: the location changes at once and the data does
+   * not. Rendering in between showed the last directory's files under the new
+   * directory's name, then the new files with the old commit column, then the
+   * commit column, then a README appearing or going -- four pictures for one
+   * click, each at a different height.
+   *
+   * So a navigation is not drawn until what it needs has arrived. The page
+   * that is on screen stays there, whole and consistent, and is replaced in
+   * one step -- which is what a browser does between two documents, and what
+   * `shouldUpdate` is for.
+   */
+
+  /** The location that is on screen. */
+  private paintedKey = "";
+  /** The location being waited for. */
+  private heldKey = "";
+  /** When everything a view cannot be drawn without had arrived. */
+  private primaryAt = 0;
+  private holdTimer = 0;
+  private busyTimer = 0;
+
+  /** Past this, draw whatever there is: a request that never answers must not
+   *  leave the last page on screen for ever. */
+  private static readonly HOLD_MS = 5000;
+  /** How long the commit column may keep a page that is otherwise ready. It is
+   *  a walk through history and can be the slowest answer by far; arriving a
+   *  moment after the file names is fine, and being waited on for a second is
+   *  not. */
+  private static readonly LATE_MS = 120;
+  /** How long a wait runs before it is worth saying so. */
+  private static readonly BUSY_MS = 150;
+
+  private navKey(): string {
+    return this.loc ? JSON.stringify(this.loc) : "";
+  }
+
+  /** Everything this page fetches by decorator, split by whether a view is
+   *  incomplete without it. */
+  private queries(): { primary: ApiState<object>[]; late: ApiState<object>[] } {
+    return {
+      primary: [
+        this.repoQuery, this.refsQuery, this.rulesQuery, this.treeQuery, this.blobQuery,
+        this.commitsQuery, this.detailQuery, this.readmeQuery, this.patchQuery,
+        this.comparisonQuery, this.mergesQuery, this.mrQuery, this.commentsQuery,
+        this.labelsQuery, this.issuesQuery, this.issueQuery, this.issueTalkQuery,
+        this.collaboratorsQuery,
+      ] as ApiState<object>[],
+      late: [this.lastCommitsQuery, this.statsQuery] as ApiState<object>[],
+    };
+  }
+
+  shouldUpdate(): boolean {
+    const key = this.navKey();
+    // Nothing on screen yet, or nowhere new to go: draw as usual.
+    if (!this.paintedKey || !key || key === this.paintedKey) {
+      this.paintedKey = key;
+      // The late answers have landed, so nothing is being hidden any more --
+      // and a refresh of this same page later must not blank it.
+      if (this.overdue && !this.queries().primary.some((q) => q.fetching)) this.overdue = false;
+      return true;
+    }
+
+    if (this.heldKey !== key) {
+      this.heldKey = key;
+      this.primaryAt = 0;
+      clearTimeout(this.holdTimer);
+      clearTimeout(this.busyTimer);
+      this.holdTimer = window.setTimeout(() => this.arrive(key), PageRepo.HOLD_MS);
+      this.busyTimer = window.setTimeout(() => {
+        if (this.heldKey === key && this.paintedKey !== key) this.setAttribute("busy", "");
+      }, PageRepo.BUSY_MS);
+    }
+
+    // A query only notices that it is being asked about somewhere else when
+    // its data is read -- which is what rendering does, and rendering is the
+    // thing being put off. Reading it here is what starts the requests.
+    const { primary, late } = this.queries();
+    for (const q of [...primary, ...late]) {
+      try {
+        void q.data;
+      } catch {
+        // A query whose URL cannot be built for this view is not one this
+        // view is waiting on.
+      }
+    }
+
+    // Asked again once those reads have had their effect: a request they
+    // started is in flight by the microtask after the one that starts it. A
+    // query finishing schedules an update, which comes back through here, so
+    // one answer making another query askable is seen as well.
+    queueMicrotask(() =>
+      queueMicrotask(() => {
+        if (this.navKey() !== key || this.paintedKey === key) return;
+        if (primary.some((q) => q.fetching)) return;
+        if (!late.some((q) => q.fetching)) return this.arrive(key);
+        // Only the commit column is outstanding. Give it a moment to make the
+        // arrival one step instead of two, and no longer than that.
+        const now = performance.now();
+        this.primaryAt ||= now;
+        const left = PageRepo.LATE_MS - (now - this.primaryAt);
+        if (left <= 0) return this.arrive(key);
+        clearTimeout(this.holdTimer);
+        this.holdTimer = window.setTimeout(() => this.arrive(key), left);
+      }),
+    );
+    return false;
+  }
+
+  /**
+   * Whether the page was drawn before what it needs had arrived.
+   *
+   * Only when a wait ran out. Then the queries are still holding the last
+   * location's data, and drawing that under the new location's name is the
+   * one picture worse than a blank: it is wrong and looks finished. While this
+   * is set, [`here`] hides a query's data until its answer lands, and the view
+   * shows that it is loading instead.
+   */
+  private overdue = false;
+
+  /** A query's data, unless the page gave up waiting for it. */
+  private here<T>(q: ApiState<T>): T | undefined {
+    if (this.overdue && q.fetching) return undefined;
+    return q.data;
+  }
+
+  /** Put the held location on screen. */
+  private arrive(key: string) {
+    if (this.navKey() !== key || this.paintedKey === key) return;
+    this.overdue = this.queries().primary.some((q) => q.fetching);
+    this.paintedKey = key;
+    this.heldKey = "";
+    clearTimeout(this.holdTimer);
+    clearTimeout(this.busyTimer);
+    this.removeAttribute("busy");
+    // Forced: the renders that were skipped are the ones that would have
+    // noticed what changed.
+    this.scheduleUpdate(true);
+  }
 
   /**
    * Make `#fragment` links work inside rendered markdown.
@@ -2597,6 +2768,40 @@ export class PageRepo extends LoomElement {
       this.docPath = "";
       this.doc = null;
     }
+  }
+
+  /**
+   * A path that is not in this tree, or a listing that could not be had.
+   *
+   * There was no such state. A path that did not exist drew the loading
+   * skeleton and left it there -- or, arrived at from somewhere real, went on
+   * showing the file that had been open before, under the name of one that
+   * does not exist.
+   */
+  private renderMissing(q: ApiState<object>, path: string) {
+    const e = q.error as { status?: number; message?: string } | undefined;
+    const gone = e?.status === 404;
+    const at = this.loc!;
+    const top = `/${at.owner}/${at.name}/tree/${this.refName()}`;
+    return (
+      <div class="panel">
+        <div class="empty">
+          <h2>{gone ? "nothing here" : "this could not be loaded"}</h2>
+          <p class="prose">
+            {gone ? (
+              <>
+                There is no <b class="mono">{path || "/"}</b> on <b class="mono">{this.refName()}</b>.
+              </>
+            ) : (
+              String(e?.message ?? e)
+            )}
+          </p>
+          <a class="btn" href={top} onClick={linkHandler(top)}>
+            back to the top of {this.refName()}
+          </a>
+        </div>
+      </div>
+    );
   }
 
   private switchRef(ref: string) {
@@ -7059,7 +7264,11 @@ fkit push</pre>
               ></clone-button>
             </div>
 
-            {v.kind === "tree" ? (
+            {v.kind === "tree" && this.treeQuery.error ? (
+              this.renderMissing(this.treeQuery, v.path)
+            ) : v.kind === "blob" && this.blobQuery.error ? (
+              this.renderMissing(this.blobQuery, v.path)
+            ) : v.kind === "tree" ? (
               this.entries === null ? (
                 <div class="panel files">
                   {[0, 1, 2, 3, 4, 5].map(() => (
