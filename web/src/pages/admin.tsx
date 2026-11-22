@@ -205,7 +205,7 @@ const sheet = css`
   .composer .w { color: var(--faint); font-size: 11.5px; flex: none; }
   .composer .grow { flex: 1; min-width: 200px; margin-top: 0; }
   .composer input {
-    flex: 1; min-width: 170px; font-size: 12px; height: 27px; padding: 0 8px;
+    flex: 1; min-width: 170px; font-size: 12px; height: 25px; padding: 0 8px;
   }
 
   /* Segmented control: both options visible, so the one you are not on is

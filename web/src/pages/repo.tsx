@@ -943,6 +943,11 @@ const sheet = css`
   .crumbs a { color: var(--muted); text-decoration: none; }
   .crumbs a:hover { color: var(--accent); }
   .crumbs .cur { color: var(--text); }
+  /* The breadcrumb in the file browser's toolbar has the same class and is
+     not a line of its own: it shares a centred row with the branch picker.
+     The margin that spaces a subject's breadcrumb from its title pushed this
+     one three and a half pixels above the buttons beside it. */
+  .toolbar .crumbs { margin-bottom: 0; }
 
   .sline {
     display: flex; align-items: baseline; gap: 11px; flex-wrap: wrap;
@@ -1779,7 +1784,7 @@ const sheet = css`
     border: 1px solid var(--border); border-radius: var(--radius);
     background: var(--raised);
   }
-  .mkrule input { flex: 1; font-size: 12px; }
+  .mkrule input { flex: 1; font-size: 12px; height: 28px; padding-top: 0; padding-bottom: 0; }
 
   /* Continues the list rather than sitting under it: same height and inset as
      a tag row, so the list reads as having more below rather than ending. */

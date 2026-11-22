@@ -42,8 +42,12 @@ export const repoRowSheet = css`
     display: flex; align-items: center; justify-content: center;
   }
 
+  /* On the baseline, and saying so: the date at the far end of this line
+     asks to be aligned by its baseline, and that only means something if the
+     name it is being aligned with asks too. Without it the date was placed at
+     the top of the row, two pixels above the line it belongs to. */
   .rr .top {
-    grid-row: 1; grid-column: 2;
+    grid-row: 1; grid-column: 2; align-self: baseline;
     display: flex; align-items: baseline; gap: 8px; min-width: 0;
   }
   .rr .nm { white-space: nowrap; font-size: 13px; }
@@ -73,6 +77,12 @@ export const repoRowSheet = css`
     grid-row: 1; grid-column: 3;
     color: var(--faint); font-size: 11px; white-space: nowrap;
     align-self: baseline;
+    /* Against the right edge, with the counts under it. Each row is its own
+       grid, so this column is as wide as that row's widest fact: set from
+       the left, its start moved from row to row and the date and the counts
+       ended in different places. The right edge is the one thing every row
+       has in common. */
+    text-align: right;
   }
 
   .rr .sub {
@@ -92,7 +102,7 @@ export const repoRowSheet = css`
      shape. */
   .rr .counts {
     grid-row: 2; grid-column: 3;
-    display: flex; align-items: center; gap: 10px;
+    display: flex; align-items: center; justify-content: flex-end; gap: 10px;
     font-size: 11px; color: var(--faint); white-space: nowrap;
     align-self: center;
   }

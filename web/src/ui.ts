@@ -35,7 +35,11 @@ export const base = css`
     display: flex; align-items: center; gap: 9px;
     flex: none; white-space: nowrap;
   }
-  .head-acts .btn { font-size: 11.5px; }
+  /* One height for everything in the row. A button sized by its padding and
+     a field sized by its height came out a pixel and a half apart, which side
+     by side is the difference between a row of controls and two things that
+     happen to be near each other. */
+  .head-acts .btn, .head-acts button { font-size: 11.5px; height: 24px; padding-top: 0; padding-bottom: 0; }
   .head-acts input { width: 170px; font-size: 12px; height: 24px; padding: 0 9px; }
 
   h1, h2, h3 { margin: 0; font-weight: 600; letter-spacing: 0; }
@@ -96,7 +100,16 @@ export const base = css`
   input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
   input::placeholder { color: var(--faint); }
 
-  label {
+  /* A caption above a field -- and only that. A label with a class is a
+     control: it wraps a switch or a checkbox and sits in a row beside other
+     things, and it styles itself. When this rule matched every label, each of
+     those had to undo it piece by piece, and each undid the capitals and none
+     undid the margin: five pixels under a label in a centred row lifts it two
+     and a half above everything it is meant to line up with. That was the
+     "viewed" mark on a diff, "allow push" beside its button, the limits on a
+     protection rule -- and on the new-repository page nothing was undone at
+     all, so two sentences of explanation were set in spaced capitals. */
+  label:not([class]) {
     display: block;
     font-size: 11px;
     text-transform: uppercase;

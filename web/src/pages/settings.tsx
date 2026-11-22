@@ -64,7 +64,9 @@ const sheet = css`
     display: flex; align-items: center; gap: 10px;
     margin-bottom: 14px; flex-wrap: wrap;
   }
-  .mint-name { flex: 1; min-width: 220px; }
+  /* The height of the button it shares the row with. A field sized by its
+     padding and its text comes out three and a half pixels taller. */
+  .mint-name { flex: 1; min-width: 220px; height: 28px; padding-top: 0; padding-bottom: 0; }
   .mint-push {
     display: flex; align-items: center; gap: 7px; flex: none;
     /* The base sheet styles a label as an upper-case caption, which is right

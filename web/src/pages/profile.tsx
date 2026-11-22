@@ -169,11 +169,14 @@ const sheet = css`
     display: grid; grid-template-columns: auto minmax(0, 1fr);
     gap: 3px 12px; margin: 14px 0 0; clear: both;
     font-size: 11.5px;
+    /* Label and value on one baseline. Only the label asked for that before,
+       which aligns it with nothing; a pixel of padding stood in, and was right
+       for one size of text. */
+    align-items: baseline;
   }
   .facts dt {
     color: var(--faint); white-space: nowrap;
     font-size: 10px; text-transform: uppercase; letter-spacing: .08em;
-    align-self: baseline; padding-top: 1px;
   }
   .facts dd { margin: 0; color: var(--muted); min-width: 0; }
   .facts .q { color: var(--faint); }
