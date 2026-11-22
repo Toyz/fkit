@@ -81,7 +81,10 @@ export class FkitTabs extends LoomElement {
           <a
             class={t.key === this.current ? "on" : ""}
             href={t.href}
-            aria-current={t.key === this.current ? "page" : undefined}
+            // Spread, so the attribute is absent on the other tabs. Given
+            // `undefined`, Loom writes the word: every tab but the current one
+            // was announcing itself as aria-current="undefined".
+            {...(t.key === this.current ? { "aria-current": "page" } : {})}
             onClick={linkHandler(t.href)}
           >
             {t.icon ? <loom-icon name={t.icon} size={12}></loom-icon> : null}

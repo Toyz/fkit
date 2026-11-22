@@ -49,7 +49,9 @@ export class FkitToggle extends LoomElement {
         type="button"
         role="switch"
         aria-checked={this.checked ? "true" : "false"}
-        aria-label={this.label || undefined}
+        // Spread, so an unlabelled switch has no label rather than the one
+        // Loom writes for `undefined`, which is the word "undefined".
+        {...(this.label ? { "aria-label": this.label } : {})}
         disabled={this.disabled}
         onClick={() => {
           if (this.disabled) return;
