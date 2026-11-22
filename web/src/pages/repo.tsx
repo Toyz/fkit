@@ -386,6 +386,17 @@ const codeSheet = css`
   }
   .src { white-space: pre; padding: 0 16px 0 14px; }
 
+  /* A row is as wide as the longest line on screen, not as wide as the panel.
+     At the panel's width its background -- the hover, a selection -- stopped
+     where the panel did, and scrolling a long line sideways scrolled the text
+     out from under its own highlight. This is the virtual list's own element;
+     the plain path gets the same from .code.
+
+     Two classes, not one, on purpose: the list's own sheet says width: 100%
+     with a single class and comes later in the cascade than this one does, so
+     an equally specific rule here is simply overruled. */
+  .vl-spacer > .vl-window { width: max-content; min-width: 100%; }
+
   .cm { color: var(--tok-comment); font-style: italic; }
   .st { color: var(--tok-string); }
   .nu { color: var(--tok-number); }
@@ -705,7 +716,13 @@ const sheet = css`
 
   /* ---- blob ----
      Row rules live in codeSheet so the plain and virtualized paths share them. */
-  .code { overflow-x: auto; }
+  /* One column, as wide as the longest line or the panel, whichever is more.
+     Every row stretches to it, so a row's background runs the full width of
+     what can be scrolled to rather than stopping at the panel's edge. */
+  .code {
+    overflow-x: auto;
+    display: grid; grid-template-columns: minmax(max-content, 1fr);
+  }
 
   /* The virtual list scrolls inside itself, so give it a real height. */
   .vcode { display: block; height: calc(100vh - 230px); min-height: 320px; }
@@ -1299,9 +1316,13 @@ const sheet = css`
   .dl { position: relative; }
   /* The gutter button only appears on the row under the pointer — a plus on
      every line of a thousand-line diff is noise, not an affordance. */
+  /* Over the first number, and kept there the same way the numbers are kept:
+     a row scrolled sideways still has to offer its button. In the flow but
+     taking no room -- the negative margin gives back exactly its width -- so
+     appearing does not shift the line it appears on. */
   .dl .addc {
-    position: absolute; left: 2px; top: 50%; transform: translateY(-50%);
-    width: 17px; height: 17px; padding: 0; display: none;
+    position: sticky; left: 2px; flex: none; align-self: center;
+    width: 17px; height: 17px; margin-right: -17px; padding: 0; display: none;
     align-items: center; justify-content: center;
     border: 0; border-radius: var(--radius); cursor: pointer;
     background: var(--accent); color: var(--bg); z-index: 2;
@@ -1629,7 +1650,28 @@ const sheet = css`
   a.df-path:hover { color: var(--accent); }
   .df-head .counts { margin-left: auto; display: flex; gap: 8px; font-variant-numeric: tabular-nums; }
   .df-note { padding: 10px 12px; color: var(--muted); font-size: 12px; font-family: var(--sans); }
-  .df-body { overflow-x: auto; }
+  /* A diff's colour is the row's background, and a row was as wide as the
+     panel: on a line longer than that the text carried on and the red or
+     green did not, so scrolling sideways left the change uncoloured exactly
+     where it was being read. One column as wide as the longest line, which
+     every hunk and so every row stretches to.
+
+     It is also a size container, for the things in here that are *not* code
+     and must not become as wide as it: the rule after this one. */
+  .df-body {
+    overflow-x: auto;
+    display: grid; grid-template-columns: minmax(max-content, 1fr);
+    container-type: inline-size;
+  }
+  /* What sits in a diff without being a line of it: a hunk header, a note, a
+     comment thread, the button for the rest of the file. Stretched with the
+     code these would be thousands of pixels wide with their content at the
+     far end -- or, for a comment, would set the width themselves, since a
+     paragraph's widest form is one line. Instead each is exactly the width
+     of the visible panel and stays in it while the code scrolls underneath. */
+  .df-body :is(.hh, .thread), .df-body > :is(.df-note, .more) {
+    position: sticky; left: 0; width: 100cqw;
+  }
 
   .hh {
     padding: 3px 12px; color: var(--faint); font-size: 11px;
@@ -1643,7 +1685,11 @@ const sheet = css`
     flex: none; width: 3.5rem; text-align: right; padding-right: 10px;
     color: var(--gutter-fg); background: var(--gutter-bg);
     user-select: none; font-variant-numeric: tabular-nums; font-size: 11px;
+    /* The numbers stay put while a long line scrolls, as they do in the file
+       view: which line this is matters most when its start is off screen. */
+    position: sticky; left: 0; z-index: 1;
   }
+  .dl .no + .no { left: 3.5rem; }
   .dl .mk { flex: none; width: 1.6ch; text-align: center; user-select: none; color: var(--faint); }
   .dl .dsrc { white-space: pre; padding-right: 16px; }
 
