@@ -892,7 +892,8 @@ fn ingest_enumerated(
     if let Some(w) = watch {
         w(Progress::Building);
     }
-    let (hash, size) = build_nested(sink, &files, &sk.dirs, "", prior)?;
+    let dirs: std::collections::BTreeSet<String> = std::mem::take(&mut sk.dirs).into_iter().collect();
+    let (hash, size) = build_nested(sink, &files, &dirs, "", prior)?;
     let unusable = std::mem::take(&mut sk.unusable);
     Ok(Ingested { hash, size, stats, raced, unusable })
 }
@@ -907,7 +908,7 @@ pub fn build_paths(
     files: &BTreeMap<String, TreeEntry>,
     prior: &Prior,
 ) -> Result<(Hash, u64)> {
-    build_nested(sink, files, &[], "", prior)
+    build_nested(sink, files, &Default::default(), "", prior)
 }
 
 /// Assemble nested trees from flat paths, creating empty directories where the
@@ -915,35 +916,36 @@ pub fn build_paths(
 fn build_nested(
     sink: &Sink,
     files: &BTreeMap<String, TreeEntry>,
-    dirs: &[String],
+    dirs: &std::collections::BTreeSet<String>,
     prefix: &str,
     prior: &Prior,
 ) -> Result<(Hash, u64)> {
-    let strip = |path: &str| -> Option<String> {
-        if prefix.is_empty() {
-            Some(path.to_string())
-        } else {
-            path.strip_prefix(prefix)?.strip_prefix('/').map(str::to_string)
-        }
-    };
+    use std::ops::Bound;
+
+    // Where this directory's run begins. The root's is everything.
+    let lead = if prefix.is_empty() { String::new() } else { format!("{prefix}/") };
+    let from = (Bound::Included(lead.as_str()), Bound::Unbounded);
 
     let mut entries: Vec<TreeEntry> = Vec::new();
     let mut subdirs: std::collections::BTreeSet<String> = Default::default();
 
-    for path in files.keys() {
-        let Some(rest) = strip(path) else { continue };
+    for (path, entry) in files.range::<str, _>(from) {
+        // The first key that does not start with `dir/` is past the run.
+        let Some(rest) = path.strip_prefix(lead.as_str()) else { break };
         match rest.split_once('/') {
-            None => entries.push(files[path].clone()),
+            None => entries.push(entry.clone()),
             Some((dir, _)) => {
-                subdirs.insert(dir.to_string());
+                if !subdirs.contains(dir) {
+                    subdirs.insert(dir.to_string());
+                }
             }
         }
     }
     // Directories with no files under them would otherwise vanish.
-    for d in dirs {
-        let Some(rest) = strip(d) else { continue };
-        if !rest.contains('/') {
-            subdirs.insert(rest);
+    for d in dirs.range::<str, _>(from) {
+        let Some(rest) = d.strip_prefix(lead.as_str()) else { break };
+        if !rest.is_empty() && !rest.contains('/') && !subdirs.contains(rest) {
+            subdirs.insert(rest.to_string());
         }
     }
 
@@ -1047,6 +1049,14 @@ pub struct Problem {
     /// The ignore file, relative to the root: `.fkthat`, `server/.fkitignore`.
     pub file: String,
     /// 1-based. 0 when it is the file as a whole that could not be read.
+///
+/// Both maps are sorted, and that is what this leans on: everything under a
+/// directory is one contiguous run of keys, starting at `dir/`. So a directory
+/// looks only at its own run. It used to look at every path in the repository
+/// and discard the ones that were not its own, which made a build cost files
+/// times directories -- a tree of sixty thousand files in three thousand
+/// directories examined a hundred and eighty million paths to commit one
+/// change, and every commit, status and import paid it.
     pub line: usize,
     pub text: String,
     pub why: String,

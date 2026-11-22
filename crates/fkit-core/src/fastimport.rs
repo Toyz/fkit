@@ -301,13 +301,23 @@ impl<'a> FastImport<'a> {
 
         // Where this commit starts from. `from` is explicit; without it, git's
         // rule is that a commit continues the branch it names.
-        let mut branch = if saw_from {
+        //
+        // Taken out of the table rather than copied, whenever this commit
+        // simply continues its own branch -- which is nearly every commit in
+        // any history. A branch carries a map of every path in the tree, and
+        // copying that once per commit is a cost in the size of the
+        // repository paid for each change to it. It goes back in below; if
+        // anything fails in between the import is over anyway.
+        let continues = self.branches.get(&refname).is_some_and(|b| !saw_from || b.tip == from);
+        let mut branch = if continues {
+            self.branches.remove(&refname).expect("just looked")
+        } else if saw_from {
             match from {
                 Some(parent) => self.branch_at(parent)?,
                 None => Branch::default(),
             }
         } else {
-            self.branches.get(&refname).cloned().unwrap_or_default()
+            Branch::default()
         };
         let parent_tree = branch.tree;
 
