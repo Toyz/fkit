@@ -8,9 +8,9 @@ a file is a Merkle tree over content-defined chunks, not one opaque blob. Point
 it at a 154 GiB tree of build output and disk images and it stores **1.2 GB**,
 128× smaller, almost entirely from noticing the same bytes twice.
 
-For ordinary source history git is smaller, by 3.7×, because it deltas versions
-against each other and this does not. That is a [deliberate
-trade](#not-done-yet) with the arithmetic written out, not an oversight.
+For ordinary source history git is still smaller, by about 2.4×: it chains
+deltas, and fkit keeps a patch at most [one step from whole](#patches). That is
+a deliberate trade with the numbers written out, not an oversight.
 
 ```
 fkit init                 fkit commit -m "..."      fkit push
@@ -18,6 +18,20 @@ fkit status               fkit log                  fkit pull
 fkit switch <branch>      fkit merkle <hash>        fkit clone ws://host/repo
 fkit submodule add <url> <path>                     fkit gc
 ```
+
+**Using it** is in [GETTING_STARTED.md](GETTING_STARTED.md). **Running a
+server** is in [DEPLOY.md](DEPLOY.md). This file is about how it works and why.
+
+- [What makes it different from git](#what-makes-it-different-from-git) ·
+  [on a real repository](#on-a-real-repository)
+- [The five object types](#the-five-object-types) · [proofs](#proofs)
+- [Storage](#storage) · [patches](#patches) ·
+  [garbage collection](#garbage-collection)
+- [Merging](#merging) · [submodules](#submodules) · [sync](#sync)
+- [Hosting](#hosting): [`fkit-hub`](#fkit-hub--the-forge),
+  [`fkitd`](#fkitd--the-minimal-daemon), [security notes](#security-notes)
+- [Layout](#layout) · [design decisions](#design-decisions-worth-knowing-about)
+  · [not done yet](#not-done-yet) · [tests](#tests)
 
 ## What makes it different from git
 
@@ -179,6 +193,42 @@ packed      127 object(s)
 Compression is a cargo feature. `--no-default-features` keeps `fkit-core` at
 exactly blake3 + anyhow.
 
+### Patches
+
+An object can also be stored as a patch against another: the base's hash, then
+the content compressed with the base as zstd's dictionary — which is LZ matching
+against the base, so the stored bytes are proportional to what changed.
+
+Nothing about identity moves. An object is still named by the digest of its
+*materialized* bytes, so addressing, deduplication, proofs and the wire protocol
+never see a patch; the hash is checked after expanding, so a damaged patch or a
+substituted base fails loudly rather than expanding into plausible wrong bytes.
+
+**There is no chain.** A patch may only name a base that is stored whole, so
+depth is one by construction: a read is fetch-base then apply, with nothing to
+walk and nothing to cap. Git chains deltas up to fifty deep; a chain of four
+measured 8.4× slower to read here than a whole object, and that cost is what
+one-deep refuses to pay.
+
+Finding a base needs no search. A packfile does not record which blobs are
+versions of which, so git hunts with a sliding window; here the tree of the
+commit being built on already says what was at each position, so chunk *i* of a
+file is offered chunk *i* of its previous version — and run *i* of a directory
+listing is offered run *i* from before. The listings turned out to be where the
+bytes were: one per directory per commit, rewritten in full because a single
+hash inside moved. Replaying 5,000 commits of git's own history went from
+55.9 MiB to 20.5 MiB.
+
+What it does not close is the gap on small source text:
+
+| 149 commits of fkit itself | on disk |
+|---|---|
+| fkit | 3.3 MiB |
+| git, fully repacked | **1.35 MiB** |
+
+That remaining 2.4× is the chains, and it is the price of an object that can be
+read in at most two seeks and checked without walking a history.
+
 ### Caching decompressed objects
 
 Rendering a page walks the same tree nodes over and over, decompressing each
@@ -208,7 +258,9 @@ While the segment is being appended to, records land in write order — a crash
 must never leave an index promising bytes the segment does not hold — and that
 index is held in memory.
 
-`fkit pack` closes the segment and rewrites its index in hash order. A sorted
+Closing the segment rewrites its index in hash order — `fkit pack` does it, and
+so does the hub when a push ends, since the segment that push wrote is finished
+and every later request would otherwise read its whole index first. A sorted
 immutable array is something you can binary search where it lies, so a sealed
 index is never loaded: about two dozen positioned reads answer a lookup in a
 ten-million-object store, all of them into pages the operating system is
@@ -460,7 +512,7 @@ route was asked for, and the app boots from it unchanged. The card itself is
 laid out as SVG and rasterised in-process — Liberation Mono is vendored so it
 renders identically on a container with no fonts installed.
 
-Set `server.public_url` (or `FKIT_PUBLIC_URL`). Open Graph URLs must be
+Set `public_url` under `[email]` (or `FKIT_PUBLIC_URL`). Open Graph URLs must be
 absolute, and without it the hub has to guess from the request's `Host`, which
 a proxy may have rewritten.
 
@@ -539,20 +591,24 @@ It **refuses to start** on a non-loopback address without a token unless you pas
 crates/
   fkit-core/     the engine — read the modules in this order:
     hash.rs        how things are named (BLAKE3)
-    object.rs      the four node types and their canonical encoding
+    object.rs      the five object types and their canonical encoding
     chunker.rs     content-defined chunking, and why fixed-size fails
     store.rs       the CAS on disk (loose + packed)
-    pack.rs        append-only segments, their index, and compression
+    pack.rs        append-only segments, compression, and one-deep patches
+    index.rs       a segment's index: appended to, then sealed and searched on disk
     cache.rs       the object cache: a trait, memory and Redis behind it
     gc.rs          reachability, the age guard, and segment compaction
-    diff.rs        Myers line diff, and why it is line-aware
+    diff.rs        Myers line diff, divided at unique lines where it would give up
     merge.rs       merge base, three-way tree and line merge
     proof.rs       Merkle inclusion proofs
     ingest.rs      filesystem -> Merkle DAG, in parallel
+    statcache.rs   what each file hashed to, so an unchanged one is not read again
     repo.rs        refs, HEAD, commits, diffing
     checkout.rs    Merkle DAG -> filesystem
     submodule.rs   pinning another repository, and where its remote lives
     archive.rs     streaming tar and zip straight from the store
+    fastimport.rs  building history from a `git fast-export` stream
+    config.rs      settings in layers: environment, repository, user
     proto.rs       the sync wire protocol
     session.rs     the server-side session loop, over a RepoHost
     ws.rs          RFC 6455, hand-rolled
@@ -572,8 +628,8 @@ being a virtue: it uses axum, tokio and sqlx, because hand-rolling HTTP routing
 and the Postgres wire protocol would be effort with no insight at the end of it.
 
 The frontend is [Loom](https://github.com/Toyz/loom) — decorator-driven web
-components, JSX compiled to real DOM, no virtual DOM. ~44 KB gzipped total, no
-webfonts, and it paints on the first frame. Large files and long histories go
+components, JSX compiled to real DOM, no virtual DOM. About 150 KB gzipped in
+all, no webfonts, and it paints on the first frame. Large files and long histories go
 through `<loom-virtual>`, and syntax highlighting is a line-aware tokenizer
 (`web/src/highlight.ts`) written specifically so it composes with
 virtualization — most off-the-shelf highlighters return one HTML string for a
@@ -585,13 +641,21 @@ tokenizer.
 ## Design decisions worth knowing about
 
 **No staging area.** `commit` snapshots the working tree as it is. Git's index
-exists largely because hashing every file on every status check was too slow in
-2005; with BLAKE3 and content-defined chunking, re-snapshotting is cheap enough
-that the extra concept isn't worth the confusion.
+is a staging area and a stat cache sharing a file, and only the first of those
+is a concept anyone has to learn. fkit has the second without the first.
 
-**`status` never writes.** Hashing is a pure function of content, so a dry-run
-sink computes exactly the same hashes as a real commit and reports what a commit
-*would* store, without touching disk.
+**A stat cache, and only a cache.** Re-hashing is cheap per byte and still costs
+a read of every file, which on sixty thousand files is seconds per `status`. So
+`.fkit/stat` remembers what each file hashed to, and a file whose size, times
+and inode are what they were is not opened again: the same tree in a third of a
+second. A hash is only reused if its content is still in the store, and never
+for a file modified in the last few seconds. Delete the file and nothing changes
+but the time the next snapshot takes.
+
+**`status` never writes an object.** Hashing is a pure function of content, so a
+dry-run sink computes exactly the same hashes as a real commit and reports what
+a commit *would* store, without touching the store. The one thing it does write
+is the stat cache above.
 
 **Checkout takes an explicit "from" tree.** It is not inferred from HEAD, because
 `clone` and `pull` have both already moved HEAD by the time they check out.
@@ -607,44 +671,17 @@ set only, so `--force` cannot eat a file fkit has never seen.
 - **Recursive merge base.** Criss-cross histories can have several equally-good
   bases. fkit picks one and reports the ambiguity rather than merging them into a
   virtual base the way git does.
-- **TLS.** Both servers speak plain `ws://`. Terminate TLS in front.
-- **Delta compression, deliberately not done.** Objects are stored whole. On
-  source history that costs real space, and the measurement is not close:
-
-  | 61 commits of fkit itself | on disk |
-  |---|---|
-  | fkit | 2.2 MiB |
-  | git, fully repacked | **594 KiB** |
-
-  Deduplication is working — 66.7 MiB of logical content across those commits
-  collapses to 5.3 MiB unique and 2.2 MiB stored, 30× — but 62% of the source
-  files here are smaller than the 8 KiB average chunk, so a one-line edit
-  rewrites the whole file as a new chunk. Content-defined chunking pays off on
-  large files with localized edits, which is the opposite of source code.
-
-  Neither obvious lever is one: zstd 1→9 gives 2.2 → 2.0 MiB, and a 2 KiB
-  average chunk cuts unique bytes 23% while leaving the disk total unchanged,
-  because smaller frames compress worse and the extra index entries eat the
-  rest. The gap is deltas, and it is possible to say exactly how much: chaining
-  every version of every file in this history as a patch against the previous
-  one costs 621 KiB against 3275 KiB stored whole — **5.3×**, and within 9% of
-  what git's pack actually achieves. So the whole difference is delta
-  compression and nothing else.
-
-  It is still the wrong trade here. Reconstructing an object from a chain of
-  four deltas measured **8.4× slower** than reading it whole, and that scales
-  with chain depth — git caps chains at 50 for this reason. Taking it would
-  cost three properties this design is built on: one seek per object, `fsck`
-  verifying each object without needing another, and an object cache whose
-  misses are cheap. In exchange for 2.6 MiB on a repository where storage is
-  the cheapest thing involved.
-
-  And it buys nothing where fkit is actually pointed. A 12 MB file with one
-  byte changed is already 4 objects; there is no redundancy left for a delta to
-  find. The entire win is on small source text, which is both trivial in
-  absolute terms and exactly the workload git already handles well. Being
-  larger there is the price of an object that can be read in one seek and
-  checked on its own.
+- **TLS in the servers.** The client speaks `wss://`; both servers speak plain
+  `ws://` and expect something in front to terminate it.
+- **Delta chains, deliberately.** Patches are [one deep](#patches) and stay
+  that way, which leaves git about 2.4× smaller on source history. Taking the
+  rest would cost what this design is built on: an object read in a bounded
+  number of seeks, `fsck` checking each object with at most one other in hand,
+  and a cache whose misses are cheap — in exchange for a few megabytes on the
+  workload git already handles well, and nothing at all on large files, where a
+  one-byte change is already four objects.
+- **A stat cache seeded by checkout.** The first `status` after a clone still
+  reads every file; only then is it remembered.
 
 - **Cross-repo dedup beyond a fork network.** Forks share one store, so a
   repository and its forks deduplicate against each other. Two *unrelated*
@@ -657,7 +694,7 @@ set only, so `--force` cannot eat a file fkit has never seen.
 make test        # cargo test --workspace, then tsc --noEmit for the UI
 ```
 
-196 Rust tests, zero clippy warnings. The ones that document the actual ideas:
+310 Rust tests, zero clippy warnings. The ones that document the actual ideas:
 
 - `chunker::insertion_only_perturbs_local_chunks` — a 10-byte insert into 4 MB
   leaves >95% of chunks untouched
@@ -678,6 +715,15 @@ make test        # cargo test --workspace, then tsc --noEmit for the UI
 - `gc::a_mostly_live_segment_is_left_alone`
 - `merge::a_rebuilt_tree_hashes_the_same_as_an_ingested_one`
 - `diff::reconstruction_holds_for_a_range_of_edits`
+- `diff::a_deletion_larger_than_the_cap_is_still_a_deletion` — a long function
+  removed is not a file rewritten
+- `pack::a_patch_never_names_a_patch` — depth one, however long the run of
+  versions
+- `pack::a_corrupt_patch_is_caught_rather_than_returned`
+- `repo::only_the_directories_on_the_way_to_a_change_are_read` — the diff is
+  handed a store holding nothing else, and still answers
+- `ingest::a_hash_computed_without_storing_is_not_built_into_a_commit` — the
+  stat cache may be wrong about nothing a commit depends on
 - `workflow::checkout_into_an_empty_directory_writes_everything`
 - `submodules::a_submodule_is_committed_as_a_pin_and_not_as_a_copy` — the
   parent's commit stores none of the submodule's own objects a second time

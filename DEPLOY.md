@@ -20,11 +20,19 @@ gh auth token | docker login ghcr.io -u Toyz --password-stdin
 GHCR packages are private by default, so the server needs its own login — a
 classic PAT with `read:packages`.
 
-`.github/workflows/image.yml` does all of this on a tag push, and is much
+`.github/workflows/image.yml` does all of this without being asked, and is much
 faster: it compiles natively with a warm cache and assembles from finished
 binaries via `Dockerfile.dist`. `make image` uses the self-contained
 `Dockerfile` instead — one command, no toolchain assumptions, cold build under
 QEMU.
+
+| pushed | tags published |
+|---|---|
+| a commit to `main` | `:main`, `:latest` |
+| a tag `v1.2.3` | `:1.2.3`, `:1.2`, `:latest` |
+
+Every build moves `:latest`, so a server that pins nothing follows `main`. Set
+`FKIT_TAG` in `.env.prod` to pin a version instead.
 
 ## 2. Put the files on the server
 
@@ -35,6 +43,23 @@ ssh server 'cd /opt/fkit && mv .env.prod.example .env.prod'
 
 Settings go in **`hub.toml`** (mounted at `/etc/fkit/hub.toml`), secrets in
 **`.env.prod`**. The environment overrides the file.
+
+The file is commented and short. Four lines in it are about *where* this server
+is, and are the ones to get right:
+
+| setting | set it to | or the symptom is |
+|---|---|---|
+| `[server] secure_cookies` | `true` behind TLS | see [cookies](#cookies-and-tls) |
+| `[server] trust_proxy` | `true` behind a proxy | see [the proxy](#the-proxy) |
+| `[email] public_url` | the address people use, `https://…` | reset and invite links, and every link preview, point at whatever host the request happened to name |
+| `[email] from` | an address on a domain verified with Resend | no mail leaves, and the sign-in page says there is no reset rather than offering one that cannot work |
+
+`public_url` and `from` only *seed* a new database: after the first boot the
+values in **admin → email** are the ones in force, so editing the file later
+changes nothing. `FKIT_PUBLIC_URL` and `FKIT_EMAIL_FROM` in the hub's
+environment are different — they always win, and the admin page shows them as
+fixed. The compose file does not pass those two through; add them under the
+`hub` service's `environment:` if you want them pinned that way.
 
 ```sh
 POSTGRES_PASSWORD=$(openssl rand -base64 24)   # with --profile bundled-db
@@ -151,16 +176,25 @@ read.
 
 ## Mirroring this repository into fkit
 
-`.github/workflows/mirror-to-fkit.yml` pushes every update to `main` into the
-hub. Two repository secrets:
+The second job in `.github/workflows/image.yml` replays `main` into the hub
+after each build, using the `fkit` binary out of the image that build just
+published. Two repository secrets:
 
 ```
 FKIT_REMOTE   wss://fkit.work/helba/fkit
 FKIT_TOKEN    an access token with write access
 ```
 
-It records what `main` looked like in fkit's object model, with real diffs
-between snapshots — not a git history translation.
+One fkit commit per git commit, with the original author, date and message, and
+the git hash recorded in a trailer. That trailer is also the bookmark: the next
+run reads the newest one out of the hub's log and resumes after it, so a run
+costs what changed. If the recorded commit is no longer in the history — a
+force-push — the whole history is replayed, because picking up from the tip
+would silently skip whatever came between.
+
+It will not send the token over plain `ws://` to anything but localhost. A
+manual run can skip the mirror, which is for the day the protocol on `main` is
+ahead of what the deployed hub speaks: update the server first, then mirror.
 
 ## Updating
 
