@@ -617,6 +617,27 @@ impl Pack {
         Ok(())
     }
 
+    /// Close the segment this handle has been writing, and seal it.
+    ///
+    /// For a writer that knows it is done: the receiving end of a push, once
+    /// the push is over. An unsealed index is read into memory, whole, by
+    /// every handle opened on the store afterwards -- and a server opens one
+    /// per request, so until something seals it every page view pays for
+    /// every object the last push brought in.
+    ///
+    /// Only ever this handle's own segment. Another writer's open segment
+    /// looks the same on disk as an abandoned one, and sealing it would
+    /// reorder an index that is still being appended to.
+    pub fn seal_current(&mut self) -> Result<()> {
+        if let Some((id, seg, idx, _)) = self.current.take() {
+            seg.sync_all()?;
+            idx.sync_all()?;
+            drop((seg, idx));
+            self.seal_segment(id)?;
+        }
+        Ok(())
+    }
+
     /// Seal every segment, including the one being written.
     ///
     /// Called from packing, which is the point at which a store says it is
@@ -625,12 +646,7 @@ impl Pack {
     /// the next write append out of order behind it. A later write simply
     /// opens a new segment, which is what happens after a rollover anyway.
     pub fn seal_all(&mut self) -> Result<()> {
-        if let Some((id, seg, idx, _)) = self.current.take() {
-            seg.sync_all()?;
-            idx.sync_all()?;
-            drop((seg, idx));
-            self.seal_segment(id)?;
-        }
+        self.seal_current()?;
 
         let already: std::collections::HashSet<u32> =
             self.index.sealed_segments().into_iter().collect();

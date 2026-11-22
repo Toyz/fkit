@@ -175,6 +175,18 @@ impl Store {
         Ok(())
     }
 
+    /// Seal what this handle wrote, and nothing else.
+    ///
+    /// See [`crate::pack::Pack::seal_current`]. A store that wrote nothing has
+    /// nothing open and this does nothing.
+    pub fn seal_written(&self) -> Result<()> {
+        let mut slot = self.pack.lock().unwrap();
+        if let Some(pack) = slot.as_mut() {
+            pack.seal_current()?;
+        }
+        Ok(())
+    }
+
     /// Merge small segments into fewer, larger ones.
     ///
     /// Every writing process opens its own segment — that is what removes the

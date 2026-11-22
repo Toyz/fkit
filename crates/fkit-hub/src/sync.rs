@@ -574,7 +574,20 @@ fn run(t: &mut ChannelTransport, state: AppState, rt: Handle, owner: &str, name:
     };
 
     send_welcome(t, host.refs()?)?;
-    serve_session(t, &host)?;
+    let served = serve_session(t, &host);
+
+    // Whatever this session received is in a segment only it was writing, and
+    // it is finished with it. Sealed now, its index is searched on disk; left
+    // as it is, every request for this repository reads all of it into memory
+    // first -- sixteen milliseconds a page after a push of sixty thousand
+    // files, on every page, until something else happened to seal it.
+    //
+    // Done whether or not the session ended well: a push cut off half way has
+    // still written objects that the retry will find already here.
+    if let Err(e) = host.store.seal_written() {
+        tracing::warn!("sealing what {} pushed: {e:#}", host.label);
+    }
+    served?;
     Ok(())
 }
 
