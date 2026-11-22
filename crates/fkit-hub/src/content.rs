@@ -8,7 +8,7 @@ use crate::error::{AppError, AppResult};
 use fkit_core::hash::Hash;
 use fkit_core::ingest::{read_entries, read_file};
 use fkit_core::object::{EntryKind, Object};
-use fkit_core::repo::{diff_trees, View};
+use fkit_core::repo::{diff_entries, diff_trees, View};
 use fkit_core::store::Store;
 use serde::Serialize;
 
@@ -582,37 +582,38 @@ pub fn commit_patch(store: &Store, id: Hash) -> AppResult<(Vec<FileDiff>, bool)>
     };
 
     let v = view(store);
-    let changes = diff_trees(&v, parent_tree, Some(c.tree)).map_err(AppError::Internal)?;
+    let changes = diff_entries(&v, parent_tree, Some(c.tree)).map_err(AppError::Internal)?;
     let more = changes.len() > MAX_DIFF_FILES;
 
-    diff_file_list(store, &v, parent_tree, c.tree, changes).map(|f| (f, more))
+    diff_file_list(store, changes).map(|f| (f, more))
 }
 
+/// Line diffs for a list of changed paths.
+///
+/// Each change arrives with the entry on either side of it, which is where
+/// its content is. This used to be handed bare paths and walk both trees in
+/// full to find them again -- twice the size of the repository read, for a
+/// commit that touched one file.
 fn diff_file_list(
     store: &Store,
-    v: &fkit_core::repo::View<'_>,
-    old_tree: Option<Hash>,
-    new_tree: Hash,
-    changes: Vec<fkit_core::repo::Change>,
+    changes: Vec<fkit_core::repo::Differing>,
 ) -> AppResult<Vec<FileDiff>> {
-    let old_files = match old_tree {
-        Some(t) => v.walk_tree(t).map_err(AppError::Internal)?,
-        None => Default::default(),
-    };
-    let new_files = v.walk_tree(new_tree).map_err(AppError::Internal)?;
+    // One allowance of searching for the whole response, not one per file.
+    // A file's own limit bounds a file; a commit is up to sixty of them, and
+    // the page should cost what a page costs however its commit was built.
+    // Ordinary edits use a few thousandths of this between them.
+    let mut effort = 2 * fkit_core::diff::BUDGET;
 
     let mut out = Vec::new();
     for ch in changes.into_iter().take(MAX_DIFF_FILES) {
-        use fkit_core::repo::Change::*;
-        let (path, status) = match &ch {
-            Added { path, .. } => (path.clone(), "added"),
-            Removed { path, .. } => (path.clone(), "removed"),
-            Modified { path, .. } => (path.clone(), "modified"),
-            TypeChanged { path } => (path.clone(), "typechanged"),
+        let (before, after) = (ch.old.as_ref(), ch.new.as_ref());
+        let path = ch.path.clone();
+        let status = match (before, after) {
+            (None, _) => "added",
+            (_, None) => "removed",
+            (Some(o), Some(n)) if o.kind != n.kind => "typechanged",
+            _ => "modified",
         };
-
-        let before = old_files.get(&path);
-        let after = new_files.get(&path);
         let old_size = before.map(|e| e.size).unwrap_or(0);
         let new_size = after.map(|e| e.size).unwrap_or(0);
 
@@ -633,7 +634,7 @@ fn diff_file_list(
 
         let a = before.map(|e| read_blob_by_hash(store, e.hash)).unwrap_or_default();
         let b = after.map(|e| read_blob_by_hash(store, e.hash)).unwrap_or_default();
-        let d = fkit_core::diff::diff(&a, &b);
+        let d = fkit_core::diff::diff_within(&a, &b, &mut effort);
 
         out.push(FileDiff {
             path,
@@ -779,9 +780,9 @@ pub fn compare(
 
     // Line-level diff of what head introduces.
     let v = view(store);
-    let changes = diff_trees(&v, base_tree, Some(head_tree)).map_err(AppError::Internal)?;
+    let changes = diff_entries(&v, base_tree, Some(head_tree)).map_err(AppError::Internal)?;
     let files_truncated = changes.len() > MAX_DIFF_FILES;
-    let files = diff_file_list(store, &v, base_tree, head_tree, changes)?;
+    let files = diff_file_list(store, changes)?;
 
     // Would the merge apply cleanly?
     let mut conflicts = Vec::new();

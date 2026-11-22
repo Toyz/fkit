@@ -768,6 +768,14 @@ impl Change {
     }
 }
 
+/// One path that is not the same in two trees, and what is at it in each.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Differing {
+    pub path: String,
+    pub old: Option<TreeEntry>,
+    pub new: Option<TreeEntry>,
+}
+
 /// Compare two trees.
 ///
 /// The Merkle property makes this fast in the common case: if two subtrees have
@@ -775,42 +783,121 @@ impl Change {
 /// without reading a single file. Comparing two 100 GB checkouts that differ in
 /// one file touches a handful of objects.
 pub fn diff_trees(view: &View, old: Option<Hash>, new: Option<Hash>) -> Result<Vec<Change>> {
-    if old == new {
-        return Ok(vec![]); // identical roots: provably no differences
-    }
-    let a = match old {
-        Some(t) => view.walk_tree(t)?,
-        None => BTreeMap::new(),
-    };
-    let b = match new {
-        Some(t) => view.walk_tree(t)?,
-        None => BTreeMap::new(),
-    };
+    Ok(diff_entries(view, old, new)?
+        .into_iter()
+        .map(|d| match (d.old, d.new) {
+            (Some(o), None) => Change::Removed { path: d.path, size: o.size },
+            (None, Some(n)) => Change::Added { path: d.path, size: n.size },
+            (Some(o), Some(n)) if o.kind != n.kind => Change::TypeChanged { path: d.path },
+            (Some(o), Some(n)) => Change::Modified {
+                path: d.path,
+                old: o.hash,
+                new: n.hash,
+                old_size: o.size,
+                new_size: n.size,
+            },
+            (None, None) => unreachable!("a path that differs is somewhere"),
+        })
+        .collect())
+}
 
-    let mut changes = Vec::new();
-    for (path, oe) in &a {
-        match b.get(path) {
-            None => changes.push(Change::Removed { path: path.clone(), size: oe.size }),
-            Some(ne) if ne.hash == oe.hash && ne.kind == oe.kind => {}
-            Some(ne) if ne.kind != oe.kind => {
-                changes.push(Change::TypeChanged { path: path.clone() })
-            }
-            Some(ne) => changes.push(Change::Modified {
-                path: path.clone(),
-                old: oe.hash,
-                new: ne.hash,
-                old_size: oe.size,
-                new_size: ne.size,
-            }),
+/// As [`diff_trees`], keeping each side's entry rather than a summary of it.
+///
+/// For a caller that goes on to read the files: the entry is what says where
+/// the content is, and finding it again by walking the tree is the cost this
+/// function exists to avoid.
+///
+/// This is where the claim in [`diff_trees`] is made true. It used to read
+/// both trees in full and compare the two lists, which is the right answer at
+/// a cost in the size of the repository -- for a one-line change. Two
+/// directories are now only opened when their hashes differ, so the work
+/// follows the change: the directories on the path to each changed file, and
+/// nothing beside them.
+pub fn diff_entries(view: &View, old: Option<Hash>, new: Option<Hash>) -> Result<Vec<Differing>> {
+    let mut out = Vec::new();
+    diff_dirs(view, old, new, "", 0, &mut out)?;
+    // Each directory is compared in name order, which is not the order of
+    // whole paths: `a.txt` sorts before the directory `a` holds, and after
+    // `a` itself.
+    out.sort_by(|x, y| x.path.cmp(&y.path));
+    Ok(out)
+}
+
+/// The tree an entry opens onto, if it is something with paths beneath it.
+///
+/// A submodule counts. [`View::walk_tree`] expands a pin into its content so
+/// that nothing downstream has to know submodules exist, and a diff that
+/// stopped at the pin would report one changed path where a checkout sees
+/// every file that moved.
+fn beneath(view: &View, e: &TreeEntry, path: &str) -> Result<Option<Hash>> {
+    Ok(match e.kind {
+        EntryKind::Dir => Some(e.hash),
+        EntryKind::Submodule => Some(view.submodule_tree(e.hash, path)?),
+        _ => None,
+    })
+}
+
+fn diff_dirs(
+    view: &View,
+    old: Option<Hash>,
+    new: Option<Hash>,
+    prefix: &str,
+    depth: usize,
+    out: &mut Vec<Differing>,
+) -> Result<()> {
+    if old == new {
+        return Ok(()); // identical roots: provably no differences
+    }
+    if depth > MAX_TREE_DEPTH {
+        bail!("directory nesting deeper than {MAX_TREE_DEPTH}");
+    }
+    let listing = |tree: Option<Hash>| -> Result<BTreeMap<String, TreeEntry>> {
+        Ok(match tree {
+            Some(t) => view.read_entries(t)?.into_iter().map(|e| (e.name.clone(), e)).collect(),
+            None => BTreeMap::new(),
+        })
+    };
+    let (a, mut b) = (listing(old)?, listing(new)?);
+
+    let join = |name: &str| if prefix.is_empty() { name.to_string() } else { format!("{prefix}/{name}") };
+
+    for (name, oe) in a {
+        let ne = b.remove(&name);
+        // The same entry on both sides, whatever it is: a file with the same
+        // content, or a directory with the same everything beneath it.
+        if ne.as_ref() == Some(&oe) {
+            continue;
+        }
+        let path = join(&name);
+        let was = beneath(view, &oe, &path)?;
+        let now = match &ne {
+            Some(e) => beneath(view, e, &path)?,
+            None => None,
+        };
+        // Whatever has paths beneath it is compared beneath it -- against the
+        // other side's directory if there is one, against nothing if not, so
+        // a directory that went away lists every file that went with it.
+        if was.is_some() || now.is_some() {
+            diff_dirs(view, was, now, &path, depth + 1, out)?;
+        }
+        // And whatever is itself a path is reported as one. A file replaced
+        // by a directory of the same name is both: the file went, and the
+        // paths under the directory arrived.
+        let old_leaf = was.is_none().then_some(oe);
+        let new_leaf = ne.filter(|_| now.is_none());
+        if old_leaf.is_some() || new_leaf.is_some() {
+            out.push(Differing { path, old: old_leaf, new: new_leaf });
         }
     }
-    for (path, ne) in &b {
-        if !a.contains_key(path) {
-            changes.push(Change::Added { path: path.clone(), size: ne.size });
+    // What is left on the new side has no counterpart on the old.
+    for (name, ne) in b {
+        let path = join(&name);
+        match beneath(view, &ne, &path)? {
+            Some(tree) => diff_dirs(view, None, Some(tree), &path, depth + 1, out)?,
+            None => out.push(Differing { path, old: None, new: Some(ne) }),
         }
     }
-    changes.sort_by(|x, y| x.path().cmp(y.path()));
-    Ok(changes)
+    Ok(())
 }
 
 fn read_hash_file(path: &Path) -> Result<Option<Hash>> {
@@ -847,4 +934,212 @@ fn read_ref_dir(dir: &Path) -> Result<BTreeMap<String, Hash>> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod diff_tests {
+    use super::*;
+    use crate::ingest::{build_paths, Prior};
+
+    /// What [`diff_trees`] used to be: read both trees whole, compare the
+    /// lists. Slow in exactly the way the new one is not, and obviously right,
+    /// which is what makes it worth keeping as the thing to be equal to.
+    fn by_walking(view: &View, old: Option<Hash>, new: Option<Hash>) -> Vec<Change> {
+        let walk = |t: Option<Hash>| t.map(|t| view.walk_tree(t).unwrap()).unwrap_or_default();
+        let (a, b) = (walk(old), walk(new));
+        let mut changes = Vec::new();
+        for (path, oe) in &a {
+            match b.get(path) {
+                None => changes.push(Change::Removed { path: path.clone(), size: oe.size }),
+                Some(ne) if ne.hash == oe.hash && ne.kind == oe.kind => {}
+                Some(ne) if ne.kind != oe.kind => changes.push(Change::TypeChanged { path: path.clone() }),
+                Some(ne) => changes.push(Change::Modified {
+                    path: path.clone(),
+                    old: oe.hash,
+                    new: ne.hash,
+                    old_size: oe.size,
+                    new_size: ne.size,
+                }),
+            }
+        }
+        for (path, ne) in &b {
+            if !a.contains_key(path) {
+                changes.push(Change::Added { path: path.clone(), size: ne.size });
+            }
+        }
+        changes.sort_by(|x, y| x.path().cmp(y.path()));
+        changes
+    }
+
+    fn store(tag: &str) -> Store {
+        let dir = std::env::temp_dir().join(format!("fkit-difftrees-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        Store::open(dir).unwrap()
+    }
+
+    /// A tree from `path -> (content id, kind)`. The diff never reads a file,
+    /// so an entry only has to name *some* content consistently.
+    fn tree(store: &Store, files: &[(&str, u8, EntryKind)]) -> Hash {
+        let paths: BTreeMap<String, TreeEntry> = files
+            .iter()
+            .map(|(path, content, kind)| {
+                let name = path.rsplit('/').next().unwrap().to_string();
+                let entry = TreeEntry { name, kind: *kind, hash: Hash([*content; 32]), size: *content as u64 };
+                (path.to_string(), entry)
+            })
+            .collect();
+        build_paths(&Sink::writing(store), &paths, &Prior::none()).unwrap().0
+    }
+
+    const FILE: EntryKind = EntryKind::File { exec: false };
+    const EXEC: EntryKind = EntryKind::File { exec: true };
+
+    #[test]
+    fn every_kind_of_change_is_reported_as_it_was() {
+        let store = store("kinds");
+        let old = tree(&store, &[
+            ("a.txt", 1, FILE),
+            ("a/kept.rs", 2, FILE),
+            ("a/edited.rs", 3, FILE),
+            ("a/gone.rs", 4, FILE),
+            ("b/deep/down/file.rs", 5, FILE),
+            ("script.sh", 6, FILE),
+            ("was-a-file", 7, FILE),
+            ("was-a-dir/one", 8, FILE),
+            ("was-a-dir/two", 9, FILE),
+            ("untouched/x", 10, FILE),
+            ("untouched/y/z", 11, FILE),
+        ]);
+        let new = tree(&store, &[
+            ("a.txt", 1, FILE),
+            ("a/kept.rs", 2, FILE),
+            ("a/edited.rs", 33, FILE),
+            ("a/new.rs", 12, FILE),
+            ("b/deep/down/file.rs", 55, FILE),
+            ("script.sh", 6, EXEC),
+            ("was-a-file/now/inside", 13, FILE),
+            ("was-a-dir", 14, EntryKind::Symlink),
+            ("untouched/x", 10, FILE),
+            ("untouched/y/z", 11, FILE),
+        ]);
+        let view = View { store: &store, overlay: Default::default() };
+
+        let got = diff_trees(&view, Some(old), Some(new)).unwrap();
+        assert_eq!(got, by_walking(&view, Some(old), Some(new)));
+        let brief: Vec<String> = got.iter().map(|c| format!("{} {}", c.sigil(), c.path())).collect();
+        assert_eq!(brief, [
+            "~ a/edited.rs",
+            "- a/gone.rs",
+            "+ a/new.rs",
+            "~ b/deep/down/file.rs",
+            "t script.sh",
+            "+ was-a-dir",
+            "- was-a-dir/one",
+            "- was-a-dir/two",
+            "- was-a-file",
+            "+ was-a-file/now/inside",
+        ]);
+
+        // Against nothing, in either direction, and against itself.
+        assert_eq!(diff_trees(&view, None, Some(new)).unwrap(), by_walking(&view, None, Some(new)));
+        assert_eq!(diff_trees(&view, Some(old), None).unwrap(), by_walking(&view, Some(old), None));
+        assert!(diff_trees(&view, Some(new), Some(new)).unwrap().is_empty());
+    }
+
+    /// The same answer as reading everything, over trees nobody chose.
+    #[test]
+    fn agrees_with_a_full_walk_on_random_trees() {
+        let store = store("random");
+        let view = View { store: &store, overlay: Default::default() };
+        let mut x = 0x9e37_79b9u64;
+        let mut rnd = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        // Few names, so that paths collide and a name is a file in one tree
+        // and a directory in the other.
+        let names = ["a", "b", "c", "d"];
+        let random_tree = |rnd: &mut dyn FnMut(u64) -> u64| {
+            let mut files: Vec<(String, u8, EntryKind)> = Vec::new();
+            for _ in 0..rnd(40) {
+                let depth = 1 + rnd(4) as usize;
+                let path: Vec<&str> = (0..depth).map(|_| names[rnd(4) as usize]).collect();
+                let path = path.join("/");
+                // A path cannot be both a file and a directory in one tree.
+                let clash = files.iter().any(|(p, ..)| {
+                    *p == path || p.starts_with(&format!("{path}/")) || path.starts_with(&format!("{p}/"))
+                });
+                if !clash {
+                    let kind = [FILE, FILE, EXEC, EntryKind::Symlink][rnd(4) as usize];
+                    files.push((path, 1 + rnd(3) as u8, kind));
+                }
+            }
+            let borrowed: Vec<(&str, u8, EntryKind)> = files.iter().map(|(p, c, k)| (p.as_str(), *c, *k)).collect();
+            tree(&store, &borrowed)
+        };
+        for _ in 0..300 {
+            let (old, new) = (random_tree(&mut rnd), random_tree(&mut rnd));
+            assert_eq!(
+                diff_trees(&view, Some(old), Some(new)).unwrap(),
+                by_walking(&view, Some(old), Some(new)),
+            );
+        }
+    }
+
+    /// The point of it: a change in one directory does not open the others.
+    #[test]
+    fn only_the_directories_on_the_way_to_a_change_are_read() {
+        let store = store("reads");
+        let mut files: Vec<(String, u8, EntryKind)> = Vec::new();
+        for d in 0..200u8 {
+            for f in 0..20 {
+                // Different content in every directory. Identical directories
+                // are one object, and then having read one is having read all.
+                files.push((format!("dir{d:03}/sub/file{f:02}"), d + 10, FILE));
+            }
+        }
+        let build = |files: &[(String, u8, EntryKind)]| {
+            let borrowed: Vec<(&str, u8, EntryKind)> = files.iter().map(|(p, c, k)| (p.as_str(), *c, *k)).collect();
+            tree(&store, &borrowed)
+        };
+        let old = build(&files);
+        files[1234].1 = 2;
+        let new = build(&files);
+
+        // Counted by handing the diff a view that can see only the objects on
+        // the path to the change. If it opened any other directory, it would
+        // fail to find it.
+        let full = View { store: &store, overlay: Default::default() };
+        let changed = diff_trees(&full, Some(old), Some(new)).unwrap();
+        assert_eq!(changed.len(), 1);
+        let path = changed[0].path().to_string();
+
+        let sparse = self::store("reads-sparse");
+        let copy = |tree: Hash| {
+            let mut at = tree;
+            for part in std::iter::once("").chain(path.split('/')) {
+                if !part.is_empty() {
+                    let entries = full.read_entries(at).unwrap();
+                    let Some(e) = entries.iter().find(|e| e.name == part && e.kind == EntryKind::Dir) else { break };
+                    at = e.hash;
+                }
+                // The directory's own objects: its runs, and any levels above them.
+                let mut stack = vec![at];
+                while let Some(h) = stack.pop() {
+                    let obj = store.get(h).unwrap();
+                    if let Object::Tree { children, .. } = &obj {
+                        stack.extend(children.iter().map(|c| c.hash));
+                    }
+                    sparse.put(&obj).unwrap();
+                }
+            }
+        };
+        copy(old);
+        copy(new);
+        let narrow = View { store: &sparse, overlay: Default::default() };
+        assert_eq!(diff_trees(&narrow, Some(old), Some(new)).unwrap(), changed);
+        assert!(narrow.walk_tree(new).is_err(), "a full walk does need the rest");
+    }
 }
