@@ -16,14 +16,19 @@
 //! # No staging area, on purpose
 //!
 //! fkit has no index. `commit` snapshots the working tree as it is. Git's index
-//! exists largely because hashing every file on every status check was too slow
-//! in 2005; with BLAKE3 and content-defined chunking, re-snapshotting is cheap
-//! enough that the extra concept is not worth its cost in confusion. If you want
-//! partial commits later, the honest way to add them is a "staged tree hash",
-//! not a parallel mutable index format.
+//! is two things sharing a file: a staging area, and a memory of what each file
+//! hashed to. Only the first is a concept, and it is the one left out. If you
+//! want partial commits later, the honest way to add them is a "staged tree
+//! hash", not a parallel mutable index format.
+//!
+//! The second is here, as [`crate::statcache`], because hashing being cheap per
+//! byte does not make reading every file cheap: a snapshot of sixty thousand
+//! files took seconds whether or not anything had changed. It is strictly a
+//! cache. A snapshot taken without it comes to the same tree, nothing can be
+//! staged in it, and removing it costs time and nothing else.
 
 use crate::hash::Hash;
-use crate::ingest::{ingest_dir, Ignore};
+use crate::ingest::Ignore;
 use crate::object::{Commit, EntryKind, Object, TreeEntry};
 use crate::store::{Sink, Store};
 use anyhow::{bail, Context, Result};
@@ -388,7 +393,15 @@ impl Repo {
     /// walk and diff it even though nothing was persisted.
     pub fn snapshot(&self) -> Result<Snapshot> {
         let sink = Sink::dry(&self.store);
-        let ing = ingest_dir(&sink, &self.root, &self.ignore(), &self.mounts()?)?;
+        let ing = crate::ingest::ingest_dir_cached(
+            &sink,
+            &self.root,
+            &self.ignore(),
+            &self.mounts()?,
+            &crate::ingest::Prior::none(),
+            None,
+            Some(&mut self.stat_cache()),
+        )?;
         Ok(Snapshot {
             hash: ing.hash,
             size: ing.size,
@@ -418,14 +431,26 @@ impl Repo {
             Some(root) => crate::ingest::Prior::at(&self.store, root),
             None => crate::ingest::Prior::none(),
         };
-        crate::ingest::ingest_dir_watched(
+        crate::ingest::ingest_dir_cached(
             &Sink::writing(&self.store),
             &self.root,
             &self.ignore(),
             &self.mounts()?,
             &prior,
             watch,
+            Some(&mut self.stat_cache()),
         )
+    }
+
+    /// What each file hashed to the last time it was read.
+    ///
+    /// Not an index: nothing is staged in it and nothing depends on it. It
+    /// lets a snapshot skip the files that have not changed, and a snapshot
+    /// taken without it comes to the same tree. See [`crate::statcache`].
+    fn stat_cache(&self) -> crate::statcache::StatCache {
+        crate::statcache::StatCache::load(crate::statcache::StatCache::file(
+            &self.root.join(META_DIR),
+        ))
     }
 
 

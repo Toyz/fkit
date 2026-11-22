@@ -65,9 +65,10 @@ $ fkit commit -m "the first thing"
 ```
 
 There is no staging area. `commit` snapshots the working tree as it is. Git's
-index exists largely because hashing every file on every status check was too
-slow in 2005; that is no longer true, so the extra concept is not worth the
-confusion.
+index is two things in one file -- a place to stage, and a memory of what each
+file hashed to so that it need not be read again -- and fkit has only the
+second, kept in `.fkit/stat`. It is a cache and nothing else: nothing is staged
+in it, and deleting it changes only how long the next `status` takes.
 
 ## What just happened
 
@@ -135,7 +136,7 @@ would never match it. And a line that cannot mean anything (an unclosed `[`, a
 trailing `\`, a doubled `//`) is reported by `fkit status` and `fkit commit`
 each time, rather than sitting there matching nothing.
 
-Unlike git there is no index, so ignoring a path that an earlier commit
+Unlike git there is nothing staged, so ignoring a path that an earlier commit
 included removes it from the next commit.
 
 ## Setting work aside

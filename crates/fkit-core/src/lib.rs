@@ -26,6 +26,7 @@ pub mod proof;
 pub mod proto;
 pub mod repo;
 pub mod session;
+pub mod statcache;
 pub mod store;
 pub mod submodule;
 pub mod ws;

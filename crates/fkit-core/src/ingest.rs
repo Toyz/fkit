@@ -38,6 +38,9 @@ pub struct Ingested {
     pub hash: Hash,
     pub size: u64,
     pub stats: WriteStats,
+    /// How many files were not read at all, because the stat cache already
+    /// knew what they hash to. Zero unless a cache was supplied.
+    pub reused: usize,
     /// Paths the working tree changed underneath the ingest. Always empty for
     /// a single file; see [`Raced`].
     pub raced: Vec<Raced>,
@@ -264,6 +267,20 @@ pub fn ingest_reader_after<R: std::io::Read>(
     reader: R,
     was: &[Hash],
 ) -> Result<Ingested> {
+    Ok(ingest_shaped(sink, reader, was)?.0)
+}
+
+/// How a file came out: how many chunks, and which one if there was only one.
+///
+/// What the stat cache keeps beside the root hash, so that it can later check
+/// a small file's content is still stored without reading the root back.
+type Shape = (u64, Option<Hash>);
+
+fn ingest_shaped<R: std::io::Read>(
+    sink: &Sink,
+    reader: R,
+    was: &[Hash],
+) -> Result<(Ingested, Shape)> {
     let mut stats = WriteStats::default();
 
     // Pass 1: cut into content-defined chunks and store each leaf.
@@ -277,6 +294,10 @@ pub fn ingest_reader_after<R: std::io::Read>(
     }
 
     let total: u64 = level_refs.iter().map(|(_, n)| n).sum();
+    let shape: Shape = (
+        level_refs.len() as u64,
+        if level_refs.len() == 1 { Some(level_refs[0].0) } else { None },
+    );
 
     // Pass 2: fold upward until a single root remains.
     let mut level: u8 = 0;
@@ -287,7 +308,15 @@ pub fn ingest_reader_after<R: std::io::Read>(
                 children: level_refs,
             })?;
             stats.merge(st);
-            return Ok(Ingested { hash: h, size: total, stats, raced: Vec::new(), unusable: Vec::new() });
+            let done = Ingested {
+                hash: h,
+                size: total,
+                stats,
+                reused: 0,
+                raced: Vec::new(),
+                unusable: Vec::new(),
+            };
+            return Ok((done, shape));
         }
 
         let mut next = Vec::with_capacity(level_refs.len() / FANOUT + 1);
@@ -452,6 +481,11 @@ struct Job {
     rel: String,
     abs: PathBuf,
     kind: JobKind,
+    /// What the walk learned about a file from listing it. Carried along
+    /// because two later steps want it and neither should have to ask the
+    /// filesystem again: ordering the work by size, and asking the stat cache
+    /// whether the file needs reading at all.
+    stat: Option<crate::statcache::Stat>,
 }
 
 enum JobKind {
@@ -471,10 +505,11 @@ fn enumerate(root: &Path, ignore: &Ignore, mounts: &Mounts) -> Result<Skeleton> 
     // Largest first: with a few very large files among many small ones, feeding
     // the big ones out first stops one thread finishing last on a 1 GB image
     // while the rest idle.
-    sk.jobs.sort_by(|a, b| {
-        let size = |j: &Job| fs::symlink_metadata(&j.abs).map(|m| m.len()).unwrap_or(0);
-        size(b).cmp(&size(a))
-    });
+    //
+    // By the size the walk already saw. Asking the filesystem here instead put
+    // a `stat` inside the comparison -- two per comparison, so on a tree of
+    // sixty thousand files, about two million of them to sort a list.
+    sk.jobs.sort_by_key(|j| std::cmp::Reverse(j.stat.map_or(0, |s| s.size)));
     Ok(sk)
 }
 
@@ -546,7 +581,7 @@ fn walk(
         }
 
         if ft.is_symlink() {
-            out.jobs.push(Job { rel, abs, kind: JobKind::Symlink });
+            out.jobs.push(Job { rel, abs, kind: JobKind::Symlink, stat: None });
         } else if ft.is_dir() {
             // A submodule is a boundary. Its files are already content in this
             // store, named by the pin, so walking into them would store a
@@ -558,15 +593,17 @@ fn walk(
             }
             walk(&abs, &rel, ignore, mounts, out)?;
         } else {
-            let exec = match entry.metadata() {
-                Ok(m) => is_executable(&m),
+            let meta = match entry.metadata() {
+                Ok(m) => m,
                 Err(e) if gone(&e) => {
                     out.raced.push(vanished(&rel));
                     continue;
                 }
                 Err(e) => return Err(e).with_context(|| format!("reading {}", abs.display())),
             };
-            out.jobs.push(Job { rel, abs, kind: JobKind::File { exec } });
+            let exec = is_executable(&meta);
+            let stat = Some(crate::statcache::Stat::of(&meta));
+            out.jobs.push(Job { rel, abs, kind: JobKind::File { exec }, stat });
         }
     }
     Ok(())
@@ -578,6 +615,11 @@ struct Ran {
     entry: Option<TreeEntry>,
     stats: WriteStats,
     raced: Option<Race>,
+    /// What the stat cache should hold for this path from now on: the entry
+    /// it was reused from, or what reading the file has just established.
+    cached: Option<crate::statcache::Cached>,
+    /// Whether the file was taken from the cache rather than read.
+    reused: bool,
 }
 
 /// Ingest one job's content. Runs on a worker thread.
@@ -587,10 +629,20 @@ struct Ran {
 /// one file deleted by a build must not cost the other hundred thousand.
 /// Errors are kept for what is actually wrong, like a file that exists and
 /// cannot be read.
-fn run_job(sink: &Sink, job: &Job, prior: &Prior) -> Result<Ran> {
+fn run_job(
+    sink: &Sink,
+    job: &Job,
+    prior: &Prior,
+    cache: Option<&crate::statcache::StatCache>,
+) -> Result<Ran> {
     let name = job.rel.rsplit('/').next().unwrap_or(&job.rel).to_string();
-    let vanished =
-        || Ran { entry: None, stats: WriteStats::default(), raced: Some(Race::Vanished) };
+    let vanished = || Ran {
+        entry: None,
+        stats: WriteStats::default(),
+        raced: Some(Race::Vanished),
+        cached: None,
+        reused: false,
+    };
 
     match job.kind {
         JobKind::Symlink => {
@@ -610,25 +662,57 @@ fn run_job(sink: &Sink, job: &Job, prior: &Prior) -> Result<Ran> {
             let ing = ingest_bytes(sink, target.to_string_lossy().as_bytes())?;
             let entry =
                 TreeEntry { name, kind: EntryKind::Symlink, hash: ing.hash, size: ing.size };
-            Ok(Ran { entry: Some(entry), stats: ing.stats, raced: None })
+            Ok(Ran { entry: Some(entry), stats: ing.stats, raced: None, cached: None, reused: false })
         }
         JobKind::File { exec } => {
+            // The file the walk listed, if it is the file that was hashed last
+            // time and what it hashed to is still in the store. Then there is
+            // nothing to read: the answer would be the one already in hand.
+            if let (Some(cache), Some(stat)) = (cache, &job.stat)
+                && let Some((was, objects)) = cache.hit(&job.rel, stat, sink.store())
+            {
+                let entry = TreeEntry {
+                    name,
+                    kind: EntryKind::File { exec },
+                    hash: was.hash,
+                    size: stat.size,
+                };
+                // Counted the way reading it would have counted it: content
+                // that was already stored and did not have to be written.
+                let stats = WriteStats {
+                    objects_deduped: objects,
+                    bytes_deduped: stat.size,
+                    ..Default::default()
+                };
+                return Ok(Ran { entry: Some(entry), stats, raced: None, cached: Some(was), reused: true });
+            }
+
             // What this path was made of in the commit being built on, so
             // each chunk can be offered its own predecessor.
             let was = prior.chunks_for(&job.rel);
-            let Some((ing, settled)) = read_settled(sink, &job.abs, &was)? else {
+            let Some(read) = read_settled(sink, &job.abs, &was)? else {
                 return Ok(vanished());
             };
             let entry = TreeEntry {
                 name,
                 kind: EntryKind::File { exec },
-                hash: ing.hash,
-                size: ing.size,
+                hash: read.ing.hash,
+                size: read.ing.size,
             };
             Ok(Ran {
                 entry: Some(entry),
-                stats: ing.stats,
-                raced: (!settled).then_some(Race::Changed),
+                stats: read.ing.stats,
+                raced: (!read.settled).then_some(Race::Changed),
+                // Only what held still is remembered. A file that changed
+                // while it was being read was hashed as something it may
+                // never have been.
+                cached: read.settled.then_some(crate::statcache::Cached {
+                    stat: read.stat,
+                    hash: read.ing.hash,
+                    chunks: read.shape.0,
+                    only: read.shape.1,
+                }),
+                reused: false,
             })
         }
     }
@@ -646,7 +730,7 @@ fn run_job(sink: &Sink, job: &Job, prior: &Prior) -> Result<Ran> {
 /// The comparison can be fooled by a write that keeps the size and lands
 /// inside the clock's resolution. Nothing here depends on it being right --
 /// the stored bytes are exactly the bytes that were read, either way.
-fn read_settled(sink: &Sink, path: &Path, was: &[Hash]) -> Result<Option<(Ingested, bool)>> {
+fn read_settled(sink: &Sink, path: &Path, was: &[Hash]) -> Result<Option<Settled>> {
     let reading = || format!("reading {}", path.display());
     let stamp = |m: &fs::Metadata| (m.len(), m.modified().ok());
 
@@ -665,8 +749,8 @@ fn read_settled(sink: &Sink, path: &Path, was: &[Hash]) -> Result<Option<(Ingest
             return Ok(None);
         }
 
-        let mut ing =
-            ingest_reader_after(sink, std::io::BufReader::new(&f), was).with_context(reading)?;
+        let (mut ing, shape) =
+            ingest_shaped(sink, std::io::BufReader::new(&f), was).with_context(reading)?;
         let after = f.metadata().with_context(reading)?;
         let settled = stamp(&before) == stamp(&after) && ing.size == after.len();
 
@@ -674,10 +758,22 @@ fn read_settled(sink: &Sink, path: &Path, was: &[Hash]) -> Result<Option<(Ingest
         stats.merge(ing.stats);
         if settled || retried {
             ing.stats = stats;
-            return Ok(Some((ing, settled)));
+            // The state of the file *after* the read, from the handle that
+            // read it: the description that goes with exactly these bytes.
+            let stat = crate::statcache::Stat::of(&after);
+            return Ok(Some(Settled { ing, settled, shape, stat }));
         }
         retried = true;
     }
+}
+
+/// What [`read_settled`] read, and what the file looked like when it had.
+struct Settled {
+    ing: Ingested,
+    /// Whether the file held still for the read.
+    settled: bool,
+    shape: Shape,
+    stat: crate::statcache::Stat,
 }
 
 /// Snapshot a directory into a `Tree`, reading files on every available core.
@@ -744,13 +840,36 @@ pub fn ingest_dir_watched(
     ignore: &Ignore,
     mounts: &Mounts,
     prior: &Prior,
-    mut watch: Option<Observer<'_>>,
+    watch: Option<Observer<'_>>,
 ) -> Result<Ingested> {
+    ingest_dir_cached(sink, dir, ignore, mounts, prior, watch, None)
+}
+
+/// [`ingest_dir_watched`], skipping files a [`StatCache`] says are unchanged.
+///
+/// The cache is consulted while the tree is read and brought up to date when
+/// the read is over. With `None` this is the ingest it always was, which reads
+/// everything.
+///
+/// [`StatCache`]: crate::statcache::StatCache
+pub fn ingest_dir_cached(
+    sink: &Sink,
+    dir: &Path,
+    ignore: &Ignore,
+    mounts: &Mounts,
+    prior: &Prior,
+    mut watch: Option<Observer<'_>>,
+    cache: Option<&mut crate::statcache::StatCache>,
+) -> Result<Ingested> {
+    // Before the walk, and so before anything is read. Whatever is modified
+    // from here on is newer than this, which is what lets a remembered hash
+    // be told apart from a stale one.
+    let began = std::time::SystemTime::now();
     if let Some(w) = watch.as_deref_mut() {
         w(Progress::Scanning { files: 0 });
     }
     let sk = enumerate(dir, ignore, mounts)?;
-    ingest_enumerated(sink, dir, sk, mounts, prior, watch)
+    ingest_enumerated(sink, dir, sk, mounts, prior, watch, cache.map(|c| (c, began)))
 }
 
 /// The second half of an ingest: read what the walk listed.
@@ -764,7 +883,12 @@ fn ingest_enumerated(
     mounts: &Mounts,
     prior: &Prior,
     mut watch: Option<Observer<'_>>,
+    mut cache: Option<(&mut crate::statcache::StatCache, std::time::SystemTime)>,
 ) -> Result<Ingested> {
+    // Read by every worker and written by none of them; what they learn comes
+    // back with their results and is put in after they have all finished.
+    let known: Option<&crate::statcache::StatCache> = cache.as_ref().map(|(c, _)| &**c);
+
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
@@ -800,7 +924,7 @@ fn ingest_enumerated(
                         loop {
                             let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let Some(job) = jobs.get(i) else { break };
-                            let ran = run_job(sink, job, prior)?;
+                            let ran = run_job(sink, job, prior, known)?;
                             // A job that found nothing to read is still a job
                             // finished, or the count would stop short of the
                             // total and the progress line with it.
@@ -848,16 +972,27 @@ fn ingest_enumerated(
     let mut files: BTreeMap<String, TreeEntry> = BTreeMap::new();
     let mut stats = WriteStats::default();
     let mut raced = std::mem::take(&mut sk.raced);
+    let mut reused = 0usize;
+    let mut remembered: Vec<(String, crate::statcache::Cached)> = Vec::new();
     for batch in collected {
         for (rel, ran) in batch? {
             stats.merge(ran.stats);
+            reused += ran.reused as usize;
             if let Some(what) = ran.raced {
                 raced.push(Raced { path: rel.to_string(), what });
+            }
+            if let Some(c) = ran.cached {
+                remembered.push((rel.to_string(), c));
             }
             if let Some(entry) = ran.entry {
                 files.insert(rel.to_string(), entry);
             }
         }
+    }
+    // Only reached when every file was read: a failed ingest returned above,
+    // and leaves the cache as it found it.
+    if let Some((cache, began)) = cache.as_mut() {
+        cache.replace(remembered.into_iter(), *began);
     }
     // Sorted, so the same race reads the same way whichever worker met it.
     raced.sort();
@@ -895,7 +1030,7 @@ fn ingest_enumerated(
     let dirs: std::collections::BTreeSet<String> = std::mem::take(&mut sk.dirs).into_iter().collect();
     let (hash, size) = build_nested(sink, &files, &dirs, "", prior)?;
     let unusable = std::mem::take(&mut sk.unusable);
-    Ok(Ingested { hash, size, stats, raced, unusable })
+    Ok(Ingested { hash, size, stats, reused, raced, unusable })
 }
 
 /// Build nested trees from a flat map of full paths.
@@ -913,6 +1048,14 @@ pub fn build_paths(
 
 /// Assemble nested trees from flat paths, creating empty directories where the
 /// skeleton recorded one but no file lives under it.
+///
+/// Both maps are sorted, and that is what this leans on: everything under a
+/// directory is one contiguous run of keys, starting at `dir/`. So a directory
+/// looks only at its own run. It used to look at every path in the repository
+/// and discard the ones that were not its own, which made a build cost files
+/// times directories -- a tree of sixty thousand files in three thousand
+/// directories examined a hundred and eighty million paths to commit one
+/// change, and every commit, status and import paid it.
 fn build_nested(
     sink: &Sink,
     files: &BTreeMap<String, TreeEntry>,
@@ -1049,14 +1192,6 @@ pub struct Problem {
     /// The ignore file, relative to the root: `.fkthat`, `server/.fkitignore`.
     pub file: String,
     /// 1-based. 0 when it is the file as a whole that could not be read.
-///
-/// Both maps are sorted, and that is what this leans on: everything under a
-/// directory is one contiguous run of keys, starting at `dir/`. So a directory
-/// looks only at its own run. It used to look at every path in the repository
-/// and discard the ones that were not its own, which made a build cost files
-/// times directories -- a tree of sixty thousand files in three thousand
-/// directories examined a hundred and eighty million paths to commit one
-/// change, and every commit, status and import paid it.
     pub line: usize,
     pub text: String,
     pub why: String,
@@ -1904,7 +2039,7 @@ mod tests {
         #[cfg(unix)]
         fs::remove_file(work.join("link")).unwrap();
 
-        let ing = ingest_enumerated(&sink, &work, sk, &mounts, &Prior::none(), None)
+        let ing = ingest_enumerated(&sink, &work, sk, &mounts, &Prior::none(), None, None)
             .expect("vanished files must not fail the snapshot");
 
         let mut want = vec!["build/tmp/a.o", "build/tmp/b.o", "f17.txt", "f3.txt"];
@@ -1952,7 +2087,7 @@ mod tests {
         fs::remove_file(work.join("thing")).unwrap();
         fs::create_dir(work.join("thing")).unwrap();
 
-        let ing = ingest_enumerated(&sink, &work, sk, &mounts, &Prior::none(), None).unwrap();
+        let ing = ingest_enumerated(&sink, &work, sk, &mounts, &Prior::none(), None, None).unwrap();
         assert_eq!(ing.raced, [Raced { path: "thing".into(), what: Race::Vanished }]);
         let mut paths = Vec::new();
         paths_in(&store, ing.hash, "", &mut paths);
@@ -2117,5 +2252,285 @@ mod tests {
         let hb = ingest_dir(&Sink::writing(&s), &b, &Ignore::empty(), &Default::default()).unwrap().hash;
         assert_eq!(ha, hb, "identical trees must hash identically");
         let _ = fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod stat_cache_tests {
+    use super::*;
+    use crate::statcache::StatCache;
+    use std::time::{Duration, SystemTime};
+
+    struct Bench {
+        store: Store,
+        dir: PathBuf,
+        work: PathBuf,
+        cache: PathBuf,
+    }
+
+    fn bench(tag: &str) -> Bench {
+        let dir = std::env::temp_dir().join(format!("fkit-statcache-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let store = Store::open(dir.join("objects")).unwrap();
+        let work = dir.join("work");
+        fs::create_dir_all(&work).unwrap();
+        Bench { store, cache: dir.join("stat"), work, dir }
+    }
+
+    impl Drop for Bench {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    impl Bench {
+        fn put(&self, rel: &str, content: &str) {
+            let p = self.work.join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, content).unwrap();
+        }
+
+        /// A snapshot through the cache.
+        ///
+        /// `aged` takes it as if an hour had passed since anything was
+        /// written. A file's change time cannot be set, so there is no way to
+        /// make one *look* old; moving the snapshot's idea of now forward is
+        /// the same thing seen from the other side.
+        fn snap(&self, writing: bool, aged: bool) -> Ingested {
+            self.snap_in(&self.store, writing, aged)
+        }
+
+        /// As [`Bench::snap`], against a store of the caller's choosing.
+        fn snap_in(&self, store: &Store, writing: bool, aged: bool) -> Ingested {
+            // Let the filesystem's clock tick, so that what was just written
+            // is strictly older than the cache file about to be. On Linux a
+            // tick is a few milliseconds, and a cache as new as the files it
+            // describes is rightly not believed about them.
+            std::thread::sleep(Duration::from_millis(40));
+            let sink = if writing { Sink::writing(store) } else { Sink::dry(store) };
+            let mut cache = StatCache::load(&self.cache);
+            let (ig, mounts) = (Ignore::empty(), Mounts::new());
+            let sk = enumerate(&self.work, &ig, &mounts).unwrap();
+            let began = SystemTime::now() + if aged { Duration::from_secs(3600) } else { Duration::ZERO };
+            ingest_enumerated(&sink, &self.work, sk, &mounts, &Prior::none(), None, Some((&mut cache, began)))
+                .unwrap()
+        }
+
+        /// The tree with nothing remembered: every file read.
+        fn truth(&self) -> Hash {
+            ingest_dir(&Sink::writing(&self.store), &self.work, &Ignore::empty(), &Mounts::new()).unwrap().hash
+        }
+
+        fn fill(&self, n: usize) {
+            for i in 0..n {
+                self.put(&format!("dir{}/file{i}.txt", i % 5), &format!("contents of file {i}\n"));
+            }
+        }
+    }
+
+    #[test]
+    fn a_file_that_has_not_changed_is_not_read_again() {
+        let b = bench("reuse");
+        b.fill(30);
+
+        let first = b.snap(true, true);
+        assert_eq!(first.reused, 0, "nothing is known the first time");
+        let second = b.snap(true, true);
+        assert_eq!(second.reused, 30);
+        assert_eq!(second.hash, first.hash);
+        assert_eq!(second.hash, b.truth());
+        // And it counts as what it is: content that did not need writing.
+        assert_eq!(second.stats.objects_written, 0);
+        assert!(second.stats.objects_deduped >= 60, "a root and a chunk for each");
+    }
+
+    #[test]
+    fn an_edited_file_is_read_and_only_that_one() {
+        let b = bench("edit");
+        b.fill(30);
+        b.snap(true, true);
+
+        b.put("dir2/file7.txt", "something else entirely\n");
+        b.put("dir0/new.txt", "a new file\n");
+        fs::remove_file(b.work.join("dir1/file11.txt")).unwrap();
+
+        let after = b.snap(true, true);
+        assert_eq!(after.reused, 28, "thirty, less the one edited and the one removed");
+        assert_eq!(after.hash, b.truth());
+        // What left the tree has left the cache.
+        assert_eq!(StatCache::load(&b.cache).len(), 30);
+    }
+
+    /// The case a modification time alone cannot see: the same number of
+    /// bytes, and the time put back to what it was.
+    #[cfg(unix)]
+    #[test]
+    fn a_rewrite_of_the_same_length_with_its_time_put_back_is_noticed() {
+        let b = bench("samelen");
+        b.fill(10);
+        let path = b.work.join("dir3/file3.txt");
+        let before = b.snap(true, true);
+        let was = fs::metadata(&path).unwrap().modified().unwrap();
+
+        // Same length, different bytes, same modification time.
+        let old = fs::read_to_string(&path).unwrap();
+        let new = old.replace("contents", "CONTENTS");
+        assert_eq!(old.len(), new.len());
+        fs::write(&path, new).unwrap();
+        fs::File::options().write(true).open(&path).unwrap().set_modified(was).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), was);
+
+        let after = b.snap(true, true);
+        assert_eq!(after.reused, 9, "the change time moved, and that cannot be put back");
+        assert_ne!(after.hash, before.hash);
+        assert_eq!(after.hash, b.truth());
+    }
+
+    #[test]
+    fn a_file_written_a_moment_ago_is_not_remembered() {
+        let b = bench("fresh");
+        b.fill(10);
+        // Not aged: these files are seconds old, and a second write inside
+        // the same tick of the clock would look exactly like the first.
+        assert_eq!(b.snap(true, false).reused, 0);
+        assert_eq!(b.snap(true, false).reused, 0);
+        assert!(StatCache::load(&b.cache).is_empty());
+    }
+
+    /// `status` hashes without storing. A commit must not be built out of a
+    /// name for content that was never written down.
+    #[test]
+    fn a_hash_computed_without_storing_is_not_built_into_a_commit() {
+        let b = bench("dry");
+        b.fill(12);
+
+        let looked = b.snap(false, true);
+        assert_eq!(looked.reused, 0);
+        assert_eq!(StatCache::load(&b.cache).len(), 12, "the hashes were learned");
+        // Learned, and still not usable: none of it is in the store.
+        assert_eq!(b.snap(false, true).reused, 0);
+
+        let committed = b.snap(true, true);
+        assert_eq!(committed.reused, 0, "so the commit read every file, and stored it");
+        assert_eq!(committed.hash, looked.hash);
+        let mut bytes = Vec::new();
+        for e in read_entries(&b.store, read_entries(&b.store, committed.hash).unwrap()[0].hash).unwrap() {
+            read_file(&b.store, e.hash, &mut bytes).expect("every file's content is there");
+        }
+
+        // Now that it is stored, both kinds of snapshot reuse it.
+        assert_eq!(b.snap(false, true).reused, 12);
+        assert_eq!(b.snap(true, true).reused, 12);
+    }
+
+    /// Garbage collection can take a chunk and leave the node above it. The
+    /// cache names files by that node.
+    #[test]
+    fn content_that_has_left_the_store_is_read_again_and_put_back() {
+        let b = bench("missing");
+        b.fill(8);
+        // And one file large enough to be many chunks under a tree of nodes.
+        let big: String = (0..40_000).map(|i| format!("line {i} of a large file\n")).collect();
+        b.put("big.txt", &big);
+        let first = b.snap(true, true);
+        assert_eq!(b.snap(true, true).reused, 9);
+
+        let chunk_of = |name: &str, which: usize| -> Hash {
+            let root = read_entries(&b.store, first.hash).unwrap();
+            let entry = root.iter().find(|e| e.name == name).unwrap();
+            match b.store.get(entry.hash).unwrap() {
+                Object::File { children, .. } => children[which].0,
+                other => panic!("{name} is a {}", other.kind().name()),
+            }
+        };
+        let (small, large) = (
+            {
+                let dir = read_entries(&b.store, first.hash).unwrap();
+                let d = dir.iter().find(|e| e.name == "dir1").unwrap().hash;
+                let f = read_entries(&b.store, d).unwrap()[0].hash;
+                match b.store.get(f).unwrap() {
+                    Object::File { children, .. } => children[0].0,
+                    _ => unreachable!(),
+                }
+            },
+            chunk_of("big.txt", 5),
+        );
+        // A store holding everything the tree needs except those two chunks:
+        // what collection leaves behind when a chunk is older than the node
+        // that points at it.
+        let thin = Store::open(b.dir.join("thin")).unwrap();
+        let mut stack = vec![first.hash];
+        while let Some(h) = stack.pop() {
+            if h == small || h == large {
+                continue;
+            }
+            let obj = b.store.get(h).unwrap();
+            stack.extend(obj.links());
+            thin.put(&obj).unwrap();
+        }
+        assert!(!thin.has(small) && !thin.has(large));
+
+        let healed = b.snap_in(&thin, true, true);
+        assert_eq!(healed.reused, 7, "the two files with a chunk missing were read");
+        assert_eq!(healed.hash, first.hash);
+        assert!(thin.has(small) && thin.has(large), "and reading them stored it again");
+        assert_eq!(b.snap_in(&thin, true, true).reused, 9);
+    }
+
+    #[test]
+    fn a_damaged_cache_is_an_empty_one() {
+        let b = bench("damaged");
+        b.fill(10);
+        let first = b.snap(true, true);
+        let good = fs::read(&b.cache).unwrap();
+
+        for bad in [&good[..good.len() / 2], &good[..10], &[][..], b"not a cache at all".as_slice()] {
+            fs::write(&b.cache, bad).unwrap();
+            assert!(StatCache::load(&b.cache).is_empty());
+        }
+        // One byte changed in the middle: the digest at the end disagrees.
+        let mut flipped = good.clone();
+        flipped[good.len() / 2] ^= 1;
+        fs::write(&b.cache, flipped).unwrap();
+        assert!(StatCache::load(&b.cache).is_empty());
+
+        let again = b.snap(true, true);
+        assert_eq!((again.reused, again.hash), (0, first.hash), "slower, and no different");
+        assert_eq!(b.snap(true, true).reused, 10, "and whole again afterwards");
+    }
+
+    /// Whatever is done to the tree, a snapshot that remembers comes to the
+    /// same root as one that reads everything.
+    #[test]
+    fn the_tree_is_the_same_with_the_cache_and_without() {
+        let b = bench("same");
+        b.fill(40);
+        let mut x = 0x1234_5678u64;
+        let mut rnd = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let mut reused = 0;
+        for round in 0..12 {
+            for _ in 0..rnd(5) {
+                let i = rnd(60);
+                let rel = format!("dir{}/file{i}.txt", i % 5);
+                match rnd(3) {
+                    0 => {
+                        let _ = fs::remove_file(b.work.join(&rel));
+                    }
+                    // The same length as it was, as often as not.
+                    1 => b.put(&rel, &format!("contents of file {i}\n").replace('c', "k")),
+                    _ => b.put(&rel, &format!("round {round} wrote file {i}\n")),
+                }
+            }
+            // Alternately a `status` and a `commit`, as in use.
+            let snap = b.snap(round % 2 == 1, true);
+            reused += snap.reused;
+            assert_eq!(snap.hash, b.truth(), "round {round}");
+        }
+        assert!(reused > 100, "and it did save reading most of them: {reused}");
     }
 }
