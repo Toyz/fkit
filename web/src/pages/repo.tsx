@@ -3705,7 +3705,8 @@ export class PageRepo extends LoomElement {
           <div class="df-body">
             {f.truncated ? (
               <div class="df-note">
-                the two versions differ too much for a line diff — shown as a full replacement
+                part of this file could not be lined up line by line — that part is shown
+                as one block removed and one block added
               </div>
             ) : null}
             {shown.map((h) => (

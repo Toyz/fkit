@@ -696,7 +696,7 @@ fn cmd_diff(
             continue;
         }
         if d.truncated {
-            println!("  (files differ too much for a line diff — replaced wholesale)");
+            println!("  (part of this could not be lined up line by line, and is shown as one block replaced)");
         }
 
         for h in &d.hunks {
